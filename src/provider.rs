@@ -150,13 +150,16 @@ pub struct HttpRequest {
 }
 
 /// Chat client configuration owned by the integration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatConfig {
     pub provider: Provider,
     pub api_key: Option<String>,
     pub model: String,
     pub base_url: String,
     pub max_tokens: u32,
+    /// Sampling temperature. `None` keeps the provider default; agent loops
+    /// that require strict JSON replies benefit from a low value such as 0.0.
+    pub temperature: Option<f32>,
 }
 
 impl ChatConfig {
@@ -167,6 +170,7 @@ impl ChatConfig {
             model: provider.default_model().to_string(),
             base_url: provider.default_base_url().to_string(),
             max_tokens: 1024,
+            temperature: None,
         }
     }
 
@@ -191,6 +195,13 @@ impl ChatConfig {
             return Err(ProviderError::InvalidConfiguration(
                 "max_tokens must be positive".into(),
             ));
+        }
+        if let Some(temperature) = self.temperature {
+            if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+                return Err(ProviderError::InvalidConfiguration(
+                    "temperature must be a finite value in 0.0..=2.0".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -284,28 +295,39 @@ fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) 
             if let Some(system) = system {
                 body["system"] = Value::String(system.to_string());
             }
+            if let Some(temperature) = config.temperature {
+                body["temperature"] = json!(temperature);
+            }
             body
         }
         Provider::OpenAiCompatible => {
             if let Some(system) = system {
                 messages.insert(0, json!({"role": "system", "content": system}));
             }
-            json!({
+            let mut body = json!({
                 "model": config.model,
                 "max_tokens": config.max_tokens,
                 "messages": messages,
-            })
+            });
+            if let Some(temperature) = config.temperature {
+                body["temperature"] = json!(temperature);
+            }
+            body
         }
         Provider::Ollama => {
             if let Some(system) = system {
                 messages.insert(0, json!({"role": "system", "content": system}));
             }
-            json!({
+            let mut body = json!({
                 "model": config.model,
                 "messages": messages,
                 "stream": false,
                 "options": {"num_predict": config.max_tokens},
-            })
+            });
+            if let Some(temperature) = config.temperature {
+                body["options"]["temperature"] = json!(temperature);
+            }
+            body
         }
     }
 }
@@ -394,6 +416,7 @@ mod tests {
             model: "test-model".into(),
             base_url: provider.default_base_url().into(),
             max_tokens: 512,
+            temperature: None,
         }
     }
 
@@ -467,6 +490,33 @@ mod tests {
         let mut bad = config(Provider::Ollama);
         bad.model = "  ".into();
         assert!(bad.validate().is_err());
+        let mut bad = config(Provider::Ollama);
+        bad.temperature = Some(f32::NAN);
+        assert!(bad.validate().is_err());
+        let mut bad = config(Provider::Ollama);
+        bad.temperature = Some(2.5);
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn temperature_is_optional_and_provider_shaped() {
+        let history = [user("hi")];
+        let mut with_temperature = config(Provider::Anthropic);
+        with_temperature.temperature = Some(0.0);
+        let request = build_chat_request(&with_temperature, None, &history).unwrap();
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["temperature"], 0.0);
+
+        let mut ollama = config(Provider::Ollama);
+        ollama.temperature = Some(0.2);
+        let request = build_chat_request(&ollama, None, &history).unwrap();
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert!((body["options"]["temperature"].as_f64().unwrap() - 0.2).abs() < 1e-6);
+
+        let request =
+            build_chat_request(&config(Provider::OpenAiCompatible), None, &history).unwrap();
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]

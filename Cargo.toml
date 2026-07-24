@@ -1,6 +1,6 @@
 [package]
 name = "jagent"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.86"
 description = "Review-first terminal AI agent core: pure session state machine, provider-neutral request building, and safety heuristics (sans-IO)"
