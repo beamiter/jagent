@@ -1,0 +1,15 @@
+[package]
+name = "jagent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+description = "Review-first terminal AI agent core: pure session state machine, provider-neutral request building, and safety heuristics (sans-IO)"
+readme = "README.md"
+repository = "https://github.com/beamiter/jagent"
+keywords = ["terminal", "shell", "agent", "ai", "llm"]
+categories = ["command-line-utilities"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
