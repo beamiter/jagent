@@ -38,6 +38,7 @@ pub use prompt::{
 pub use provider::{HttpRequest, Message, Provider, ProviderError, Role};
 pub use safety::{is_auto_approvable, is_dangerous};
 pub use session::{
-    AgentSession, AgentState, ApprovedCommand, ModelOutcome, ParseError, ProposalId,
-    ProposalStatus, SessionError, Turn,
+    AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
+    ModelOutcome, ParseError, ProposalId, ProposalStatus, SessionError, Turn,
+    MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
