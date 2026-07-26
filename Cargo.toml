@@ -1,6 +1,6 @@
 [package]
 name = "jagent"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.86"
 description = "Review-first terminal AI agent core: pure session state machine, provider-neutral request building, and safety heuristics (sans-IO)"
@@ -11,5 +11,6 @@ categories = ["command-line-utilities"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
