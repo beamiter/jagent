@@ -32,7 +32,7 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
     {
         return Some("mkfs formats a filesystem");
     }
-    if lower.contains("dd ") && lower.contains("of=/dev/") {
+    if tokens.contains(&"dd") && tokens.iter().any(|token| token.starts_with("of=/dev/")) {
         return Some("dd writes raw bytes to a device");
     }
     if (lower.contains("curl ") || lower.contains("wget "))
@@ -293,6 +293,16 @@ mod tests {
         assert!(is_dangerous("env systemctl reboot").is_some());
         assert!(is_dangerous("git status").is_none());
         assert!(is_dangerous("git -C repo status").is_none());
+    }
+
+    #[test]
+    fn dd_detection_matches_the_command_not_substrings() {
+        assert!(is_dangerous("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(is_dangerous("sudo dd if=image.iso of=/dev/sdb bs=4M").is_some());
+        assert!(is_dangerous("dd\tif=/dev/zero\tof=/dev/sda").is_some());
+        // Substrings of other words must not trip the heuristic.
+        assert!(is_dangerous("echo \"add of=/dev/null\"").is_none());
+        assert!(is_dangerous("grep -r 'dd of=/dev/' docs").is_none());
     }
 
     #[test]

@@ -53,9 +53,9 @@ pub struct EnvironmentMeta {
 pub fn build_agent_system_prompt() -> String {
     "You are an interactive shell agent. Every reply MUST be exactly one JSON object, \
 with no markdown or surrounding prose. Allowed shapes (no extra keys):\n\
-{{\"action\":\"run\",\"command\":\"one visible command line\"}}\n\
-{{\"action\":\"say\",\"message\":\"question or note\"}}\n\
-{{\"action\":\"done\",\"message\":\"short summary\"}}\n\
+{\"action\":\"run\",\"command\":\"one visible command line\"}\n\
+{\"action\":\"say\",\"message\":\"question or note\"}\n\
+{\"action\":\"done\",\"message\":\"short summary\"}\n\
 A run action is only a proposal. The application will never execute it without explicit \
 per-command user approval. Propose one focused command, wait for its exit status and output, \
 and never assume success. Use inspection-first commands, ask before making ambiguous or \
@@ -148,6 +148,11 @@ mod tests {
         assert!(prompt.contains("explicit"));
         assert!(prompt.contains("Do not include hidden reasoning"));
         assert!(prompt.contains("untrusted"));
+        // The example shapes must be valid JSON, not format!-escaped braces
+        // the model would faithfully mimic.
+        assert!(!prompt.contains("{{"));
+        assert!(!prompt.contains("}}"));
+        assert!(prompt.contains("{\"action\":\"run\",\"command\":\"one visible command line\"}"));
     }
 
     #[test]

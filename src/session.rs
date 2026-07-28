@@ -737,7 +737,6 @@ impl AgentSession {
     }
 }
 
-
 impl AgentSession {
     /// Capture a serializable snapshot for cross-restart persistence.
     ///
@@ -927,7 +926,6 @@ pub fn sample_observation(output: &str) -> String {
 mod tests {
     use super::*;
 
-
     #[test]
     fn snapshot_roundtrip_preserves_resumable_states() {
         let mut session = AgentSession::new(10);
@@ -951,7 +949,8 @@ mod tests {
             unreachable!();
         };
         let mut restored = restored;
-        restored.approve(proposal_id).unwrap();
+        let approved = restored.approve(proposal_id).unwrap();
+        assert!(!approved.command.is_empty());
     }
 
     #[test]
@@ -964,7 +963,8 @@ mod tests {
         let AgentState::AwaitingApproval { proposal_id } = session.state() else {
             unreachable!();
         };
-        session.approve(proposal_id).unwrap();
+        let approved = session.approve(proposal_id).unwrap();
+        assert_eq!(approved.command, "make");
         assert!(matches!(
             session.state(),
             AgentState::AwaitingObservation { .. }
