@@ -15,7 +15,7 @@ the parts that must behave identically everywhere.
 |------------|----------|
 | `session`  | Pure agent state machine: strict JSON `run`/`say`/`done` protocol, proposal approval/rejection/manual-review transitions, bounded transcript, turn budget, cancellation. |
 | `safety`   | `is_dangerous` destructive-pattern warnings and the fail-closed `is_auto_approvable` read-only allowlist. |
-| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data, plus strict response text extraction and history bounding. |
+| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data, plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
 | `prompt`   | Agent system prompt and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
 
 ## Invariants

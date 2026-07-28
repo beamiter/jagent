@@ -27,8 +27,8 @@
 //! 4. Terminal output and environment metadata are untrusted user-role data.
 
 pub mod prompt;
-pub mod redact;
 pub mod provider;
+pub mod redact;
 pub mod safety;
 pub mod session;
 mod text;
@@ -36,7 +36,9 @@ mod text;
 pub use prompt::{
     agent_user_prompt, build_agent_system_prompt, BlockContext, EnvironmentMeta, GitMeta,
 };
-pub use provider::{HttpRequest, Message, Provider, ProviderError, Role};
+pub use provider::{
+    ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role, Usage,
+};
 pub use redact::redact_secrets;
 pub use safety::{is_auto_approvable, is_dangerous};
 pub use session::{

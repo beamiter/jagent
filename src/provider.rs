@@ -211,13 +211,23 @@ impl ChatConfig {
 /// never let the retained window begin with an assistant turn.
 /// Returns the retained history and how many older turns were omitted.
 pub fn bound_history(history: &[Message]) -> (Vec<Message>, usize) {
+    bound_history_with(history, str::to_string)
+}
+
+/// [`bound_history`] with a per-turn preparation hook (redaction, normalization)
+/// applied to each turn's text *before* the byte budget elides it, so the
+/// budget is measured against what will actually be sent.
+pub fn bound_history_with(
+    history: &[Message],
+    prepare: impl Fn(&str) -> String,
+) -> (Vec<Message>, usize) {
     let mut retained_reversed = Vec::new();
     let mut retained_bytes = 0_usize;
     for turn in history.iter().rev() {
         if retained_reversed.len() >= MAX_REQUEST_HISTORY_TURNS {
             break;
         }
-        let text = elide_middle(&turn.text, MAX_REQUEST_TURN_BYTES);
+        let text = elide_middle(&prepare(&turn.text), MAX_REQUEST_TURN_BYTES);
         let cost = text.len().saturating_add(32);
         if !retained_reversed.is_empty()
             && retained_bytes.saturating_add(cost) > MAX_REQUEST_HISTORY_BYTES
@@ -332,10 +342,46 @@ fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) 
     }
 }
 
+/// Token usage reported by the provider, when the response carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Structured result of parsing one non-streaming chat response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatResponse {
+    /// Assistant text exactly as extracted — no advisory notes appended.
+    pub text: String,
+    /// The provider stopped at the output-token limit; the integration should
+    /// present the text as partial rather than complete.
+    pub reached_token_limit: bool,
+    pub usage: Option<Usage>,
+}
+
 /// Extract the assistant text from one non-streaming chat response.
 /// A reached token limit is surfaced as a visible trailing note, never as an
 /// error, so partial answers stay reviewable.
 pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<String, ProviderError> {
+    let parsed = parse_chat_response_full(provider, response)?;
+    let mut text = parsed.text;
+    if parsed.reached_token_limit {
+        text.push_str(
+            "\n\n[Response reached the configured output limit. Ask to continue or \
+             increase max_tokens.]",
+        );
+    }
+    Ok(text)
+}
+
+/// [`parse_chat_response`] returning the structured parts: raw text, the
+/// token-limit flag (so integrations word their own advisory note), and any
+/// token usage the provider reported.
+pub fn parse_chat_response_full(
+    provider: Provider,
+    response: &Value,
+) -> Result<ChatResponse, ProviderError> {
     let reached_token_limit = match provider {
         Provider::Anthropic => {
             response.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
@@ -348,7 +394,7 @@ pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<Strin
         }
         Provider::Ollama => response.get("done_reason").and_then(Value::as_str) == Some("length"),
     };
-    let mut text = match provider {
+    let text = match provider {
         Provider::Anthropic => response
             .get("content")
             .and_then(Value::as_array)
@@ -378,18 +424,39 @@ pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<Strin
     if text.trim().is_empty() {
         return Err(ProviderError::EmptyResponse);
     }
-    if reached_token_limit {
-        text.push_str(
-            "\n\n[Response reached the configured output limit. Ask to continue or \
-             increase max_tokens.]",
-        );
-    }
     if text.len() > MAX_MODEL_TEXT_BYTES {
         return Err(ProviderError::ResponseTooLarge {
             limit: MAX_MODEL_TEXT_BYTES,
         });
     }
-    Ok(text)
+    Ok(ChatResponse {
+        text,
+        reached_token_limit,
+        usage: parse_usage(provider, response),
+    })
+}
+
+/// Best-effort usage extraction; providers that omit the fields yield `None`.
+fn parse_usage(provider: Provider, response: &Value) -> Option<Usage> {
+    let (input, output) = match provider {
+        Provider::Anthropic => (
+            response.pointer("/usage/input_tokens"),
+            response.pointer("/usage/output_tokens"),
+        ),
+        Provider::OpenAiCompatible => (
+            response.pointer("/usage/prompt_tokens"),
+            response.pointer("/usage/completion_tokens"),
+        ),
+        Provider::Ollama => (
+            response.get("prompt_eval_count"),
+            response.get("eval_count"),
+        ),
+    };
+    let usage = Usage {
+        input_tokens: input.and_then(Value::as_u64),
+        output_tokens: output.and_then(Value::as_u64),
+    };
+    (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
 }
 
 fn content_text(value: &Value) -> Option<String> {
@@ -577,5 +644,72 @@ mod tests {
             parse_chat_response(Provider::Anthropic, &empty),
             Err(ProviderError::EmptyResponse)
         ));
+    }
+
+    #[test]
+    fn full_parse_returns_raw_text_flag_and_usage() {
+        let anthropic = serde_json::json!({
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 12, "output_tokens": 34},
+        });
+        let parsed = parse_chat_response_full(Provider::Anthropic, &anthropic).unwrap();
+        assert_eq!(parsed.text, "partial");
+        assert!(parsed.reached_token_limit);
+        assert_eq!(
+            parsed.usage,
+            Some(Usage {
+                input_tokens: Some(12),
+                output_tokens: Some(34),
+            })
+        );
+
+        let openai = serde_json::json!({
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 7},
+        });
+        let parsed = parse_chat_response_full(Provider::OpenAiCompatible, &openai).unwrap();
+        assert!(!parsed.reached_token_limit);
+        assert_eq!(
+            parsed.usage,
+            Some(Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(7),
+            })
+        );
+
+        let ollama = serde_json::json!({
+            "message": {"content": "yo"},
+            "prompt_eval_count": 3,
+            "eval_count": 9,
+        });
+        let parsed = parse_chat_response_full(Provider::Ollama, &ollama).unwrap();
+        assert_eq!(
+            parsed.usage,
+            Some(Usage {
+                input_tokens: Some(3),
+                output_tokens: Some(9),
+            })
+        );
+
+        // Responses without usage fields yield None, not zeros.
+        let bare = serde_json::json!({"message": {"content": "yo"}});
+        let parsed = parse_chat_response_full(Provider::Ollama, &bare).unwrap();
+        assert_eq!(parsed.usage, None);
+    }
+
+    #[test]
+    fn history_bounding_prepare_hook_runs_before_the_byte_budget() {
+        // The hook's output, not the raw text, must be what the budget
+        // measures: a hook that shrinks an oversized turn keeps it intact.
+        let oversized = "x".repeat(MAX_REQUEST_TURN_BYTES * 2);
+        let history = [user(&oversized)];
+        let (retained, _) = bound_history_with(&history, |text| text[..8].to_string());
+        assert_eq!(retained[0].text, "xxxxxxxx");
+
+        let (retained, _) = bound_history_with(&[user("secret")], |text| {
+            text.replace("secret", "[redacted]")
+        });
+        assert_eq!(retained[0].text, "[redacted]");
     }
 }
