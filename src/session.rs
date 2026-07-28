@@ -6,6 +6,10 @@
 
 use crate::safety::{is_dangerous, MAX_COMMAND_BYTES};
 use crate::text::elide_middle;
+use crate::tools::{
+    AgentProtocol, ToolResponse, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_NAME_BYTES, TOOL_DONE,
+    TOOL_RUN, TOOL_SAY,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +20,7 @@ const MAX_STORED_TRANSCRIPT_BYTES: usize = 128 * 1024;
 const MAX_STORED_TRANSCRIPT_ENTRIES: usize = 128;
 const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
-const MAX_THOUGHT_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_THOUGHT_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Serialize)]
 pub struct ProposalId(u64);
@@ -117,6 +121,13 @@ pub enum ParseError {
     UnknownAction(String),
     UnexpectedField(String),
     InvalidCommand(String),
+    /// Native tool mode: the reply carried no tool call. Accompanying prose is
+    /// never promoted to an action, so this fails closed even with text
+    /// present. See [`crate::tools`].
+    NoToolCall,
+    /// Native tool mode: the reply carried more than one tool call. The state
+    /// machine advances one action per turn; choosing one would be a guess.
+    MultipleToolCalls(usize),
 }
 
 impl std::fmt::Display for ParseError {
@@ -133,6 +144,13 @@ impl std::fmt::Display for ParseError {
             Self::UnknownAction(action) => write!(f, "unknown action '{action}'"),
             Self::UnexpectedField(field) => write!(f, "unexpected field '{field}'"),
             Self::InvalidCommand(message) => write!(f, "invalid command: {message}"),
+            Self::NoToolCall => write!(f, "reply contained no tool call"),
+            Self::MultipleToolCalls(count) => {
+                write!(
+                    f,
+                    "reply contained {count} tool calls; exactly one is required"
+                )
+            }
         }
     }
 }
@@ -151,25 +169,63 @@ pub fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
         .map_err(|error| ParseError::InvalidJson(error.to_string()))?;
     let object = value.as_object().ok_or(ParseError::ExpectedObject)?;
     let action = required_string(object, "action", 32)?;
+    action_from_object(&action, object, &["action"])
+}
+
+/// Map one *native* tool call onto the same [`ParsedAction`] values
+/// [`parse_action`] produces, so the state machine and every invariant apply
+/// unchanged whichever protocol carried the reply.
+///
+/// `arguments` is the raw JSON object text (empty means "no arguments" and is
+/// read as `{}`). The rules are identical to the text protocol minus the
+/// `action` field, which the tool name supplies: unknown names, wrong types,
+/// missing or empty required fields, extra keys, and multi-line commands all
+/// fail closed and never degrade into a proposal.
+pub fn parse_tool_action(name: &str, arguments: &str) -> Result<ParsedAction, ParseError> {
+    let name = name.trim();
+    if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+        return Err(ParseError::FieldTooLarge("arguments"));
+    }
+    let payload = arguments.trim();
+    let value: Value = if payload.is_empty() {
+        Value::Object(Map::new())
+    } else {
+        serde_json::from_str(payload).map_err(|error| ParseError::InvalidJson(error.to_string()))?
+    };
+    let object = value.as_object().ok_or(ParseError::ExpectedObject)?;
+    action_from_object(name, object, &[])
+}
+
+/// Shared tail of both protocols: `action` names the shape, `object` carries
+/// the fields, and `also_allowed` lists keys the *carrier* contributes (the
+/// text protocol's own `action` key; nothing in tool mode).
+fn action_from_object(
+    action: &str,
+    object: &Map<String, Value>,
+    also_allowed: &[&str],
+) -> Result<ParsedAction, ParseError> {
     let thought = optional_string(object, "thought", MAX_THOUGHT_BYTES)?;
-    match action.as_str() {
-        "run" => {
-            reject_unexpected(object, &["action", "thought", "command"])?;
+    match action {
+        TOOL_RUN => {
+            reject_unexpected(object, also_allowed, &["thought", "command"])?;
             let command = required_string(object, "command", MAX_COMMAND_BYTES)?;
             validate_command(&command)?;
             Ok(ParsedAction::Run { thought, command })
         }
-        "say" => {
-            reject_unexpected(object, &["action", "thought", "message"])?;
+        TOOL_SAY => {
+            reject_unexpected(object, also_allowed, &["thought", "message"])?;
             let message = required_string(object, "message", MAX_MESSAGE_BYTES)?;
             Ok(ParsedAction::Say { thought, message })
         }
-        "done" => {
-            reject_unexpected(object, &["action", "thought", "message"])?;
+        TOOL_DONE => {
+            reject_unexpected(object, also_allowed, &["thought", "message"])?;
             let message = required_string(object, "message", MAX_MESSAGE_BYTES)?;
             Ok(ParsedAction::Done { thought, message })
         }
-        other => Err(ParseError::UnknownAction(other.to_string())),
+        other => Err(ParseError::UnknownAction(elide_middle(
+            other,
+            MAX_TOOL_NAME_BYTES,
+        ))),
     }
 }
 
@@ -228,10 +284,14 @@ fn optional_string(
     Ok(Some(value.to_string()))
 }
 
-fn reject_unexpected(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), ParseError> {
+fn reject_unexpected(
+    object: &Map<String, Value>,
+    also_allowed: &[&str],
+    allowed: &[&str],
+) -> Result<(), ParseError> {
     if let Some(field) = object
         .keys()
-        .find(|field| !allowed.contains(&field.as_str()))
+        .find(|field| !allowed.contains(&field.as_str()) && !also_allowed.contains(&field.as_str()))
     {
         return Err(ParseError::UnexpectedField(field.clone()));
     }
@@ -443,7 +503,32 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Ingest a reply carried by the JSON-in-text protocol.
     pub fn accept_model_reply(&mut self, raw: &str) -> Result<ModelOutcome, SessionError> {
+        self.accept_parsed_action(|| parse_action(raw))
+    }
+
+    /// Ingest a reply carried by the provider's *native* tool-calling, parsed
+    /// with [`crate::tools::parse_tool_response`].
+    ///
+    /// The reply is resolved to exactly one [`ParsedAction`] by
+    /// [`ToolResponse::to_action`] — including the mixed text-and-tool rule —
+    /// and then runs through the identical state machine as
+    /// [`Self::accept_model_reply`]: the same [`ModelOutcome`]s, the same
+    /// transcript turns, and the same fail-closed protocol errors. A `run`
+    /// tool call is still only a proposal; approval still returns an
+    /// [`ApprovedCommand`] and this crate still cannot execute anything.
+    pub fn accept_model_tool_reply(
+        &mut self,
+        reply: &ToolResponse,
+    ) -> Result<ModelOutcome, SessionError> {
+        self.accept_parsed_action(|| reply.to_action())
+    }
+
+    fn accept_parsed_action(
+        &mut self,
+        parse: impl FnOnce() -> Result<ParsedAction, ParseError>,
+    ) -> Result<ModelOutcome, SessionError> {
         self.check_not_cancelled()?;
         if self.state != AgentState::AwaitingModel {
             return Err(self.invalid_transition("accept a model reply"));
@@ -453,7 +538,7 @@ impl AgentSession {
             return Err(SessionError::TurnLimitReached);
         }
         self.turns_used = self.turns_used.saturating_add(1);
-        let action = match parse_action(raw) {
+        let action = match parse() {
             Ok(action) => action,
             Err(error) => {
                 self.push_turn(Turn::ProtocolError(error.to_string()));
@@ -656,6 +741,18 @@ impl AgentSession {
     }
 
     pub fn build_user_prompt(&self) -> String {
+        self.build_user_prompt_with(AgentProtocol::Text)
+    }
+
+    /// [`Self::build_user_prompt`] with the closing instruction matched to the
+    /// protocol in use, so native mode does not ask for a JSON object the
+    /// schema has already replaced. [`AgentProtocol::Text`] is byte-identical
+    /// to [`Self::build_user_prompt`].
+    ///
+    /// The transcript body itself is protocol-independent: past actions are
+    /// always rendered as the canonical JSON shapes, which stay an unambiguous
+    /// record of what was proposed and how the user ruled on it.
+    pub fn build_user_prompt_with(&self, protocol: AgentProtocol) -> String {
         let mut entries: Vec<String> = self.transcript.iter().map(Turn::to_prompt).collect();
         if self.transcript_truncated {
             entries.insert(
@@ -663,8 +760,17 @@ impl AgentSession {
                 "[older Agent activity was omitted by the in-memory safety budget]".to_string(),
             );
         }
-        entries
-            .push("Reply with exactly one JSON object from the protocol; no markdown.".to_string());
+        entries.push(
+            match protocol {
+                AgentProtocol::Text => {
+                    "Reply with exactly one JSON object from the protocol; no markdown."
+                }
+                AgentProtocol::NativeTools => {
+                    "Continue by calling exactly one tool: run, say, or done."
+                }
+            }
+            .to_string(),
+        );
         elide_middle(&entries.join("\n\n"), MAX_TRANSCRIPT_BYTES)
     }
 
@@ -1418,6 +1524,182 @@ mod tests {
             session.accept_model_reply(&run_reply("pwd")),
             Err(SessionError::Cancelled)
         ));
+    }
+
+    fn tool_reply(name: &str, arguments: &str) -> ToolResponse {
+        ToolResponse::new(
+            "",
+            vec![crate::tools::ToolCall {
+                id: "call_1".into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            }],
+        )
+    }
+
+    #[test]
+    fn native_tool_reply_walks_the_identical_state_machine() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("show files").unwrap();
+
+        let reply = ToolResponse::new(
+            "Listing the directory first.",
+            vec![crate::tools::ToolCall {
+                id: "toolu_1".into(),
+                name: "run".into(),
+                arguments: r#"{"command":"ls -la"}"#.into(),
+            }],
+        );
+        let outcome = session.accept_model_tool_reply(&reply).unwrap();
+        let ModelOutcome::Proposal { id, command, .. } = outcome else {
+            panic!("expected proposal")
+        };
+        assert_eq!(command, "ls -la");
+        // A tool call is a proposal and nothing more: the session parks in
+        // AwaitingApproval exactly as the text protocol does.
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+        // The accompanying prose is preserved as a visible thought.
+        assert!(session
+            .transcript()
+            .iter()
+            .any(|turn| matches!(turn, Turn::AssistantThought(text)
+                if text == "Listing the directory first.")));
+
+        let approved = session.approve(id).unwrap();
+        assert_eq!(approved.command, "ls -la");
+        assert_eq!(approved.proposal_id, id);
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingObservation { proposal_id: id }
+        );
+
+        session.observe(id, 0, "a\nb").unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+
+        // The turn after can complete via the done tool.
+        let outcome = session
+            .accept_model_tool_reply(&tool_reply("done", r#"{"message":"listed"}"#))
+            .unwrap();
+        assert_eq!(outcome, ModelOutcome::Completed("listed".into()));
+        assert_eq!(session.state(), AgentState::Completed);
+        assert_eq!(session.turns_used(), 2);
+
+        // The transcript renders identically to a text-protocol run.
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains(r#"{"action":"run","command":"ls -la"}"#));
+        assert!(prompt.contains("user approved"));
+    }
+
+    #[test]
+    fn malformed_tool_reply_never_becomes_a_proposal() {
+        for reply in [
+            // No tool call, only prose that describes a command.
+            ToolResponse::new("I will run rm -rf / now", Vec::new()),
+            // Unknown tool name.
+            tool_reply("exec", r#"{"command":"rm -rf /"}"#),
+            // Malformed arguments.
+            tool_reply("run", "{\"command\":"),
+            // Multi-line command smuggling extra PTY input.
+            tool_reply("run", "{\"command\":\"ls\\nrm -rf /\"}"),
+            // Two calls at once.
+            ToolResponse::new(
+                "",
+                vec![
+                    crate::tools::ToolCall {
+                        id: "a".into(),
+                        name: "run".into(),
+                        arguments: r#"{"command":"ls"}"#.into(),
+                    },
+                    crate::tools::ToolCall {
+                        id: "b".into(),
+                        name: "run".into(),
+                        arguments: r#"{"command":"rm -rf /"}"#.into(),
+                    },
+                ],
+            ),
+        ] {
+            let mut session = AgentSession::new(3);
+            session.submit_user("inspect").unwrap();
+            assert!(
+                matches!(
+                    session.accept_model_tool_reply(&reply),
+                    Err(SessionError::Protocol(_))
+                ),
+                "{reply:?}"
+            );
+            assert_eq!(session.state(), AgentState::Ready);
+            assert!(
+                !session
+                    .transcript()
+                    .iter()
+                    .any(|turn| matches!(turn, Turn::AssistantProposed { .. })),
+                "{reply:?}"
+            );
+            // The failed turn is retryable, exactly as a bad JSON reply is.
+            assert!(session.can_retry_model());
+        }
+    }
+
+    #[test]
+    fn tool_actions_equal_the_text_protocol_actions() {
+        let cases = [
+            (
+                "run",
+                r#"{"command":"ls"}"#,
+                r#"{"action":"run","command":"ls"}"#,
+            ),
+            (
+                "say",
+                r#"{"message":"which repo?"}"#,
+                r#"{"action":"say","message":"which repo?"}"#,
+            ),
+            (
+                "done",
+                r#"{"message":"finished","thought":"all green"}"#,
+                r#"{"action":"done","message":"finished","thought":"all green"}"#,
+            ),
+        ];
+        for (name, arguments, json) in cases {
+            assert_eq!(
+                parse_tool_action(name, arguments).unwrap(),
+                parse_action(json).unwrap(),
+                "{name}"
+            );
+        }
+
+        // The tool carries the action, so an `action` key in the arguments is
+        // an unexpected field rather than a second source of truth.
+        assert!(matches!(
+            parse_tool_action("run", r#"{"action":"run","command":"ls"}"#),
+            Err(ParseError::UnexpectedField(field)) if field == "action"
+        ));
+        // Absent arguments read as an empty object and fail on the required
+        // field rather than inventing one.
+        assert_eq!(
+            parse_tool_action("run", ""),
+            Err(ParseError::MissingField("command"))
+        );
+    }
+
+    #[test]
+    fn user_prompt_tail_follows_the_protocol_without_changing_text_mode() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        assert_eq!(
+            session.build_user_prompt_with(AgentProtocol::Text),
+            session.build_user_prompt()
+        );
+        assert!(session
+            .build_user_prompt()
+            .ends_with("Reply with exactly one JSON object from the protocol; no markdown."));
+
+        let native = session.build_user_prompt_with(AgentProtocol::NativeTools);
+        assert!(native.ends_with("Continue by calling exactly one tool: run, say, or done."));
+        assert!(!native.contains("JSON object"));
+        assert!(native.contains("User: inspect"));
     }
 
     #[test]

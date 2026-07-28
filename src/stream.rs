@@ -41,6 +41,10 @@
 
 use crate::provider::{Provider, Usage, MAX_MODEL_TEXT_BYTES};
 use crate::text::elide_middle;
+use crate::tools::{
+    ToolCall, MAX_STREAM_TOOL_CALLS, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_ID_BYTES,
+    MAX_TOOL_NAME_BYTES,
+};
 use serde_json::Value;
 
 /// Detail quoted from provider-reported stream errors is elided to this many
@@ -61,6 +65,16 @@ pub enum StreamEvent {
     /// [`crate::provider::ChatResponse::reached_token_limit`] reports.
     /// Emitted at most once per stream.
     ReachedTokenLimit,
+    /// A native tool call finished accumulating — Anthropic's `tool_use`
+    /// block reached `content_block_stop`, or an OpenAI-compatible
+    /// `tool_calls` accumulation reached the end of the message. Emitted in
+    /// the order the calls were opened, always before [`StreamEvent::Usage`]
+    /// and [`StreamEvent::Done`], and never for a call still mid-flight when
+    /// the stream failed or was truncated. The value is identical in shape to
+    /// what [`crate::tools::parse_tool_response`] extracts from the
+    /// equivalent non-streaming reply, so
+    /// [`crate::tools::ToolResponse::to_action`] applies unchanged.
+    ToolCall(ToolCall),
     /// Token usage reported by the provider. Emitted at most once, directly
     /// before [`StreamEvent::Done`], and only when the provider reported at
     /// least one count; a truncated stream never reports usage.
@@ -102,6 +116,20 @@ pub struct StreamParser {
     saw_message_end: bool,
     reached_token_limit: bool,
     usage: Usage,
+    /// Tool calls still accumulating, in the order they were opened. Keyed by
+    /// the provider's own index (Anthropic content-block index, OpenAI
+    /// `tool_calls[].index`).
+    pending_tools: Vec<PendingToolCall>,
+    /// Cumulative bytes of tool-call arguments seen, bounded like text.
+    delivered_tool_bytes: usize,
+}
+
+#[derive(Debug)]
+struct PendingToolCall {
+    index: i64,
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 impl StreamParser {
@@ -117,6 +145,8 @@ impl StreamParser {
             saw_message_end: false,
             reached_token_limit: false,
             usage: Usage::default(),
+            pending_tools: Vec::new(),
+            delivered_tool_bytes: 0,
         }
     }
 
@@ -258,6 +288,23 @@ impl StreamParser {
                 let block_type = block
                     .and_then(|block| block.get("type"))
                     .and_then(Value::as_str);
+                if block_type == Some("tool_use") {
+                    // `input` in this frame is always `{}`; the arguments
+                    // arrive as input_json_delta fragments.
+                    let name = block
+                        .and_then(|block| block.get("name"))
+                        .and_then(Value::as_str);
+                    let Some(name) = name else {
+                        self.fail("tool_use block carries no name", events);
+                        return;
+                    };
+                    let id = block
+                        .and_then(|block| block.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.open_tool_call(block_index(&frame), id, name, events);
+                    return;
+                }
                 if block_type == Some("text") {
                     if self.saw_text_block {
                         // parse_chat_response_full joins multiple text blocks
@@ -286,10 +333,21 @@ impl StreamParser {
                         Some(text) => self.deliver_text(text, events),
                         None => self.fail("text_delta frame carries no text", events),
                     }
+                } else if delta_type == Some("input_json_delta") {
+                    match delta
+                        .and_then(|delta| delta.get("partial_json"))
+                        .and_then(Value::as_str)
+                    {
+                        Some(fragment) => {
+                            self.extend_tool_call(block_index(&frame), fragment, events)
+                        }
+                        None => self.fail("input_json_delta frame carries no partial_json", events),
+                    }
                 }
-                // thinking/input_json deltas are non-text content; the
-                // non-streaming parser ignores those blocks as well.
+                // thinking deltas are non-text content; the non-streaming
+                // parser ignores those blocks as well.
             }
+            "content_block_stop" => self.close_tool_call(block_index(&frame), events),
             "message_delta" => {
                 self.merge_usage(frame.get("usage"), "input_tokens", "output_tokens");
                 if let Some(stop_reason) =
@@ -315,8 +373,8 @@ impl StreamParser {
                     events,
                 );
             }
-            // ping, content_block_stop, and future event types carry no
-            // text, stop reason, or usage.
+            // ping and future event types carry no text, stop reason, usage,
+            // or tool call.
             _ => {}
         }
     }
@@ -354,6 +412,23 @@ impl StreamParser {
             Some(Value::Null) | None => {}
             Some(_) => {
                 self.fail("delta content is not a string", events);
+                return;
+            }
+        }
+        match frame.pointer("/choices/0/delta/tool_calls") {
+            Some(Value::Array(entries)) => {
+                // Cloned so the accumulator can borrow `self` mutably; a delta
+                // frame carries at most a handful of small fragments.
+                for entry in entries.clone() {
+                    self.accumulate_openai_tool_call(&entry, events);
+                    if self.phase != Phase::Streaming {
+                        return;
+                    }
+                }
+            }
+            Some(Value::Null) | None => {}
+            Some(_) => {
+                self.fail("delta tool_calls is not an array", events);
                 return;
             }
         }
@@ -408,6 +483,149 @@ impl StreamParser {
         }
     }
 
+    /// Merge one OpenAI-compatible `tool_calls` delta entry. Fragments are
+    /// keyed by the entry's `index`; `id` and `name` normally arrive whole in
+    /// the opening fragment but are appended defensively, and `arguments`
+    /// fragments concatenate into the raw JSON object text.
+    fn accumulate_openai_tool_call(&mut self, entry: &Value, events: &mut Vec<StreamEvent>) {
+        let index = entry.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let id = match entry.get("id") {
+            Some(Value::String(id)) => id.as_str(),
+            Some(Value::Null) | None => "",
+            Some(_) => {
+                self.fail("tool call id is not a string", events);
+                return;
+            }
+        };
+        let function = entry.get("function");
+        let name = match function.and_then(|function| function.get("name")) {
+            Some(Value::String(name)) => name.as_str(),
+            Some(Value::Null) | None => "",
+            Some(_) => {
+                self.fail("tool call name is not a string", events);
+                return;
+            }
+        };
+        let arguments = match function.and_then(|function| function.get("arguments")) {
+            Some(Value::String(arguments)) => arguments.as_str(),
+            Some(Value::Null) | None => "",
+            Some(_) => {
+                self.fail("tool call arguments are not a string", events);
+                return;
+            }
+        };
+        match self.pending_index(index) {
+            None => self.open_tool_call(index, id, name, events),
+            Some(position) => {
+                self.pending_tools[position].id.push_str(id);
+                self.pending_tools[position].name.push_str(name);
+                self.check_tool_identifiers(position, events);
+            }
+        }
+        if self.phase != Phase::Streaming {
+            return;
+        }
+        self.extend_tool_call(index, arguments, events);
+    }
+
+    fn pending_index(&self, index: i64) -> Option<usize> {
+        self.pending_tools
+            .iter()
+            .position(|pending| pending.index == index)
+    }
+
+    /// Start accumulating a tool call, enforcing the concurrent-call bound.
+    fn open_tool_call(&mut self, index: i64, id: &str, name: &str, events: &mut Vec<StreamEvent>) {
+        if self.phase != Phase::Streaming {
+            return;
+        }
+        if self.pending_tools.len() >= MAX_STREAM_TOOL_CALLS {
+            self.fail(
+                &format!("stream opened more than {MAX_STREAM_TOOL_CALLS} concurrent tool calls"),
+                events,
+            );
+            return;
+        }
+        self.pending_tools.push(PendingToolCall {
+            index,
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: String::new(),
+        });
+        let position = self.pending_tools.len() - 1;
+        self.check_tool_identifiers(position, events);
+    }
+
+    fn check_tool_identifiers(&mut self, position: usize, events: &mut Vec<StreamEvent>) -> bool {
+        let pending = &self.pending_tools[position];
+        if pending.name.len() > MAX_TOOL_NAME_BYTES {
+            self.fail("streamed tool name exceeds its byte limit", events);
+            return false;
+        }
+        if pending.id.len() > MAX_TOOL_ID_BYTES {
+            self.fail("streamed tool call id exceeds its byte limit", events);
+            return false;
+        }
+        true
+    }
+
+    /// Append an arguments fragment, enforcing the per-call and cumulative
+    /// bounds. A fragment for a call that was never opened fails closed.
+    fn extend_tool_call(&mut self, index: i64, fragment: &str, events: &mut Vec<StreamEvent>) {
+        if self.phase != Phase::Streaming || fragment.is_empty() {
+            return;
+        }
+        let Some(position) = self.pending_index(index) else {
+            self.fail(
+                "tool-call arguments arrived for an unopened tool call",
+                events,
+            );
+            return;
+        };
+        let total = self.delivered_tool_bytes.saturating_add(fragment.len());
+        if total > MAX_MODEL_TEXT_BYTES {
+            self.fail(
+                &format!("streamed tool arguments exceed the {MAX_MODEL_TEXT_BYTES} byte limit"),
+                events,
+            );
+            return;
+        }
+        self.delivered_tool_bytes = total;
+        let pending = &mut self.pending_tools[position];
+        pending.arguments.push_str(fragment);
+        if pending.arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+            self.fail(
+                &format!(
+                    "one tool call's arguments exceed the {MAX_TOOL_ARGUMENTS_BYTES} byte limit"
+                ),
+                events,
+            );
+        }
+    }
+
+    /// Emit the tool call accumulating at `index`, if any. Anthropic closes
+    /// each `tool_use` block explicitly; other content blocks close with no
+    /// pending call and are a no-op here.
+    fn close_tool_call(&mut self, index: i64, events: &mut Vec<StreamEvent>) {
+        if self.phase != Phase::Streaming {
+            return;
+        }
+        let Some(position) = self.pending_index(index) else {
+            return;
+        };
+        let pending = self.pending_tools.remove(position);
+        events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
+    }
+
+    /// Emit every still-open tool call, in the order they were opened. Used
+    /// at the completion frame, where OpenAI-compatible streams have no
+    /// per-call terminator.
+    fn flush_tool_calls(&mut self, events: &mut Vec<StreamEvent>) {
+        for pending in std::mem::take(&mut self.pending_tools) {
+            events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
+        }
+    }
+
     /// Emit a text delta, enforcing the cumulative text bound. Empty deltas
     /// are dropped; they carry no information.
     fn deliver_text(&mut self, text: &str, events: &mut Vec<StreamEvent>) {
@@ -451,6 +669,7 @@ impl StreamParser {
         if self.phase != Phase::Streaming {
             return;
         }
+        self.flush_tool_calls(events);
         if self.usage.input_tokens.is_some() || self.usage.output_tokens.is_some() {
             events.push(StreamEvent::Usage(self.usage));
         }
@@ -468,6 +687,28 @@ impl StreamParser {
         self.phase = Phase::Failed;
         self.line = Vec::new();
         self.event_data = String::new();
+        // A half-accumulated call is never emitted: an incomplete argument
+        // fragment must not become a reviewable command.
+        self.pending_tools = Vec::new();
+    }
+}
+
+/// Anthropic's block index and OpenAI's `tool_calls[].index` both live here.
+fn block_index(frame: &Value) -> i64 {
+    frame.get("index").and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn finished_tool_call(pending: PendingToolCall) -> ToolCall {
+    ToolCall {
+        id: pending.id,
+        name: pending.name,
+        // Normalize "no fragments arrived" to the empty object, so the value
+        // matches what the non-streaming parser reports for `input: {}`.
+        arguments: if pending.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            pending.arguments
+        },
     }
 }
 
@@ -610,6 +851,7 @@ mod tests {
     #[derive(Debug, Default, PartialEq)]
     struct Folded {
         text: String,
+        calls: Vec<ToolCall>,
         reached_token_limit: bool,
         usage: Option<Usage>,
         done: bool,
@@ -621,6 +863,7 @@ mod tests {
         for event in events {
             match event {
                 StreamEvent::TextDelta(delta) => folded.text.push_str(delta),
+                StreamEvent::ToolCall(call) => folded.calls.push(call.clone()),
                 StreamEvent::ReachedTokenLimit => folded.reached_token_limit = true,
                 StreamEvent::Usage(usage) => folded.usage = Some(*usage),
                 StreamEvent::Done => folded.done = true,
@@ -1047,6 +1290,324 @@ mod tests {
             "eval_count": 298,
         });
         assert_stream_matches_parse(Provider::Ollama, &ollama_body("length"), &non_streaming);
+    }
+
+    /// An Anthropic tool_use block whose JSON arguments arrive in fragments,
+    /// after a prose preamble in a separate text block.
+    fn anthropic_tool_body() -> String {
+        [
+            sse(
+                "message_start",
+                &json!({"type": "message_start", "message": {
+                    "usage": {"input_tokens": 25, "output_tokens": 1}}}),
+            ),
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": "Checking 编译 first."}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 1,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                        "delta": {"type": "input_json_delta", "partial_json": "{\"comm"}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                        "delta": {"type": "input_json_delta", "partial_json": "and\": \"ls "}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                        "delta": {"type": "input_json_delta", "partial_json": "-la\"}"}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 1}),
+            ),
+            sse(
+                "message_delta",
+                &json!({"type": "message_delta",
+                        "delta": {"stop_reason": "tool_use"},
+                        "usage": {"output_tokens": 15}}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat()
+    }
+
+    /// The OpenAI-compatible equivalent: index-keyed `tool_calls` deltas whose
+    /// `arguments` string arrives in fragments.
+    fn openai_tool_body() -> String {
+        [
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"role": "assistant", "content": "Checking 编译 first."},
+                 "finish_reason": null},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "type": "function",
+                     "function": {"name": "run", "arguments": ""}},
+                ]}, "finish_reason": null},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "{\"comm"}},
+                ]}, "finish_reason": null},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "and\": \"ls "}},
+                ]}, "finish_reason": null},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "function": {"arguments": "-la\"}"}},
+                ]}, "finish_reason": null},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+            ], "usage": {"prompt_tokens": 9, "completion_tokens": 12}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat()
+    }
+
+    fn expected_run_call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "run".into(),
+            arguments: "{\"command\": \"ls -la\"}".into(),
+        }
+    }
+
+    #[test]
+    fn split_tool_call_deltas_accumulate_into_one_call() {
+        for (provider, body, id) in [
+            (Provider::Anthropic, anthropic_tool_body(), "toolu_1"),
+            (Provider::OpenAiCompatible, openai_tool_body(), "call_1"),
+        ] {
+            let events = run(provider, &body);
+            let folded = fold(&events);
+            assert_eq!(folded.text, "Checking 编译 first.", "{provider:?}");
+            assert_eq!(folded.calls, vec![expected_run_call(id)], "{provider:?}");
+            assert!(folded.done, "{provider:?}");
+            assert_eq!(folded.protocol, None, "{provider:?}");
+
+            // The completed call is ordered before Usage and Done.
+            let call_at = events
+                .iter()
+                .position(|event| matches!(event, StreamEvent::ToolCall(_)))
+                .expect("tool call event");
+            let done_at = events
+                .iter()
+                .position(|event| *event == StreamEvent::Done)
+                .expect("done event");
+            assert!(call_at < done_at, "{provider:?}");
+
+            // Byte-at-a-time delivery splits every fragment and still yields
+            // exactly the same events.
+            let mut parser = StreamParser::new(provider);
+            let mut split = Vec::new();
+            for byte in body.as_bytes() {
+                split.extend(parser.push(std::slice::from_ref(byte)));
+            }
+            split.extend(parser.finish());
+            assert_eq!(split, events, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn streamed_tool_call_matches_the_non_streaming_reply() {
+        use crate::tools::{parse_tool_response, ToolResponse};
+
+        let non_streaming = json!({
+            "content": [
+                {"type": "text", "text": "Checking 编译 first."},
+                {"type": "tool_use", "id": "toolu_1", "name": "run",
+                 "input": {"command": "ls -la"}},
+            ],
+            "stop_reason": "tool_use",
+        });
+        let parsed = parse_tool_response(Provider::Anthropic, &non_streaming).unwrap();
+        let folded = fold(&run(Provider::Anthropic, &anthropic_tool_body()));
+        let streamed = ToolResponse::new(folded.text, folded.calls);
+        assert_eq!(streamed.text, parsed.text);
+        assert_eq!(streamed.calls.len(), parsed.calls.len());
+        assert_eq!(streamed.calls[0].id, parsed.calls[0].id);
+        assert_eq!(streamed.calls[0].name, parsed.calls[0].name);
+        // The same action, and therefore the same session behavior.
+        assert_eq!(streamed.to_action(), parsed.to_action());
+        assert!(streamed.to_action().is_ok());
+    }
+
+    #[test]
+    fn truncated_tool_call_is_never_emitted() {
+        for (provider, body) in [
+            (Provider::Anthropic, anthropic_tool_body()),
+            (Provider::OpenAiCompatible, openai_tool_body()),
+        ] {
+            // Cut inside the argument fragments, before the call is closed.
+            let cut = body.find("-la\\\"}").expect("fragment marker");
+            let mut parser = StreamParser::new(provider);
+            let mut events = parser.push(&body.as_bytes()[..cut]);
+            events.extend(parser.finish());
+            let folded = fold(&events);
+            assert_eq!(folded.calls, Vec::new(), "{provider:?}");
+            assert!(folded.protocol.is_some(), "{provider:?}");
+            assert!(!folded.done, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_tool_frames_fail_closed() {
+        // Anthropic: a tool_use block with no name.
+        let body = sse(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "tool_use", "id": "toolu_1"}}),
+        );
+        assert_eq!(
+            run(Provider::Anthropic, &body),
+            vec![StreamEvent::Protocol(
+                "tool_use block carries no name".into()
+            )]
+        );
+
+        // Anthropic: an input_json_delta with no payload.
+        let body = sse(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "input_json_delta"}}),
+        );
+        assert_eq!(
+            run(Provider::Anthropic, &body),
+            vec![StreamEvent::Protocol(
+                "input_json_delta frame carries no partial_json".into()
+            )]
+        );
+
+        // Anthropic: arguments for a block that was never opened as a tool.
+        let body = sse(
+            "content_block_delta",
+            &json!({"type": "content_block_delta", "index": 3,
+                    "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+        );
+        assert_eq!(
+            run(Provider::Anthropic, &body),
+            vec![StreamEvent::Protocol(
+                "tool-call arguments arrived for an unopened tool call".into()
+            )]
+        );
+
+        // OpenAI: non-string arguments in a delta.
+        let body = openai_line(&json!({"choices": [
+            {"index": 0, "delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "run", "arguments": 42}},
+            ]}},
+        ]}));
+        assert_eq!(
+            run(Provider::OpenAiCompatible, &body),
+            vec![StreamEvent::Protocol(
+                "tool call arguments are not a string".into()
+            )]
+        );
+
+        // OpenAI: tool_calls that is not an array.
+        let body = openai_line(&json!({"choices": [
+            {"index": 0, "delta": {"tool_calls": "run"}},
+        ]}));
+        assert_eq!(
+            run(Provider::OpenAiCompatible, &body),
+            vec![StreamEvent::Protocol(
+                "delta tool_calls is not an array".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn oversized_tool_arguments_fail_closed() {
+        let fragment = "a".repeat(32 * 1024);
+        let mut parser = StreamParser::new(Provider::OpenAiCompatible);
+        let mut events = parser.push(
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "call_1", "function": {"name": "run", "arguments": ""}},
+                ]}},
+            ]}))
+            .as_bytes(),
+        );
+        for _ in 0..3 {
+            events.extend(
+                parser.push(
+                    openai_line(&json!({"choices": [
+                        {"index": 0, "delta": {"tool_calls": [
+                            {"index": 0, "function": {"arguments": fragment}},
+                        ]}},
+                    ]}))
+                    .as_bytes(),
+                ),
+            );
+        }
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Protocol(message)) if message.contains("byte limit")
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_))));
+        assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn parallel_tool_calls_are_surfaced_separately_for_the_caller_to_reject() {
+        // The parser reports what arrived; the "exactly one call" rule lives
+        // in ToolResponse::to_action so streaming and non-streaming agree.
+        let body = [
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "a", "function": {"name": "run", "arguments": "{}"}},
+                    {"index": 1, "id": "b", "function": {"name": "say", "arguments": "{}"}},
+                ]}},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {}, "finish_reason": "tool_calls"},
+            ]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let folded = fold(&run(Provider::OpenAiCompatible, &body));
+        assert_eq!(folded.calls.len(), 2);
+        assert_eq!(folded.calls[0].id, "a");
+        assert_eq!(folded.calls[1].id, "b");
+        assert_eq!(
+            crate::tools::ToolResponse::new("", folded.calls).to_action(),
+            Err(crate::session::ParseError::MultipleToolCalls(2))
+        );
+    }
+
+    #[test]
+    fn text_only_streams_are_unchanged_by_tool_support() {
+        for provider in ALL_PROVIDERS {
+            let folded = fold(&run(provider, &happy_body(provider)));
+            assert_eq!(folded.calls, Vec::new(), "{provider:?}");
+            assert_eq!(folded.text, TEXT, "{provider:?}");
+        }
     }
 
     fn assert_stream_matches_parse(provider: Provider, streaming: &str, non_streaming: &Value) {

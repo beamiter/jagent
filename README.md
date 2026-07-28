@@ -13,11 +13,12 @@ the parts that must behave identically everywhere.
 
 | Module     | Contents |
 |------------|----------|
-| `session`  | Pure agent state machine: strict JSON `run`/`say`/`done` protocol, proposal approval/rejection/manual-review transitions, bounded transcript, turn budget, cancellation. |
+| `session`  | Pure agent state machine: strict `run`/`say`/`done` protocol (`parse_action` for JSON-in-text, `parse_tool_action` for native tool calls — both yielding the same `ParsedAction`), proposal approval/rejection/manual-review transitions, bounded transcript, turn budget, cancellation. |
 | `safety`   | `is_dangerous` destructive-pattern warnings and the fail-closed `is_auto_approvable` read-only allowlist. |
-| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data, plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
-| `prompt`   | Agent system prompt and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
-| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ReachedTokenLimit` / `Usage` / `Done` events; malformed frames fail closed. Pair with `build_chat_request_streaming`. |
+| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data (`build_agent_chat_request` adds an `AgentProtocol` selector), plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
+| `prompt`   | Agent system prompts — `build_agent_system_prompt` (JSON protocol) and `build_agent_tool_system_prompt` (schema-carried protocol) — and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
+| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events; tool-call argument deltas accumulate into one complete call, and malformed frames fail closed. Pair with `build_chat_request_streaming`. |
+| `tools`    | The same three actions carried by the providers' **native** tool-calling: provider-correct schemas (Anthropic `input_schema`, OpenAI `function`/`parameters`; Ollama returns `InvalidConfiguration`), plus `parse_tool_response` → `ToolResponse::to_action` ingestion into the identical `ParsedAction` values. Fully additive: `AgentProtocol::Text` reproduces 0.4 byte-for-byte. |
 
 ## Invariants
 
@@ -50,6 +51,36 @@ let request = provider::build_chat_request(
 //     ModelOutcome::Said(text) | ModelOutcome::Completed(text) => { /* render */ }
 // }
 ```
+
+The same loop over the providers' native tool-calling — the provider enforces
+the action schema, so no JSON-in-text parsing is involved:
+
+```rust
+use jagent::{provider, tools, AgentProtocol, AgentSession, ModelOutcome};
+
+let protocol = AgentProtocol::NativeTools;
+let request = provider::build_agent_chat_request(
+    &config,
+    Some(&jagent::build_agent_tool_system_prompt()),
+    &[provider::Message {
+        role: jagent::Role::User,
+        text: session.build_user_prompt_with(protocol),
+    }],
+    protocol,
+)?;
+// ... perform `request` with your own HTTP stack ...
+// let reply = tools::parse_tool_response(config.provider, &response_json)?;
+// match session.accept_model_tool_reply(&reply)? {
+//     ModelOutcome::Proposal { id, command, danger } => { /* same review UI */ }
+//     ModelOutcome::Said(text) | ModelOutcome::Completed(text) => { /* render */ }
+// }
+```
+
+A tool call is still only a proposal: it becomes the same `ParsedAction`, walks
+the same state machine, and approval still returns an `ApprovedCommand` that
+only the caller can act on. A reply must carry **exactly one** tool call — zero
+fails closed even when prose is present, and prose alongside a call is kept as
+the action's visible thought rather than dropped.
 
 ## License
 

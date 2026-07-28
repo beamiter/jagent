@@ -19,6 +19,12 @@
 //! - [`stream`] — sans-IO incremental parsing of streaming chat response
 //!   bodies (Anthropic SSE, OpenAI-compatible SSE, Ollama NDJSON) into
 //!   byte-bounded [`stream::StreamEvent`]s.
+//! - [`tools`] — the same `run`/`say`/`done` actions carried by the
+//!   providers' *native* tool-calling instead of JSON-in-text, so the
+//!   provider enforces the schema. Additive: [`tools::AgentProtocol::Text`]
+//!   keeps today's behavior byte-for-byte, and tool calls are converted into
+//!   the same [`session::ParsedAction`] values, so the state machine and
+//!   every invariant below apply unchanged.
 //!
 //! # Invariants (inherited from jterm4)
 //!
@@ -36,9 +42,11 @@ pub mod safety;
 pub mod session;
 pub mod stream;
 mod text;
+pub mod tools;
 
 pub use prompt::{
-    agent_user_prompt, build_agent_system_prompt, BlockContext, EnvironmentMeta, GitMeta,
+    agent_user_prompt, build_agent_system_prompt, build_agent_tool_system_prompt, BlockContext,
+    EnvironmentMeta, GitMeta,
 };
 pub use provider::{
     ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role, Usage,
@@ -51,3 +59,4 @@ pub use session::{
     MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
 pub use stream::{StreamEvent, StreamParser};
+pub use tools::{AgentProtocol, ToolCall, ToolResponse};

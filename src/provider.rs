@@ -6,6 +6,7 @@
 //! [`parse_chat_response`]. Nothing in this module opens a socket.
 
 use crate::text::elide_middle;
+use crate::tools::{agent_body_fields, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -117,7 +118,12 @@ pub enum ProviderError {
     InvalidConfiguration(String),
     MissingApiKey(Provider),
     EmptyResponse,
-    ResponseTooLarge { limit: usize },
+    ResponseTooLarge {
+        limit: usize,
+    },
+    /// The reply's shape violates the provider's own wire format — for
+    /// example a tool call with no name. Fail closed rather than guess.
+    MalformedResponse(String),
 }
 
 impl std::fmt::Display for ProviderError {
@@ -131,6 +137,7 @@ impl std::fmt::Display for ProviderError {
             Self::ResponseTooLarge { limit } => {
                 write!(f, "model response exceeds the {limit} byte limit")
             }
+            Self::MalformedResponse(detail) => write!(f, "malformed model response: {detail}"),
         }
     }
 }
@@ -275,11 +282,72 @@ pub fn build_chat_request_streaming(
     build_request(config, system, history, true)
 }
 
+/// Build one agent-loop chat POST in the requested protocol.
+///
+/// [`AgentProtocol::Text`] is byte-identical to [`build_chat_request`] — the
+/// JSON-in-text protocol parsed by [`crate::session::parse_action`].
+/// [`AgentProtocol::NativeTools`] adds the provider-correct `tools` and
+/// `tool_choice` fields (see [`crate::tools`]) and changes nothing else;
+/// replies are then ingested with [`crate::tools::parse_tool_response`].
+///
+/// Ollama has no standard tool-calling in the chat endpoint this crate
+/// targets, so native mode returns [`ProviderError::InvalidConfiguration`]
+/// there instead of emitting a request that would degrade to prose.
+pub fn build_agent_chat_request(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+) -> Result<HttpRequest, ProviderError> {
+    build_agent_request(config, system, history, protocol, false)
+}
+
+/// [`build_agent_chat_request`] with the provider's streaming flag set, as
+/// [`build_chat_request_streaming`] does. Tool-call deltas in the response are
+/// accumulated by [`crate::stream::StreamParser`].
+pub fn build_agent_chat_request_streaming(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+) -> Result<HttpRequest, ProviderError> {
+    build_agent_request(config, system, history, protocol, true)
+}
+
+fn build_agent_request(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+    stream: bool,
+) -> Result<HttpRequest, ProviderError> {
+    match protocol {
+        AgentProtocol::Text => build_request(config, system, history, stream),
+        AgentProtocol::NativeTools => {
+            // Validate the configuration before reporting protocol support so
+            // the error the caller sees is the first thing actually wrong.
+            config.validate()?;
+            let extra = agent_body_fields(config.provider)?;
+            build_request_with(config, system, history, stream, &extra)
+        }
+    }
+}
+
 fn build_request(
     config: &ChatConfig,
     system: Option<&str>,
     history: &[Message],
     stream: bool,
+) -> Result<HttpRequest, ProviderError> {
+    build_request_with(config, system, history, stream, &[])
+}
+
+fn build_request_with(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    stream: bool,
+    extra_body_fields: &[(&'static str, Value)],
 ) -> Result<HttpRequest, ProviderError> {
     config.validate()?;
     let api_key = config
@@ -303,7 +371,10 @@ fn build_request(
             }
         }
     }
-    let body = request_body(config, system, history, stream);
+    let mut body = request_body(config, system, history, stream);
+    for (field, value) in extra_body_fields {
+        body[*field] = value.clone();
+    }
     Ok(HttpRequest {
         url: config.provider.endpoint(&config.base_url),
         headers,
@@ -418,18 +489,7 @@ pub fn parse_chat_response_full(
     provider: Provider,
     response: &Value,
 ) -> Result<ChatResponse, ProviderError> {
-    let reached_token_limit = match provider {
-        Provider::Anthropic => {
-            response.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
-        }
-        Provider::OpenAiCompatible => {
-            response
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-                == Some("length")
-        }
-        Provider::Ollama => response.get("done_reason").and_then(Value::as_str) == Some("length"),
-    };
+    let reached_token_limit = reached_token_limit(provider, response);
     let text = match provider {
         Provider::Anthropic => response
             .get("content")
@@ -472,8 +532,25 @@ pub fn parse_chat_response_full(
     })
 }
 
+/// Did the provider stop at the output-token limit? Shared by the text and
+/// native-tool ingestion paths so both report the same condition.
+pub(crate) fn reached_token_limit(provider: Provider, response: &Value) -> bool {
+    match provider {
+        Provider::Anthropic => {
+            response.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+        }
+        Provider::OpenAiCompatible => {
+            response
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("length")
+        }
+        Provider::Ollama => response.get("done_reason").and_then(Value::as_str) == Some("length"),
+    }
+}
+
 /// Best-effort usage extraction; providers that omit the fields yield `None`.
-fn parse_usage(provider: Provider, response: &Value) -> Option<Usage> {
+pub(crate) fn parse_usage(provider: Provider, response: &Value) -> Option<Usage> {
     let (input, output) = match provider {
         Provider::Anthropic => (
             response.pointer("/usage/input_tokens"),
@@ -495,7 +572,7 @@ fn parse_usage(provider: Provider, response: &Value) -> Option<Usage> {
     (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
 }
 
-fn content_text(value: &Value) -> Option<String> {
+pub(crate) fn content_text(value: &Value) -> Option<String> {
     if let Some(text) = value.as_str() {
         return Some(text.to_string());
     }
