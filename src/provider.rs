@@ -260,6 +260,27 @@ pub fn build_chat_request(
     system: Option<&str>,
     history: &[Message],
 ) -> Result<HttpRequest, ProviderError> {
+    build_request(config, system, history, false)
+}
+
+/// [`build_chat_request`] with the provider's streaming flag set
+/// (`"stream": true` for all three providers). The response body then
+/// arrives as SSE (Anthropic, OpenAI-compatible) or NDJSON (Ollama) and is
+/// parsed incrementally with [`crate::stream::StreamParser`].
+pub fn build_chat_request_streaming(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+) -> Result<HttpRequest, ProviderError> {
+    build_request(config, system, history, true)
+}
+
+fn build_request(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    stream: bool,
+) -> Result<HttpRequest, ProviderError> {
     config.validate()?;
     let api_key = config
         .api_key
@@ -282,7 +303,7 @@ pub fn build_chat_request(
             }
         }
     }
-    let body = request_body(config, system, history);
+    let body = request_body(config, system, history, stream);
     Ok(HttpRequest {
         url: config.provider.endpoint(&config.base_url),
         headers,
@@ -290,7 +311,12 @@ pub fn build_chat_request(
     })
 }
 
-fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) -> Value {
+fn request_body(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    stream: bool,
+) -> Value {
     let mut messages: Vec<Value> = history
         .iter()
         .map(|turn| json!({"role": turn.role.as_str(), "content": turn.text}))
@@ -308,6 +334,9 @@ fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) 
             if let Some(temperature) = config.temperature {
                 body["temperature"] = json!(temperature);
             }
+            if stream {
+                body["stream"] = json!(true);
+            }
             body
         }
         Provider::OpenAiCompatible => {
@@ -322,6 +351,13 @@ fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) 
             if let Some(temperature) = config.temperature {
                 body["temperature"] = json!(temperature);
             }
+            if stream {
+                body["stream"] = json!(true);
+                // Most Chat Completions servers only report token usage during
+                // streaming when asked; the parser treats the frame as optional
+                // so servers that ignore this stay compatible.
+                body["stream_options"] = json!({"include_usage": true});
+            }
             body
         }
         Provider::Ollama => {
@@ -331,7 +367,7 @@ fn request_body(config: &ChatConfig, system: Option<&str>, history: &[Message]) 
             let mut body = json!({
                 "model": config.model,
                 "messages": messages,
-                "stream": false,
+                "stream": stream,
                 "options": {"num_predict": config.max_tokens},
             });
             if let Some(temperature) = config.temperature {
@@ -521,6 +557,48 @@ mod tests {
         let body: Value = serde_json::from_str(&ollama.body).unwrap();
         assert_eq!(body["stream"], false);
         assert_eq!(body["options"]["num_predict"], 512);
+    }
+
+    #[test]
+    fn streaming_requests_only_add_the_streaming_fields() {
+        let history = [user("hello")];
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let plain = build_chat_request(&config(provider), Some("sys"), &history).unwrap();
+            let streaming =
+                build_chat_request_streaming(&config(provider), Some("sys"), &history).unwrap();
+            assert_eq!(streaming.url, plain.url);
+            assert_eq!(streaming.headers, plain.headers);
+            let mut streaming_body: Value = serde_json::from_str(&streaming.body).unwrap();
+            assert_eq!(streaming_body["stream"], true, "{provider:?}");
+            let plain_body: Value = serde_json::from_str(&plain.body).unwrap();
+            // Normalizing the streaming-only fields away recovers the
+            // non-streaming body exactly; nothing else may differ.
+            match provider {
+                Provider::Ollama => {
+                    assert_eq!(plain_body["stream"], false);
+                    streaming_body["stream"] = json!(false);
+                }
+                Provider::OpenAiCompatible => {
+                    assert!(plain_body.get("stream").is_none());
+                    assert_eq!(
+                        streaming_body["stream_options"],
+                        json!({"include_usage": true}),
+                    );
+                    let body = streaming_body.as_object_mut().unwrap();
+                    body.remove("stream");
+                    body.remove("stream_options");
+                }
+                Provider::Anthropic => {
+                    assert!(plain_body.get("stream").is_none());
+                    streaming_body.as_object_mut().unwrap().remove("stream");
+                }
+            }
+            assert_eq!(streaming_body, plain_body, "{provider:?}");
+        }
     }
 
     #[test]

@@ -16,6 +16,9 @@
 //! - [`prompt`] — the agent system prompt and user-role context encoding.
 //!   Terminal bytes and environment metadata are always carried as explicitly
 //!   untrusted user-role data, never interpolated into system instructions.
+//! - [`stream`] — sans-IO incremental parsing of streaming chat response
+//!   bodies (Anthropic SSE, OpenAI-compatible SSE, Ollama NDJSON) into
+//!   byte-bounded [`stream::StreamEvent`]s.
 //!
 //! # Invariants (inherited from jterm4)
 //!
@@ -31,6 +34,7 @@ pub mod provider;
 pub mod redact;
 pub mod safety;
 pub mod session;
+pub mod stream;
 mod text;
 
 pub use prompt::{
@@ -46,3 +50,4 @@ pub use session::{
     ModelOutcome, ParseError, ProposalId, ProposalStatus, SessionError, Turn,
     MAX_AGENT_SNAPSHOT_JSON_BYTES,
 };
+pub use stream::{StreamEvent, StreamParser};

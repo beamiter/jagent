@@ -17,6 +17,7 @@ the parts that must behave identically everywhere.
 | `safety`   | `is_dangerous` destructive-pattern warnings and the fail-closed `is_auto_approvable` read-only allowlist. |
 | `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data, plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
 | `prompt`   | Agent system prompt and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
+| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ReachedTokenLimit` / `Usage` / `Done` events; malformed frames fail closed. Pair with `build_chat_request_streaming`. |
 
 ## Invariants
 
