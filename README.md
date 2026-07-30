@@ -2,7 +2,7 @@
 
 Review-first terminal AI agent core, extracted from
 [jterm4](https://github.com/beamiter/jterm4)'s native Shell Agent so the same
-agent behavior can be embedded in [rsh](https://github.com/beamiter/rsh) and
+agent behavior can be embedded in [jsh](https://github.com/beamiter/jsh) and
 other terminals (jterm1/2/3).
 
 The crate is deliberately **sans-IO**: no HTTP client, no PTY, no process
