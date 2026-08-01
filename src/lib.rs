@@ -8,8 +8,8 @@
 //! - [`session`] — the pure agent state machine. The model may only *propose*
 //!   commands; approval returns an [`session::ApprovedCommand`] value to the
 //!   caller, and nothing in this crate can execute it.
-//! - [`safety`] — recognizable-danger warnings and the fail-closed read-only
-//!   auto-approval allowlist.
+//! - [`safety`] — recognizable-danger warnings and a retired auto-approval
+//!   compatibility hook that always fails closed.
 //! - [`provider`] — provider-neutral chat request construction (Anthropic /
 //!   OpenAI-compatible / Ollama) returning plain [`provider::HttpRequest`]
 //!   data, plus strict response text extraction.
@@ -34,6 +34,8 @@
 //!    command proposal.
 //! 3. All transcripts, observations, and context payloads are byte-bounded.
 //! 4. Terminal output and environment metadata are untrusted user-role data.
+//! 5. Persisted sessions are revalidated on restore; proposal ids uniquely
+//!    bind an approval action to the pending command the caller displayed.
 
 pub mod prompt;
 pub mod provider;
@@ -56,7 +58,7 @@ pub use safety::{is_auto_approvable, is_dangerous};
 pub use session::{
     AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
     ModelOutcome, ParseError, ProposalId, ProposalStatus, SessionError, Turn,
-    MAX_AGENT_SNAPSHOT_JSON_BYTES,
+    MAX_ACTION_JSON_BYTES, MAX_AGENT_SNAPSHOT_JSON_BYTES, MAX_SESSION_TURNS,
 };
 pub use stream::{StreamEvent, StreamParser};
 pub use tools::{AgentProtocol, ToolCall, ToolResponse};

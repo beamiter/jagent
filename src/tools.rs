@@ -45,6 +45,7 @@ use crate::provider::{Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES};
 use crate::session::{parse_tool_action, ParseError, ParsedAction, MAX_THOUGHT_BYTES};
 use crate::text::elide_middle;
 use serde_json::{json, Value};
+use std::io::{self, Write};
 
 /// Tool name for the command-proposal action.
 pub const TOOL_RUN: &str = "run";
@@ -61,8 +62,8 @@ pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_NAME_BYTES: usize = 64;
 /// Byte cap for the provider-assigned call id, which is never interpreted.
 pub const MAX_TOOL_ID_BYTES: usize = 256;
-/// Cap on tool calls buffered from one streaming response before failing
-/// closed. The protocol accepts exactly one; this only bounds memory.
+/// Cap on tool calls retained from one provider response before failing
+/// closed. The protocol accepts exactly one; this only bounds parsing memory.
 pub const MAX_STREAM_TOOL_CALLS: usize = 8;
 
 const NATIVE_TOOLS_UNSUPPORTED: &str =
@@ -125,8 +126,12 @@ impl ToolResponse {
 
     /// Resolve this reply to exactly one action, applying the mixed
     /// text-and-tool rule documented at the module level. Fails closed on
-    /// zero or multiple tool calls, unknown names, and malformed arguments.
+    /// token-limited output, zero or multiple tool calls, unknown names, and
+    /// malformed arguments.
     pub fn to_action(&self) -> Result<ParsedAction, ParseError> {
+        if self.reached_token_limit {
+            return Err(ParseError::TruncatedResponse);
+        }
         let call = match self.calls.as_slice() {
             [] => return Err(ParseError::NoToolCall),
             [call] => call,
@@ -311,24 +316,26 @@ pub fn parse_tool_response(
 }
 
 fn anthropic_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderError> {
-    let mut texts = Vec::new();
     let mut calls = Vec::new();
     let parts = response
         .get("content")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    let text = crate::provider::join_model_text(
+        parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str)),
+    )?;
     for part in parts {
         match part.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    texts.push(text);
-                }
-            }
+            Some("text") => {}
             Some("tool_use") => {
+                ensure_tool_call_capacity(&calls)?;
                 let arguments = match part.get("input") {
                     None | Some(Value::Null) => String::new(),
-                    Some(input @ Value::Object(_)) => input.to_string(),
+                    Some(input @ Value::Object(_)) => serialize_tool_arguments(input)?,
                     Some(_) => {
                         return Err(malformed("tool_use input is not a JSON object"));
                     }
@@ -343,20 +350,21 @@ fn anthropic_parts(response: &Value) -> Result<(String, Vec<ToolCall>), Provider
             _ => {}
         }
     }
-    Ok((texts.join("\n"), calls))
+    Ok((text, calls))
 }
 
 fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderError> {
     let message = response.pointer("/choices/0/message");
-    let text = message
-        .and_then(|message| message.get("content"))
-        .and_then(crate::provider::content_text)
-        .unwrap_or_default();
+    let text = match message.and_then(|message| message.get("content")) {
+        Some(content) => crate::provider::content_text(content)?.unwrap_or_default(),
+        None => String::new(),
+    };
     let mut calls = Vec::new();
     match message.and_then(|message| message.get("tool_calls")) {
         None | Some(Value::Null) => {}
         Some(Value::Array(entries)) => {
             for entry in entries {
+                ensure_tool_call_capacity(&calls)?;
                 let function = entry
                     .get("function")
                     .ok_or_else(|| malformed("tool_calls entry has no function object"))?;
@@ -365,8 +373,8 @@ fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderErr
                 // accepted here and re-parsed strictly either way.
                 let arguments = match function.get("arguments") {
                     None | Some(Value::Null) => String::new(),
-                    Some(Value::String(arguments)) => arguments.clone(),
-                    Some(object @ Value::Object(_)) => object.to_string(),
+                    Some(Value::String(arguments)) => bounded_tool_arguments(arguments)?,
+                    Some(object @ Value::Object(_)) => serialize_tool_arguments(object)?,
                     Some(_) => {
                         return Err(malformed(
                             "tool call arguments are neither a JSON string nor an object",
@@ -387,6 +395,74 @@ fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderErr
 
 fn malformed(detail: &str) -> ProviderError {
     ProviderError::MalformedResponse(detail.to_string())
+}
+
+fn ensure_tool_call_capacity(calls: &[ToolCall]) -> Result<(), ProviderError> {
+    if calls.len() >= MAX_STREAM_TOOL_CALLS {
+        return Err(malformed(&format!(
+            "response contains more than {MAX_STREAM_TOOL_CALLS} tool calls"
+        )));
+    }
+    Ok(())
+}
+
+fn bounded_tool_arguments(arguments: &str) -> Result<String, ProviderError> {
+    if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: MAX_TOOL_ARGUMENTS_BYTES,
+        });
+    }
+    Ok(arguments.to_string())
+}
+
+/// Serialize provider-native argument objects through a bounded writer. Using
+/// `Value::to_string()` and checking afterwards would transiently allocate the
+/// entire attacker-controlled object, including JSON escaping expansion.
+fn serialize_tool_arguments(arguments: &Value) -> Result<String, ProviderError> {
+    let mut writer = BoundedJsonWriter::new(MAX_TOOL_ARGUMENTS_BYTES);
+    if let Err(error) = serde_json::to_writer(&mut writer, arguments) {
+        if writer.exceeded {
+            return Err(ProviderError::ResponseTooLarge {
+                limit: MAX_TOOL_ARGUMENTS_BYTES,
+            });
+        }
+        return Err(ProviderError::MalformedResponse(format!(
+            "could not serialize tool arguments: {error}"
+        )));
+    }
+    String::from_utf8(writer.bytes)
+        .map_err(|_| malformed("serialized tool arguments are not valid UTF-8"))
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(io::Error::other("JSON output exceeds its byte limit"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn bounded_id(value: Option<&Value>) -> String {
@@ -858,11 +934,57 @@ mod tests {
                 "arguments": format!("{{\"command\":\"{}\"}}", "a".repeat(MAX_TOOL_ARGUMENTS_BYTES)),
             }}],
         }));
-        let parsed = parse_tool_response(Provider::OpenAiCompatible, &reply).unwrap();
-        assert_eq!(
-            parsed.to_action(),
-            Err(ParseError::FieldTooLarge("arguments"))
-        );
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &reply),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_TOOL_ARGUMENTS_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn native_response_parsing_bounds_calls_text_and_argument_serialization() {
+        let calls: Vec<Value> = (0..=MAX_STREAM_TOOL_CALLS)
+            .map(|index| {
+                json!({
+                    "id": format!("call_{index}"),
+                    "function": {"name": "run", "arguments": "{}"},
+                })
+            })
+            .collect();
+        let reply = openai_reply(json!({"tool_calls": calls}));
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &reply),
+            Err(ProviderError::MalformedResponse(message))
+                if message.contains("more than")
+        ));
+
+        let half = "x".repeat(MAX_MODEL_TEXT_BYTES / 2);
+        let reply = anthropic_reply(json!([
+            {"type": "text", "text": half},
+            {"type": "text", "text": half},
+        ]));
+        assert!(matches!(
+            parse_tool_response(Provider::Anthropic, &reply),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES
+            })
+        ));
+
+        // The decoded object is under the limit, but JSON escaping would
+        // expand it far past the wire budget. The bounded writer must stop
+        // serialization without materializing that expanded string.
+        let reply = anthropic_reply(json!([{
+            "type": "tool_use",
+            "name": "say",
+            "input": {"message": "\u{0}".repeat(MAX_TOOL_ARGUMENTS_BYTES / 2)},
+        }]));
+        assert!(matches!(
+            parse_tool_response(Provider::Anthropic, &reply),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_TOOL_ARGUMENTS_BYTES
+            })
+        ));
     }
 
     #[test]
@@ -874,6 +996,7 @@ mod tests {
         let parsed = parse_tool_response(Provider::Anthropic, &reply).unwrap();
         assert!(parsed.reached_token_limit);
         assert_eq!(parsed.usage, None);
+        assert_eq!(parsed.to_action(), Err(ParseError::TruncatedResponse));
 
         // An empty reply is not an error here (a bare tool call has no text);
         // it fails closed one layer up instead.

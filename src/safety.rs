@@ -7,6 +7,9 @@ pub(crate) const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// or blocks a proposal; it gives the approval UI a reason to slow the user.
 pub fn is_dangerous(command: &str) -> Option<&'static str> {
     let command = command.trim();
+    if command.len() > MAX_COMMAND_BYTES {
+        return Some("command exceeds the safe review size limit");
+    }
     let lower = command.to_ascii_lowercase();
     let tokens: Vec<&str> = lower
         .split_whitespace()
@@ -48,6 +51,31 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
     {
         return Some("recursive chmod 777 on a top-level path");
     }
+    match effective.first().copied() {
+        Some("hostname") if effective.len() > 1 => {
+            return Some("hostname arguments can change the system hostname");
+        }
+        Some("date")
+            if effective[1..]
+                .iter()
+                .any(|arg| *arg == "-s" || *arg == "--set" || arg.starts_with("--set=")) =>
+        {
+            return Some("date --set changes the system clock");
+        }
+        Some("truncate" | "shred") => {
+            return Some("can irreversibly destroy file contents");
+        }
+        Some("wipefs") => {
+            return Some("wipefs can erase filesystem signatures");
+        }
+        Some("kubectl") if effective.get(1) == Some(&"delete") => {
+            return Some("kubectl delete removes cluster resources");
+        }
+        Some("terraform") if effective.get(1) == Some(&"destroy") => {
+            return Some("terraform destroy removes managed infrastructure");
+        }
+        _ => {}
+    }
     if let Some((subcommand, arguments)) = git_subcommand(effective) {
         if subcommand == "reset" && arguments.contains(&"--hard") {
             return Some("git reset --hard can discard uncommitted work");
@@ -66,6 +94,31 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
         {
             return Some("force-pushing can overwrite remote history");
         }
+        if subcommand == "restore" {
+            return Some("git restore can discard uncommitted work");
+        }
+        if subcommand == "checkout"
+            && (arguments.contains(&"--")
+                || arguments
+                    .iter()
+                    .any(|token| *token == "-f" || *token == "--force"))
+        {
+            return Some("git checkout can discard uncommitted work");
+        }
+        if subcommand == "branch"
+            && arguments
+                .iter()
+                .any(|token| matches!(*token, "-d" | "--delete" | "--delete-force"))
+        {
+            return Some("forced branch deletion can discard commits");
+        }
+        if subcommand == "stash"
+            && arguments
+                .first()
+                .is_some_and(|action| matches!(*action, "drop" | "clear"))
+        {
+            return Some("git stash removal can discard saved work");
+        }
     }
     if effective.first().is_some_and(|token| {
         matches!(
@@ -79,83 +132,37 @@ pub fn is_dangerous(command: &str) -> Option<&'static str> {
     {
         return Some("can stop or restart the system");
     }
-    if lower.contains("docker system prune") || lower.contains("podman system prune") {
-        return Some("system prune can delete unused containers, images, and volumes");
+    for runtime in ["docker", "podman"] {
+        if let Some(index) = effective.iter().position(|token| *token == runtime) {
+            let action = &effective[index + 1..];
+            if action.starts_with(&["system", "prune"]) {
+                return Some("system prune can delete unused containers, images, and volumes");
+            }
+            if action.first().is_some_and(|subcommand| {
+                matches!(*subcommand, "rm" | "rmi")
+                    || (*subcommand == "volume" && action.get(1) == Some(&"rm"))
+            }) {
+                return Some("container removal can permanently delete runtime data");
+            }
+        }
     }
     None
 }
 
-/// Conservative allowlist deciding whether a proposal qualifies for the
-/// opt-in auto-approve-read-only mode. This never executes anything; the UI
-/// still routes the approval through the normal single-line validation and
-/// prompt-ready gate.
+/// Compatibility hook for the retired "read-only auto-approve" policy.
 ///
-/// Fail closed: only a single simple command whose program is a known
-/// read-only inspector qualifies. Chaining, redirection, background jobs,
-/// command substitution, per-program flags that can execute or write, and
-/// anything `is_dangerous` recognizes all keep the manual approval card.
-pub fn is_auto_approvable(command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty() || command.len() > MAX_COMMAND_BYTES {
-        return false;
-    }
-    if command.chars().any(char::is_control) || is_dangerous(command).is_some() {
-        return false;
-    }
-    if command.contains(['|', ';', '&', '>', '<', '`']) || command.contains("$(") {
-        return false;
-    }
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let Some(program) = tokens.first().copied() else {
-        return false;
-    };
-    let arguments = &tokens[1..];
-    match program {
-        "ls" | "pwd" | "du" | "df" | "free" | "ps" | "id" | "whoami" | "uname" | "date"
-        | "uptime" | "hostname" | "printenv" | "echo" | "which" | "whereis" | "basename"
-        | "dirname" | "realpath" | "readlink" | "tree" => true,
-        // Readers that block on stdin without an operand; require one so an
-        // auto-approved command cannot silently hang the pinned prompt.
-        "cat" | "head" | "tail" | "wc" | "file" | "stat" | "grep" => {
-            arguments.iter().any(|argument| !argument.starts_with('-'))
-        }
-        "rg" => arguments
-            .iter()
-            .all(|argument| !argument.starts_with("--pre")),
-        "fd" => arguments
-            .iter()
-            .all(|argument| !matches!(*argument, "-x" | "-X") && !argument.starts_with("--exec")),
-        "find" => arguments.iter().all(|argument| {
-            !matches!(
-                *argument,
-                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls"
-            ) && !argument.starts_with("-fprint")
-        }),
-        // The read-only subcommand must follow `git` directly: global flags
-        // like `-c` can register executable helpers, so they disqualify
-        // auto-approval instead of being skipped.
-        "git" => {
-            matches!(
-                arguments.first().copied(),
-                Some(
-                    "status"
-                        | "log"
-                        | "diff"
-                        | "show"
-                        | "blame"
-                        | "shortlog"
-                        | "describe"
-                        | "rev-parse"
-                        | "ls-files"
-                        | "reflog"
-                        | "grep"
-                )
-            ) && arguments
-                .iter()
-                .all(|argument| !argument.starts_with("--output"))
-        }
-        _ => false,
-    }
+/// This deliberately returns `false` for every command. A string classifier
+/// cannot prove what a shell will execute: aliases and functions can replace
+/// an allowlisted program, Git readers can invoke configured helpers, several
+/// apparently observational tools have write/exec flags, and a file reader
+/// can disclose arbitrary secrets to the next model turn. Those properties
+/// are only knowable at the integration's parsed-execution boundary, not in
+/// this sans-IO crate.
+///
+/// Keep the function so existing integrations fail closed while migrating
+/// their old setting. Every proposal must receive explicit user approval.
+pub fn is_auto_approvable(_command: &str) -> bool {
+    false
 }
 
 fn strip_shell_prefixes<'a>(tokens: &'a [&'a str]) -> &'a [&'a str] {
@@ -287,12 +294,25 @@ mod tests {
         assert!(is_dangerous("git push --force origin main").is_some());
         assert!(is_dangerous("systemctl reboot").is_some());
         assert!(is_dangerous("docker system prune -af").is_some());
+        assert!(is_dangerous("hostname build-node").is_some());
+        assert!(is_dangerous("date --set=tomorrow").is_some());
+        assert!(is_dangerous("truncate -s 0 important.db").is_some());
+        assert!(is_dangerous("git restore src/main.rs").is_some());
+        assert!(is_dangerous("git checkout -- src/main.rs").is_some());
+        assert!(is_dangerous("git branch -D work").is_some());
+        assert!(is_dangerous("git stash clear").is_some());
+        assert!(is_dangerous("docker volume rm database").is_some());
+        assert!(is_dangerous("kubectl delete namespace prod").is_some());
+        assert!(is_dangerous("terraform destroy -auto-approve").is_some());
+        assert!(is_dangerous(&"x".repeat(MAX_COMMAND_BYTES + 1)).is_some());
         assert!(is_dangerous("FOO=1 sudo apt remove important-package").is_some());
         assert!(is_dangerous("command sudo apt remove important-package").is_some());
         assert!(is_dangerous("git -C repo reset --hard HEAD~1").is_some());
         assert!(is_dangerous("env systemctl reboot").is_some());
         assert!(is_dangerous("git status").is_none());
         assert!(is_dangerous("git -C repo status").is_none());
+        assert!(is_dangerous("hostname").is_none());
+        assert!(is_dangerous("date -u").is_none());
     }
 
     #[test]
@@ -306,57 +326,24 @@ mod tests {
     }
 
     #[test]
-    fn auto_approval_accepts_only_simple_read_only_commands() {
-        assert!(is_auto_approvable("ls -la"));
-        assert!(is_auto_approvable("pwd"));
-        assert!(is_auto_approvable("cat Cargo.toml"));
-        assert!(is_auto_approvable("grep -rn TODO src"));
-        assert!(is_auto_approvable("git status"));
-        assert!(is_auto_approvable("git log --oneline -20"));
-        assert!(is_auto_approvable("git diff --stat"));
-        assert!(is_auto_approvable("find . -name '*.rs'"));
-        assert!(is_auto_approvable("rg -n unsafe src"));
-        assert!(is_auto_approvable("du -sh target"));
-        assert!(is_auto_approvable("  uname -a  "));
-    }
-
-    #[test]
-    fn auto_approval_fails_closed_on_writes_chaining_and_execution() {
-        // Not on the allowlist at all.
-        assert!(!is_auto_approvable("rm -rf build"));
-        assert!(!is_auto_approvable("touch marker"));
-        assert!(!is_auto_approvable("cargo check"));
-        assert!(!is_auto_approvable("sed -i s/a/b/ file"));
-        assert!(!is_auto_approvable("FOO=1 ls"));
-        assert!(!is_auto_approvable("env ls"));
-        assert!(!is_auto_approvable("LS"));
-        assert!(!is_auto_approvable(""));
-        // Chaining, redirection, jobs, and substitution.
-        assert!(!is_auto_approvable("ls; rm -rf build"));
-        assert!(!is_auto_approvable("ls && rm x"));
-        assert!(!is_auto_approvable("cat a > b"));
-        assert!(!is_auto_approvable("cat < a"));
-        assert!(!is_auto_approvable("grep foo src | wc -l"));
-        assert!(!is_auto_approvable("echo `whoami`"));
-        assert!(!is_auto_approvable("echo $(rm x)"));
-        assert!(!is_auto_approvable("du -sh &"));
-        // Per-program escape hatches.
-        assert!(!is_auto_approvable("find . -name x -delete"));
-        assert!(!is_auto_approvable("find . -exec rm {} +"));
-        assert!(!is_auto_approvable("fd -x rm"));
-        assert!(!is_auto_approvable("fd --exec-batch rm"));
-        assert!(!is_auto_approvable("rg --pre=sh pattern"));
-        // Stdin-blocking readers without an operand.
-        assert!(!is_auto_approvable("cat"));
-        assert!(!is_auto_approvable("grep -v"));
-        // Git: only direct read-only subcommands, no output redirection.
-        assert!(!is_auto_approvable("git push"));
-        assert!(!is_auto_approvable("git branch -D main"));
-        assert!(!is_auto_approvable("git stash list"));
-        assert!(!is_auto_approvable("git -c core.fsmonitor=rm status"));
-        assert!(!is_auto_approvable("git -C repo status"));
-        assert!(!is_auto_approvable("git log --output=/tmp/x"));
-        // Anything the danger heuristic flags stays manual.
-        assert!(!is_auto_approvable("sudo ls"));
+    fn auto_approval_is_retired_and_always_fails_closed() {
+        for command in [
+            "ls -la",
+            "pwd",
+            "cat Cargo.toml",
+            "hostname new-name",
+            "date -s tomorrow",
+            "tree -o /tmp/tree.txt",
+            "tail -f /dev/null",
+            "git diff --ext-diff",
+            "git grep --open-files-in-pager=sh pattern",
+            "rm -rf build",
+            "",
+        ] {
+            assert!(
+                !is_auto_approvable(command),
+                "auto-approval unexpectedly accepted {command:?}"
+            );
+        }
     }
 }

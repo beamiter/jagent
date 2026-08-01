@@ -27,10 +27,13 @@
 //! usage extraction.
 //!
 //! Fail closed (jagent invariant #2): a malformed frame, an invalid-UTF-8
-//! frame, a provider-reported stream error, or an exceeded bound emits one
+//! frame, payload after an end signal, an empty completed text response, a
+//! provider-reported stream error, or an exceeded bound emits one
 //! [`StreamEvent::Protocol`], after which the parser is inert and ignores all
-//! further input. Bounds (invariant #3): a single buffered line/frame and the
-//! cumulative delivered text are each capped at [`MAX_MODEL_TEXT_BYTES`].
+//! further input. Bounds (invariant #3): a single buffered line/frame,
+//! cumulative delivered text/tool arguments, and the number of calls are
+//! capped. Completed tool blocks remain private until the enclosing response
+//! succeeds, so a later error cannot leave an actionable call behind.
 //!
 //! UTF-8 handling: input is buffered as bytes and split only at `\n`, so a
 //! multi-byte sequence split across pushes is reassembled before decoding. A
@@ -65,14 +68,17 @@ pub enum StreamEvent {
     /// [`crate::provider::ChatResponse::reached_token_limit`] reports.
     /// Emitted at most once per stream.
     ReachedTokenLimit,
-    /// A native tool call finished accumulating — Anthropic's `tool_use`
-    /// block reached `content_block_stop`, or an OpenAI-compatible
-    /// `tool_calls` accumulation reached the end of the message. Emitted in
-    /// the order the calls were opened, always before [`StreamEvent::Usage`]
-    /// and [`StreamEvent::Done`], and never for a call still mid-flight when
-    /// the stream failed or was truncated. The value is identical in shape to
-    /// what [`crate::tools::parse_tool_response`] extracts from the
-    /// equivalent non-streaming reply, so
+    /// A native tool call from a response that finished successfully.
+    /// Anthropic's `tool_use` block must first reach `content_block_stop`, and
+    /// the enclosing response must then complete (`message_stop`, or EOF after
+    /// an explicit stop reason); OpenAI-compatible calls are finalized at the
+    /// response completion marker. Calls are
+    /// emitted in the order they were opened, always immediately before
+    /// [`StreamEvent::Usage`] and [`StreamEvent::Done`]. A later malformed or
+    /// truncated frame therefore cannot leave an already-published call for a
+    /// caller to act on. The value is identical in shape to what
+    /// [`crate::tools::parse_tool_response`] extracts from the equivalent
+    /// non-streaming reply, so
     /// [`crate::tools::ToolResponse::to_action`] applies unchanged.
     ToolCall(ToolCall),
     /// Token usage reported by the provider. Emitted at most once, directly
@@ -108,6 +114,10 @@ pub struct StreamParser {
     event_data: String,
     event_has_data: bool,
     delivered_text_bytes: usize,
+    /// Whether any delivered text survives Unicode whitespace trimming. This
+    /// lets completion mirror the non-streaming parser's empty-response rule
+    /// without retaining another copy of the streamed text.
+    saw_non_whitespace_text: bool,
     /// Anthropic only: a text content block was opened; a later one is
     /// joined with `"\n"` to match the non-streaming extraction.
     saw_text_block: bool,
@@ -120,13 +130,18 @@ pub struct StreamParser {
     /// the provider's own index (Anthropic content-block index, OpenAI
     /// `tool_calls[].index`).
     pending_tools: Vec<PendingToolCall>,
+    /// Calls whose provider-specific block is closed but whose enclosing
+    /// response has not completed yet. Holding these back makes publication
+    /// transactional: a later malformed frame or truncated response can still
+    /// fail closed without leaking an actionable call to the integration.
+    completed_tools: Vec<PendingToolCall>,
     /// Cumulative bytes of tool-call arguments seen, bounded like text.
     delivered_tool_bytes: usize,
 }
 
 #[derive(Debug)]
 struct PendingToolCall {
-    index: i64,
+    index: u64,
     id: String,
     name: String,
     arguments: String,
@@ -141,11 +156,13 @@ impl StreamParser {
             event_data: String::new(),
             event_has_data: false,
             delivered_text_bytes: 0,
+            saw_non_whitespace_text: false,
             saw_text_block: false,
             saw_message_end: false,
             reached_token_limit: false,
             usage: Usage::default(),
             pending_tools: Vec::new(),
+            completed_tools: Vec::new(),
             delivered_tool_bytes: 0,
         }
     }
@@ -275,6 +292,10 @@ impl StreamParser {
             self.fail("stream frame is missing its type", events);
             return;
         };
+        if self.saw_message_end && !matches!(kind, "message_stop" | "ping") {
+            self.fail("Anthropic streamed data after its stop reason", events);
+            return;
+        }
         match kind {
             "message_start" => {
                 self.merge_usage(
@@ -302,7 +323,11 @@ impl StreamParser {
                         .and_then(|block| block.get("id"))
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.open_tool_call(block_index(&frame), id, name, events);
+                    let Some(index) = block_index(&frame) else {
+                        self.fail("tool_use block carries no valid index", events);
+                        return;
+                    };
+                    self.open_tool_call(index, id, name, events);
                     return;
                 }
                 if block_type == Some("text") {
@@ -338,16 +363,22 @@ impl StreamParser {
                         .and_then(|delta| delta.get("partial_json"))
                         .and_then(Value::as_str)
                     {
-                        Some(fragment) => {
-                            self.extend_tool_call(block_index(&frame), fragment, events)
-                        }
+                        Some(fragment) => match block_index(&frame) {
+                            Some(index) => self.extend_tool_call(index, fragment, events),
+                            None => {
+                                self.fail("tool-call argument delta carries no valid index", events)
+                            }
+                        },
                         None => self.fail("input_json_delta frame carries no partial_json", events),
                     }
                 }
                 // thinking deltas are non-text content; the non-streaming
                 // parser ignores those blocks as well.
             }
-            "content_block_stop" => self.close_tool_call(block_index(&frame), events),
+            "content_block_stop" => match block_index(&frame) {
+                Some(index) => self.close_tool_call(index),
+                None => self.fail("content_block_stop carries no valid index", events),
+            },
             "message_delta" => {
                 self.merge_usage(frame.get("usage"), "input_tokens", "output_tokens");
                 if let Some(stop_reason) =
@@ -403,6 +434,18 @@ impl StreamParser {
                     "provider error: {}",
                     elide_middle(detail, MAX_ERROR_DETAIL_BYTES)
                 ),
+                events,
+            );
+            return;
+        }
+        if self.saw_message_end
+            && frame
+                .pointer("/choices/0/delta")
+                .and_then(Value::as_object)
+                .is_some_and(|delta| !delta.is_empty())
+        {
+            self.fail(
+                "OpenAI-compatible streamed data after its finish reason",
                 events,
             );
             return;
@@ -488,7 +531,10 @@ impl StreamParser {
     /// the opening fragment but are appended defensively, and `arguments`
     /// fragments concatenate into the raw JSON object text.
     fn accumulate_openai_tool_call(&mut self, entry: &Value, events: &mut Vec<StreamEvent>) {
-        let index = entry.get("index").and_then(Value::as_i64).unwrap_or(0);
+        let Some(index) = entry.get("index").and_then(Value::as_u64) else {
+            self.fail("tool call carries no valid index", events);
+            return;
+        };
         let id = match entry.get("id") {
             Some(Value::String(id)) => id.as_str(),
             Some(Value::Null) | None => "",
@@ -528,22 +574,38 @@ impl StreamParser {
         self.extend_tool_call(index, arguments, events);
     }
 
-    fn pending_index(&self, index: i64) -> Option<usize> {
+    fn pending_index(&self, index: u64) -> Option<usize> {
         self.pending_tools
             .iter()
             .position(|pending| pending.index == index)
     }
 
-    /// Start accumulating a tool call, enforcing the concurrent-call bound.
-    fn open_tool_call(&mut self, index: i64, id: &str, name: &str, events: &mut Vec<StreamEvent>) {
+    /// Start accumulating a tool call, enforcing the whole-response call
+    /// bound. Anthropic calls close independently, so counting only currently
+    /// open blocks would let a response stream an unbounded sequence of calls.
+    fn open_tool_call(&mut self, index: u64, id: &str, name: &str, events: &mut Vec<StreamEvent>) {
         if self.phase != Phase::Streaming {
             return;
         }
-        if self.pending_tools.len() >= MAX_STREAM_TOOL_CALLS {
+        if self
+            .pending_tools
+            .len()
+            .saturating_add(self.completed_tools.len())
+            >= MAX_STREAM_TOOL_CALLS
+        {
             self.fail(
-                &format!("stream opened more than {MAX_STREAM_TOOL_CALLS} concurrent tool calls"),
+                &format!("stream contains more than {MAX_STREAM_TOOL_CALLS} tool calls"),
                 events,
             );
+            return;
+        }
+        if self.pending_index(index).is_some()
+            || self
+                .completed_tools
+                .iter()
+                .any(|completed| completed.index == index)
+        {
+            self.fail("stream reused a tool-call index", events);
             return;
         }
         self.pending_tools.push(PendingToolCall {
@@ -571,7 +633,7 @@ impl StreamParser {
 
     /// Append an arguments fragment, enforcing the per-call and cumulative
     /// bounds. A fragment for a call that was never opened fails closed.
-    fn extend_tool_call(&mut self, index: i64, fragment: &str, events: &mut Vec<StreamEvent>) {
+    fn extend_tool_call(&mut self, index: u64, fragment: &str, events: &mut Vec<StreamEvent>) {
         if self.phase != Phase::Streaming || fragment.is_empty() {
             return;
         }
@@ -603,10 +665,11 @@ impl StreamParser {
         }
     }
 
-    /// Emit the tool call accumulating at `index`, if any. Anthropic closes
+    /// Finish the tool call accumulating at `index`, if any. Anthropic closes
     /// each `tool_use` block explicitly; other content blocks close with no
-    /// pending call and are a no-op here.
-    fn close_tool_call(&mut self, index: i64, events: &mut Vec<StreamEvent>) {
+    /// pending call and are a no-op here. Finished calls remain private until
+    /// the enclosing response completes successfully.
+    fn close_tool_call(&mut self, index: u64) {
         if self.phase != Phase::Streaming {
             return;
         }
@@ -614,15 +677,15 @@ impl StreamParser {
             return;
         };
         let pending = self.pending_tools.remove(position);
-        events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
+        self.completed_tools.push(pending);
     }
 
-    /// Emit every still-open tool call, in the order they were opened. Used
-    /// at the completion frame, where OpenAI-compatible streams have no
-    /// per-call terminator.
-    fn flush_tool_calls(&mut self, events: &mut Vec<StreamEvent>) {
+    /// Finish every still-open tool call, in the order they were opened. Used
+    /// only for OpenAI-compatible completion frames, whose protocol has no
+    /// per-call terminator. Anthropic calls must close explicitly.
+    fn finish_open_tool_calls(&mut self) {
         for pending in std::mem::take(&mut self.pending_tools) {
-            events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
+            self.completed_tools.push(pending);
         }
     }
 
@@ -641,6 +704,7 @@ impl StreamParser {
             return;
         }
         self.delivered_text_bytes = total;
+        self.saw_non_whitespace_text |= text.chars().any(|character| !character.is_whitespace());
         events.push(StreamEvent::TextDelta(text.to_string()));
     }
 
@@ -669,7 +733,30 @@ impl StreamParser {
         if self.phase != Phase::Streaming {
             return;
         }
-        self.flush_tool_calls(events);
+        if self.provider == Provider::Anthropic && !self.pending_tools.is_empty() {
+            self.fail(
+                "Anthropic message ended before a tool_use block was closed",
+                events,
+            );
+            return;
+        }
+        if self.provider == Provider::OpenAiCompatible {
+            self.finish_open_tool_calls();
+        }
+        if self.reached_token_limit && !self.completed_tools.is_empty() {
+            self.fail(
+                "tool response reached the provider output limit and may be truncated",
+                events,
+            );
+            return;
+        }
+        if self.completed_tools.is_empty() && !self.saw_non_whitespace_text {
+            self.fail("the model returned an empty response", events);
+            return;
+        }
+        for pending in std::mem::take(&mut self.completed_tools) {
+            events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
+        }
         if self.usage.input_tokens.is_some() || self.usage.output_tokens.is_some() {
             events.push(StreamEvent::Usage(self.usage));
         }
@@ -688,14 +775,16 @@ impl StreamParser {
         self.line = Vec::new();
         self.event_data = String::new();
         // A half-accumulated call is never emitted: an incomplete argument
-        // fragment must not become a reviewable command.
+        // fragment, or a fully accumulated call from a response that later
+        // failed, must not become a reviewable command.
         self.pending_tools = Vec::new();
+        self.completed_tools = Vec::new();
     }
 }
 
 /// Anthropic's block index and OpenAI's `tool_calls[].index` both live here.
-fn block_index(frame: &Value) -> i64 {
-    frame.get("index").and_then(Value::as_i64).unwrap_or(0)
+fn block_index(frame: &Value) -> Option<u64> {
+    frame.get("index").and_then(Value::as_u64)
 }
 
 fn finished_tool_call(pending: PendingToolCall) -> ToolCall {
@@ -973,6 +1062,48 @@ mod tests {
             assert_eq!(parser.push(body.as_bytes()), vec![], "{provider:?}");
             assert_eq!(parser.finish(), vec![], "{provider:?}");
             assert_eq!(parser.finish(), vec![], "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn empty_completed_streams_fail_like_non_streaming_responses() {
+        let bodies = [
+            (
+                Provider::Anthropic,
+                [
+                    sse(
+                        "message_delta",
+                        &json!({"type": "message_delta",
+                                "delta": {"stop_reason": "end_turn"}}),
+                    ),
+                    sse("message_stop", &json!({"type": "message_stop"})),
+                ]
+                .concat(),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                [
+                    openai_line(&json!({"choices": [
+                        {"index": 0, "delta": {}, "finish_reason": "stop"},
+                    ]})),
+                    "data: [DONE]\n\n".to_string(),
+                ]
+                .concat(),
+            ),
+            (
+                Provider::Ollama,
+                ndjson_line(&json!({"message": {"content": ""}, "done": true})),
+            ),
+        ];
+
+        for (provider, body) in bodies {
+            assert_eq!(
+                run(provider, &body),
+                vec![StreamEvent::Protocol(
+                    "the model returned an empty response".into()
+                )],
+                "{provider:?}"
+            );
         }
     }
 
@@ -1475,6 +1606,212 @@ mod tests {
     }
 
     #[test]
+    fn closed_anthropic_call_is_withheld_if_the_response_later_fails() {
+        let body = [
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": "{\"command\":\"rm -rf data\"}"}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            "data: not-json\n\n".to_string(),
+        ]
+        .concat();
+
+        let events = run(Provider::Anthropic, &body);
+        assert_eq!(
+            events,
+            vec![StreamEvent::Protocol(
+                "malformed JSON in stream frame".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn payload_after_a_provider_end_signal_fails_closed() {
+        let anthropic = [
+            sse(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}),
+            ),
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "tool_use", "id": "late",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
+        assert_eq!(
+            run(Provider::Anthropic, &anthropic),
+            vec![StreamEvent::Protocol(
+                "Anthropic streamed data after its stop reason".into()
+            )]
+        );
+
+        let openai = [
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"content": "done"}, "finish_reason": "stop"},
+            ]})),
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"tool_calls": [
+                    {"index": 0, "id": "late",
+                     "function": {"name": "run",
+                                  "arguments": "{\"command\":\"rm -rf data\"}"}},
+                ]}, "finish_reason": null},
+            ]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let events = run(Provider::OpenAiCompatible, &openai);
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Protocol(message)) if message.contains("after its finish reason")
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+
+        // OpenAI may legitimately send one usage-only frame after the choice
+        // has finished. It carries no response payload and remains accepted.
+        let usage_tail = [
+            openai_line(&json!({"choices": [
+                {"index": 0, "delta": {"content": "done"}, "finish_reason": "stop"},
+            ]})),
+            openai_line(&json!({"choices": [],
+                                "usage": {"prompt_tokens": 3, "completion_tokens": 1}})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let folded = fold(&run(Provider::OpenAiCompatible, &usage_tail));
+        assert!(folded.done);
+        assert_eq!(
+            folded.usage,
+            Some(Usage {
+                input_tokens: Some(3),
+                output_tokens: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn sequential_anthropic_calls_share_the_whole_response_limit() {
+        let mut body = String::new();
+        for index in 0..=MAX_STREAM_TOOL_CALLS {
+            body.push_str(&sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": index,
+                        "content_block": {"type": "tool_use",
+                                          "id": format!("toolu_{index}"),
+                                          "name": "run", "input": {}}}),
+            ));
+            body.push_str(&sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": "{\"command\":\"true\"}"}}),
+            ));
+            body.push_str(&sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+
+        let events = run(Provider::Anthropic, &body);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Protocol(message)] if message.contains("more than")
+        ));
+    }
+
+    #[test]
+    fn anthropic_message_stop_does_not_flush_an_unclosed_tool_block() {
+        let body = [
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 4,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 4,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": "{\"command\":\"rm -rf data\"}"}}),
+            ),
+            // A valid Anthropic stream must close index 4 before ending the
+            // message. Treating message_stop like OpenAI's global call
+            // terminator would promote this malformed incremental state.
+            sse(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
+
+        let events = run(Provider::Anthropic, &body);
+        assert_eq!(
+            events,
+            vec![StreamEvent::Protocol(
+                "Anthropic message ended before a tool_use block was closed".into()
+            )]
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+    }
+
+    #[test]
+    fn token_limited_stream_never_publishes_a_tool_call() {
+        let body = [
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 0,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 0,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": "{\"command\":\"rm -rf /\"}"}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse(
+                "message_delta",
+                &json!({"type": "message_delta", "delta": {"stop_reason": "max_tokens"}}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
+
+        let events = run(Provider::Anthropic, &body);
+        assert_eq!(events.first(), Some(&StreamEvent::ReachedTokenLimit));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Protocol(message)) if message.contains("may be truncated")
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+    }
+
+    #[test]
     fn malformed_tool_frames_fail_closed() {
         // Anthropic: a tool_use block with no name.
         let body = sse(
@@ -1488,6 +1825,22 @@ mod tests {
                 "tool_use block carries no name".into()
             )]
         );
+
+        // Provider indexes bind later argument fragments to the call they
+        // belong to. Defaulting a missing/negative index to zero could merge
+        // distinct malformed calls into one reviewable command.
+        for index in [Value::Null, json!(-1)] {
+            let mut frame = json!({"type": "content_block_start",
+                                   "content_block": {"type": "tool_use",
+                                                     "id": "toolu_1", "name": "run"}});
+            if !index.is_null() {
+                frame["index"] = index;
+            }
+            assert!(matches!(
+                run(Provider::Anthropic, &sse("content_block_start", &frame)).as_slice(),
+                [StreamEvent::Protocol(message)] if message.contains("valid index")
+            ));
+        }
 
         // Anthropic: an input_json_delta with no payload.
         let body = sse(
@@ -1528,6 +1881,16 @@ mod tests {
             )]
         );
 
+        let body = openai_line(&json!({"choices": [
+            {"index": 0, "delta": {"tool_calls": [
+                {"id": "call_1", "function": {"name": "run", "arguments": "{}"}},
+            ]}},
+        ]}));
+        assert!(matches!(
+            run(Provider::OpenAiCompatible, &body).as_slice(),
+            [StreamEvent::Protocol(message)] if message.contains("valid index")
+        ));
+
         // OpenAI: tool_calls that is not an array.
         let body = openai_line(&json!({"choices": [
             {"index": 0, "delta": {"tool_calls": "run"}},
@@ -1536,6 +1899,38 @@ mod tests {
             run(Provider::OpenAiCompatible, &body),
             vec![StreamEvent::Protocol(
                 "delta tool_calls is not an array".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_indexes_cannot_be_reused_after_a_block_closes() {
+        let call = |id: &str| {
+            [
+                sse(
+                    "content_block_start",
+                    &json!({"type": "content_block_start", "index": 2,
+                            "content_block": {"type": "tool_use", "id": id,
+                                              "name": "run", "input": {}}}),
+                ),
+                sse(
+                    "content_block_delta",
+                    &json!({"type": "content_block_delta", "index": 2,
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": "{\"command\":\"true\"}"}}),
+                ),
+                sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": 2}),
+                ),
+            ]
+            .concat()
+        };
+        let body = [call("toolu_1"), call("toolu_2")].concat();
+        assert_eq!(
+            run(Provider::Anthropic, &body),
+            vec![StreamEvent::Protocol(
+                "stream reused a tool-call index".into()
             )]
         );
     }

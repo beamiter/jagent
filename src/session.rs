@@ -21,6 +21,16 @@ const MAX_STORED_TRANSCRIPT_ENTRIES: usize = 128;
 const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_THOUGHT_BYTES: usize = 4 * 1024;
+/// Maximum model turns in one task. Construction and snapshot restoration
+/// share this bound so every session created through the public API remains
+/// restorable while persisted data cannot inject an effectively unbounded
+/// agent loop.
+pub const MAX_SESSION_TURNS: u32 = 1_000;
+/// Byte cap applied before parsing one JSON-in-text model action. This is
+/// large enough for every bounded decoded field even under JSON escaping,
+/// while preventing an unknown field from making `serde_json` allocate an
+/// arbitrarily large value before the action schema rejects it.
+pub const MAX_ACTION_JSON_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Serialize)]
 pub struct ProposalId(u64);
@@ -128,6 +138,10 @@ pub enum ParseError {
     /// Native tool mode: the reply carried more than one tool call. The state
     /// machine advances one action per turn; choosing one would be a guess.
     MultipleToolCalls(usize),
+    /// The provider reported that generation stopped at its output-token
+    /// limit. Even syntactically complete-looking tool arguments are treated
+    /// as partial and cannot become an action.
+    TruncatedResponse,
 }
 
 impl std::fmt::Display for ParseError {
@@ -151,6 +165,12 @@ impl std::fmt::Display for ParseError {
                     "reply contained {count} tool calls; exactly one is required"
                 )
             }
+            Self::TruncatedResponse => {
+                write!(
+                    f,
+                    "reply reached the provider output limit and may be truncated"
+                )
+            }
         }
     }
 }
@@ -161,6 +181,9 @@ impl std::error::Error for ParseError {}
 /// prose, unknown actions/keys, wrong types, and empty required fields fail.
 /// Parse failure never degrades into a command proposal.
 pub fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
+    if raw.len() > MAX_ACTION_JSON_BYTES {
+        return Err(ParseError::FieldTooLarge("reply"));
+    }
     let payload = strip_json_fence(raw.trim())?;
     if payload.is_empty() {
         return Err(ParseError::Empty);
@@ -293,7 +316,10 @@ fn reject_unexpected(
         .keys()
         .find(|field| !allowed.contains(&field.as_str()) && !also_allowed.contains(&field.as_str()))
     {
-        return Err(ParseError::UnexpectedField(field.clone()));
+        return Err(ParseError::UnexpectedField(elide_middle(
+            field,
+            MAX_TOOL_NAME_BYTES,
+        )));
     }
     Ok(())
 }
@@ -312,7 +338,42 @@ fn validate_command(command: &str) -> Result<(), ParseError> {
             "contains a control character".into(),
         ));
     }
+    if command.chars().any(is_unsafe_invisible_command_char) {
+        return Err(ParseError::InvalidCommand(
+            "contains an invisible or bidirectional formatting character".into(),
+        ));
+    }
     Ok(())
+}
+
+/// Characters that can visually reorder or hide shell input without being
+/// classified as control characters by [`char::is_control`]. A review-first
+/// approval card must display the same visible ordering that is handed to the
+/// shell. Ordinary non-ASCII text, combining marks, and emoji that do not rely
+/// on invisible presentation selectors remain valid.
+fn is_unsafe_invisible_command_char(character: char) -> bool {
+    (character.is_whitespace() && character != ' ')
+        || matches!(
+            character,
+            '\u{00ad}' // soft hyphen
+            | '\u{034f}' // combining grapheme joiner
+            | '\u{061c}' // Arabic letter mark
+            | '\u{115f}'..='\u{1160}' // Hangul fillers
+            | '\u{17b4}'..='\u{17b5}' // Khmer inherent vowels
+            | '\u{180b}'..='\u{180f}' // Mongolian selectors/separator
+            | '\u{200b}'..='\u{200f}' // zero-width + direction marks
+            | '\u{2028}'..='\u{202e}' // line/paragraph + bidi embedding/override
+            | '\u{2060}'..='\u{206f}' // invisible operators, isolates, deprecated controls
+            | '\u{3164}' // Hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{feff}' // zero-width no-break space / BOM
+            | '\u{ffa0}' // halfwidth Hangul filler
+            | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+            | '\u{1d173}'..='\u{1d17a}' // musical format controls
+            | '\u{e0001}' // language tag
+            | '\u{e0020}'..='\u{e007f}' // tag characters
+            | '\u{e0100}'..='\u{e01ef}' // supplementary variation selectors
+        )
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
@@ -421,7 +482,7 @@ impl AgentSession {
             transcript_truncated: false,
             state: AgentState::Ready,
             turns_used: 0,
-            max_turns: max_turns.max(1),
+            max_turns: max_turns.clamp(1, MAX_SESSION_TURNS),
             next_proposal_id: 1,
             cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
         }
@@ -464,6 +525,8 @@ impl AgentSession {
     /// Completed or exhausted sessions can start a fresh task in the same
     /// surface without closing and rebuilding the Agent UI. This explicitly
     /// drops the old model transcript and restores the configured turn budget.
+    /// Proposal ids remain monotonic across the reset so delayed actions from
+    /// the previous task stay stale.
     pub fn start_new_task(&mut self) -> Result<(), SessionError> {
         self.check_not_cancelled()?;
         if !matches!(
@@ -473,7 +536,14 @@ impl AgentSession {
             return Err(self.invalid_transition("start a new task"));
         }
         let max_turns = self.max_turns;
-        *self = Self::new(max_turns);
+        // Proposal ids are authorization bindings, not transcript-local row
+        // numbers. Preserve the counter across task resets so a delayed click
+        // or callback from an old approval card can never match a new task's
+        // proposal merely because both would otherwise be numbered `1`.
+        let next_proposal_id = self.next_proposal_id;
+        let mut fresh = Self::new(max_turns);
+        fresh.next_proposal_id = next_proposal_id;
+        *self = fresh;
         Ok(())
     }
 
@@ -541,16 +611,26 @@ impl AgentSession {
         let action = match parse() {
             Ok(action) => action,
             Err(error) => {
-                self.push_turn(Turn::ProtocolError(error.to_string()));
+                self.push_turn(Turn::ProtocolError(elide_middle(
+                    &error.to_string(),
+                    MAX_MESSAGE_BYTES,
+                )));
                 self.state = self.ready_or_limited();
                 return Err(SessionError::Protocol(error));
             }
         };
         match action {
             ParsedAction::Run { thought, command } => {
+                let Some(next_proposal_id) = self.next_proposal_id.checked_add(1) else {
+                    self.push_turn(Turn::ProtocolError(
+                        "proposal identifier space is exhausted".into(),
+                    ));
+                    self.state = AgentState::TurnLimitReached;
+                    return Err(SessionError::TurnLimitReached);
+                };
                 self.push_thought(thought);
                 let id = ProposalId(self.next_proposal_id);
-                self.next_proposal_id = self.next_proposal_id.saturating_add(1);
+                self.next_proposal_id = next_proposal_id;
                 self.push_turn(Turn::AssistantProposed {
                     id,
                     command: command.clone(),
@@ -638,7 +718,7 @@ impl AgentSession {
     ) -> Result<ApprovedCommand, SessionError> {
         self.check_not_cancelled()?;
         self.expect_pending_proposal(id, "approve a proposal")?;
-        let turn = self.proposal_mut(id)?;
+        let turn = self.pending_proposal_mut(id)?;
         let Turn::AssistantProposed {
             command, status, ..
         } = turn
@@ -661,7 +741,7 @@ impl AgentSession {
     pub fn reject(&mut self, id: ProposalId) -> Result<(), SessionError> {
         self.check_not_cancelled()?;
         self.expect_pending_proposal(id, "reject a proposal")?;
-        let turn = self.proposal_mut(id)?;
+        let turn = self.pending_proposal_mut(id)?;
         if let Turn::AssistantProposed { status, .. } = turn {
             *status = ProposalStatus::Rejected;
         }
@@ -691,7 +771,7 @@ impl AgentSession {
             return Err(SessionError::Protocol(ParseError::EmptyField("command")));
         }
         validate_command(&edited_command).map_err(SessionError::Protocol)?;
-        let turn = self.proposal_mut(id)?;
+        let turn = self.pending_proposal_mut(id)?;
         let Turn::AssistantProposed {
             command, status, ..
         } = turn
@@ -774,11 +854,22 @@ impl AgentSession {
         elide_middle(&entries.join("\n\n"), MAX_TRANSCRIPT_BYTES)
     }
 
-    fn proposal_mut(&mut self, id: ProposalId) -> Result<&mut Turn, SessionError> {
+    /// Resolve the exact pending card the user is acting on. Matching status
+    /// as well as id is defense in depth for sessions restored from storage:
+    /// an old approved/rejected turn must never be mistaken for the visible
+    /// pending proposal even if persistence was corrupted.
+    fn pending_proposal_mut(&mut self, id: ProposalId) -> Result<&mut Turn, SessionError> {
         self.transcript
             .iter_mut()
             .find(|turn| {
-                matches!(turn, Turn::AssistantProposed { id: candidate, .. } if *candidate == id)
+                matches!(
+                    turn,
+                    Turn::AssistantProposed {
+                        id: candidate,
+                        status: ProposalStatus::Pending,
+                        ..
+                    } if *candidate == id
+                )
             })
             .ok_or(SessionError::ProposalNotFound(id))
     }
@@ -877,7 +968,7 @@ impl AgentSession {
         if snapshot.version != AGENT_SNAPSHOT_VERSION {
             return Err(AgentSnapshotError::UnsupportedVersion(snapshot.version));
         }
-        if snapshot.max_turns == 0 || snapshot.max_turns > 1_000 {
+        if snapshot.max_turns == 0 || snapshot.max_turns > MAX_SESSION_TURNS {
             return Err(AgentSnapshotError::Invalid("max_turns out of range"));
         }
         if snapshot.turns_used > snapshot.max_turns {
@@ -891,55 +982,178 @@ impl AgentSession {
                 "cancelled sessions are not restorable",
             ));
         }
-        let highest_proposal_id = snapshot
-            .transcript
-            .iter()
-            .filter_map(|turn| match turn {
-                Turn::AssistantProposed { id, .. } => Some(id.get()),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
+        let facts = validate_snapshot_transcript(&snapshot.transcript)?;
+        match snapshot.state {
+            AgentState::AwaitingApproval { proposal_id }
+                if facts.pending_proposal != Some(proposal_id) =>
+            {
+                return Err(AgentSnapshotError::Invalid(
+                    "approval state does not identify the pending proposal",
+                ));
+            }
+            AgentState::AwaitingObservation { proposal_id }
+                if !snapshot.transcript.iter().any(|turn| {
+                    matches!(
+                        turn,
+                        Turn::AssistantProposed {
+                            id,
+                            status: ProposalStatus::Approved,
+                            ..
+                        } if *id == proposal_id
+                    )
+                }) =>
+            {
+                return Err(AgentSnapshotError::Invalid(
+                    "observation state does not identify an approved proposal",
+                ));
+            }
+            AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => {}
+            _ if facts.pending_proposal.is_some() => {
+                return Err(AgentSnapshotError::Invalid(
+                    "pending proposal exists outside approval state",
+                ));
+            }
+            _ => {}
+        }
+        let minimum_next_id =
+            facts
+                .highest_proposal_id
+                .checked_add(1)
+                .ok_or(AgentSnapshotError::Invalid(
+                    "proposal identifier space is exhausted",
+                ))?;
+        let next_proposal_id = snapshot.next_proposal_id.max(minimum_next_id).max(1);
+        if next_proposal_id == u64::MAX {
+            return Err(AgentSnapshotError::Invalid(
+                "proposal identifier space is exhausted",
+            ));
+        }
         let mut session = Self {
             transcript: snapshot.transcript,
             transcript_truncated: snapshot.transcript_truncated,
             state: snapshot.state,
             turns_used: snapshot.turns_used,
             max_turns: snapshot.max_turns,
-            next_proposal_id: snapshot
-                .next_proposal_id
-                .max(highest_proposal_id.saturating_add(1)),
+            next_proposal_id,
             cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
         };
         session.compact_transcript();
-        match session.state {
-            AgentState::AwaitingApproval { proposal_id } => {
-                let pending = session.transcript.iter().any(|turn| {
-                    matches!(
-                        turn,
-                        Turn::AssistantProposed { id, status: ProposalStatus::Pending, .. }
-                            if *id == proposal_id
-                    )
-                });
-                if !pending {
-                    session.push_turn(Turn::ProtocolError(
-                        "the pending proposal was lost across a restart".into(),
-                    ));
-                    session.state = session.ready_or_limited();
-                }
-            }
-            AgentState::AwaitingObservation { proposal_id } => {
-                session.push_turn(Turn::ProtocolError(format!(
-                    "the application exited before proposal #{}'s output was \
-                     observed; its result is unknown",
-                    proposal_id.get()
-                )));
-                session.state = session.ready_or_limited();
-            }
-            _ => {}
+        if let AgentState::AwaitingObservation { proposal_id } = session.state {
+            session.push_turn(Turn::ProtocolError(format!(
+                "the application exited before proposal #{}'s output was \
+                 observed; its result is unknown",
+                proposal_id.get()
+            )));
+            session.state = session.ready_or_limited();
         }
         Ok(session)
     }
+}
+
+#[derive(Debug, Default)]
+struct SnapshotTranscriptFacts {
+    highest_proposal_id: u64,
+    pending_proposal: Option<ProposalId>,
+}
+
+/// Validate every invariant that public session transitions establish before
+/// trusting persisted state. In particular, proposal ids are a security
+/// binding between the approval card and the command returned to the caller;
+/// duplicates or reordering must not be repaired heuristically.
+fn validate_snapshot_transcript(
+    transcript: &[Turn],
+) -> Result<SnapshotTranscriptFacts, AgentSnapshotError> {
+    if transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES {
+        return Err(AgentSnapshotError::Invalid(
+            "transcript exceeds its entry limit",
+        ));
+    }
+
+    let mut facts = SnapshotTranscriptFacts::default();
+    for turn in transcript {
+        match turn {
+            Turn::User(message) => {
+                validate_snapshot_text(message, MAX_MESSAGE_BYTES, true, "invalid user turn")?;
+            }
+            Turn::AssistantThought(thought) => {
+                validate_snapshot_text(
+                    thought,
+                    MAX_THOUGHT_BYTES,
+                    true,
+                    "invalid assistant thought",
+                )?;
+            }
+            Turn::AssistantSay(message) => {
+                validate_snapshot_text(
+                    message,
+                    MAX_MESSAGE_BYTES,
+                    true,
+                    "invalid assistant message",
+                )?;
+            }
+            Turn::AssistantProposed {
+                id,
+                command,
+                status,
+            } => {
+                if id.get() == 0 || id.get() <= facts.highest_proposal_id {
+                    return Err(AgentSnapshotError::Invalid(
+                        "proposal ids are zero, duplicated, or out of order",
+                    ));
+                }
+                if command.trim().is_empty() || validate_command(command).is_err() {
+                    return Err(AgentSnapshotError::Invalid(
+                        "proposal command violates its safety bounds",
+                    ));
+                }
+                facts.highest_proposal_id = id.get();
+                if *status == ProposalStatus::Pending
+                    && facts.pending_proposal.replace(*id).is_some()
+                {
+                    return Err(AgentSnapshotError::Invalid(
+                        "snapshot contains multiple pending proposals",
+                    ));
+                }
+            }
+            Turn::Observation {
+                proposal_id,
+                output_sample,
+                ..
+            } => {
+                if proposal_id.get() == 0 || output_sample.len() > MAX_OBSERVATION_BYTES {
+                    return Err(AgentSnapshotError::Invalid(
+                        "observation violates its safety bounds",
+                    ));
+                }
+            }
+            Turn::ProtocolError(message) => {
+                validate_snapshot_text(
+                    message,
+                    MAX_MESSAGE_BYTES,
+                    false,
+                    "protocol error exceeds its safety bound",
+                )?;
+            }
+        }
+    }
+    if stored_transcript_bytes(transcript) > MAX_STORED_TRANSCRIPT_BYTES {
+        return Err(AgentSnapshotError::Invalid(
+            "transcript exceeds its byte limit",
+        ));
+    }
+    Ok(facts)
+}
+
+fn validate_snapshot_text(
+    value: &str,
+    max_bytes: usize,
+    require_nonempty: bool,
+    reason: &'static str,
+) -> Result<(), AgentSnapshotError> {
+    if value.len() > max_bytes || (require_nonempty && value.trim().is_empty()) {
+        return Err(AgentSnapshotError::Invalid(reason));
+    }
+    Ok(())
 }
 
 const AGENT_SNAPSHOT_VERSION: u32 = 1;
@@ -1060,6 +1274,17 @@ mod tests {
     }
 
     #[test]
+    fn constructor_and_restore_share_the_turn_budget_bound() {
+        let mut session = AgentSession::new(u32::MAX);
+        assert_eq!(session.max_turns(), MAX_SESSION_TURNS);
+        session.submit_user("hello").unwrap();
+        let restored = AgentSession::restore(session.snapshot().unwrap()).unwrap();
+        assert_eq!(restored.max_turns(), MAX_SESSION_TURNS);
+
+        assert_eq!(AgentSession::new(0).max_turns(), 1);
+    }
+
+    #[test]
     fn restore_normalizes_lost_observation_to_a_protocol_note() {
         let mut session = AgentSession::new(10);
         session.submit_user("run it").unwrap();
@@ -1146,6 +1371,132 @@ mod tests {
         assert!(id.get() > proposal_id.get(), "ids must stay unique");
     }
 
+    #[test]
+    fn restore_rejects_duplicate_ids_that_could_misbind_approval() {
+        let id = ProposalId(7);
+        let snapshot = AgentSessionSnapshot {
+            version: AGENT_SNAPSHOT_VERSION,
+            transcript: vec![
+                Turn::User("inspect".into()),
+                // A corrupt snapshot could put a previously approved command
+                // before the benign pending card carrying the same id. A
+                // first-id lookup must never return the hidden command.
+                Turn::AssistantProposed {
+                    id,
+                    command: "rm -rf important-data".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::AssistantProposed {
+                    id,
+                    command: "printf reviewed".into(),
+                    status: ProposalStatus::Pending,
+                },
+            ],
+            transcript_truncated: false,
+            state: AgentState::AwaitingApproval { proposal_id: id },
+            turns_used: 1,
+            max_turns: 10,
+            next_proposal_id: 8,
+        };
+
+        assert!(matches!(
+            AgentSession::restore(snapshot),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("duplicated")
+        ));
+    }
+
+    #[test]
+    fn approval_lookup_requires_the_pending_status_as_well_as_the_id() {
+        let id = ProposalId(3);
+        let mut session = AgentSession {
+            transcript: vec![
+                Turn::AssistantProposed {
+                    id,
+                    command: "rm -rf important-data".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::AssistantProposed {
+                    id,
+                    command: "printf reviewed".into(),
+                    status: ProposalStatus::Pending,
+                },
+            ],
+            transcript_truncated: false,
+            state: AgentState::AwaitingApproval { proposal_id: id },
+            turns_used: 1,
+            max_turns: 10,
+            next_proposal_id: 4,
+            cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
+        };
+
+        let approved = session.approve(id).unwrap();
+        assert_eq!(approved.command, "printf reviewed");
+    }
+
+    #[test]
+    fn restore_revalidates_active_state_commands_and_identifier_space() {
+        let mut session = AgentSession::new(10);
+        session.submit_user("run").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"run","command":"true"}"#)
+            .unwrap();
+
+        let mut wrong_status = session.snapshot().unwrap();
+        let Turn::AssistantProposed { status, .. } = wrong_status.transcript.last_mut().unwrap()
+        else {
+            unreachable!();
+        };
+        *status = ProposalStatus::Approved;
+        assert!(matches!(
+            AgentSession::restore(wrong_status),
+            Err(AgentSnapshotError::Invalid(_))
+        ));
+
+        let mut hidden_input = session.snapshot().unwrap();
+        let Turn::AssistantProposed { command, .. } = hidden_input.transcript.last_mut().unwrap()
+        else {
+            unreachable!();
+        };
+        *command = "true\nrm -rf important-data".into();
+        assert!(matches!(
+            AgentSession::restore(hidden_input),
+            Err(AgentSnapshotError::Invalid(_))
+        ));
+
+        let mut visually_spoofed = session.snapshot().unwrap();
+        let Turn::AssistantProposed { command, .. } =
+            visually_spoofed.transcript.last_mut().unwrap()
+        else {
+            unreachable!();
+        };
+        *command = "printf safe\u{202e}; rm -rf important".into();
+        assert!(matches!(
+            AgentSession::restore(visually_spoofed),
+            Err(AgentSnapshotError::Invalid(_))
+        ));
+
+        let mut exhausted = session.snapshot().unwrap();
+        let Turn::AssistantProposed { id, .. } = exhausted.transcript.last_mut().unwrap() else {
+            unreachable!();
+        };
+        *id = ProposalId(u64::MAX);
+        exhausted.state = AgentState::AwaitingApproval { proposal_id: *id };
+        assert!(matches!(
+            AgentSession::restore(exhausted),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("identifier space")
+        ));
+
+        let mut exhausted_counter = session.snapshot().unwrap();
+        exhausted_counter.next_proposal_id = u64::MAX;
+        assert!(matches!(
+            AgentSession::restore(exhausted_counter),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("identifier space")
+        ));
+    }
+
     fn run_reply(command: &str) -> String {
         serde_json::json!({"action":"run", "command": command}).to_string()
     }
@@ -1179,6 +1530,33 @@ mod tests {
             parse_action("{\"action\":\"run\",\"command\":\"printf\\tok\"}"),
             Err(ParseError::InvalidCommand(_))
         ));
+        for hidden in [
+            '\u{202e}',
+            '\u{2066}',
+            '\u{200b}',
+            '\u{2028}',
+            '\u{feff}',
+            '\u{00a0}',
+            '\u{2003}',
+            '\u{034f}',
+            '\u{fe0f}',
+            '\u{e0020}',
+        ] {
+            let reply = serde_json::json!({
+                "action": "run",
+                "command": format!("printf safe{hidden}; rm -rf important"),
+            })
+            .to_string();
+            assert!(matches!(
+                parse_action(&reply),
+                Err(ParseError::InvalidCommand(message))
+                    if message.contains("invisible or bidirectional")
+            ));
+        }
+        assert!(parse_action(
+            &serde_json::json!({"action": "run", "command": "printf '编译🙂'"}).to_string()
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1188,6 +1566,26 @@ mod tests {
         assert!(matches!(parsed, ParsedAction::Done { .. }));
         assert!(parse_action("result: {\"action\":\"done\",\"message\":\"ok\"}").is_err());
         assert!(parse_action("```text\n{}\n```").is_err());
+    }
+
+    #[test]
+    fn action_parser_bounds_raw_json_and_reported_unknown_keys() {
+        let oversized = format!(
+            r#"{{"action":"say","message":"ok","padding":"{}"}}"#,
+            "x".repeat(MAX_ACTION_JSON_BYTES)
+        );
+        assert_eq!(
+            parse_action(&oversized),
+            Err(ParseError::FieldTooLarge("reply"))
+        );
+
+        let unknown = "x".repeat(MAX_TOOL_NAME_BYTES * 4);
+        let reply = format!(r#"{{"action":"say","message":"ok","{unknown}":true}}"#);
+        let Err(ParseError::UnexpectedField(reported)) = parse_action(&reply) else {
+            panic!("expected the unknown field to fail closed");
+        };
+        assert!(reported.len() <= MAX_TOOL_NAME_BYTES);
+        assert!(reported.contains("bytes elided"));
     }
 
     #[test]
@@ -1476,13 +1874,54 @@ mod tests {
         assert_eq!(session.state(), AgentState::TurnLimitReached);
         assert_eq!(session.turns_used(), 1);
         assert!(!session.transcript().is_empty());
+        let old_task_token = session.cancellation_token();
 
         session.start_new_task().unwrap();
+        assert!(old_task_token.is_cancelled());
+        assert!(!session.cancellation_token().is_cancelled());
         assert_eq!(session.state(), AgentState::Ready);
         assert_eq!(session.turns_used(), 0);
         assert_eq!(session.max_turns(), 1);
         assert!(session.transcript().is_empty());
         session.submit_user("fresh task").unwrap();
+    }
+
+    #[test]
+    fn task_reset_never_reuses_an_old_approval_binding() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("first task").unwrap();
+        let ModelOutcome::Proposal { id: old_id, .. } = session
+            .accept_model_reply(&run_reply("printf old"))
+            .unwrap()
+        else {
+            panic!("expected first proposal")
+        };
+        session.reject(old_id).unwrap();
+        assert_eq!(session.state(), AgentState::TurnLimitReached);
+
+        session.start_new_task().unwrap();
+        session.submit_user("second task").unwrap();
+        let ModelOutcome::Proposal { id: new_id, .. } = session
+            .accept_model_reply(&run_reply("rm -rf important-data"))
+            .unwrap()
+        else {
+            panic!("expected second proposal")
+        };
+        assert!(new_id.get() > old_id.get());
+
+        assert_eq!(
+            session.approve(old_id),
+            Err(SessionError::StaleProposal {
+                expected: new_id,
+                received: old_id,
+            })
+        );
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingApproval {
+                proposal_id: new_id
+            }
+        );
     }
 
     #[test]

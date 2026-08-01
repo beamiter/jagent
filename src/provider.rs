@@ -16,6 +16,10 @@ pub const MAX_MODEL_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_HISTORY_TURNS: usize = 40;
 pub const MAX_REQUEST_HISTORY_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_TURN_BYTES: usize = 192 * 1024;
+/// Generous ceiling for a credential copied into one HTTP header. This bounds
+/// request construction and rejects configuration mistakes without exposing
+/// or echoing the credential in an error.
+pub const MAX_API_KEY_BYTES: usize = 16 * 1024;
 
 /// Supported wire protocols. OpenAI-compatible intentionally includes local
 /// and hosted services which implement the Chat Completions endpoint.
@@ -146,7 +150,7 @@ impl std::error::Error for ProviderError {}
 
 /// A fully described HTTP POST for the integration's transport to perform.
 /// Headers already include content-type and any credential the provider needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub url: String,
     /// Lowercase header names. Credentials appear here; integrations must keep
@@ -156,8 +160,38 @@ pub struct HttpRequest {
     pub body: String,
 }
 
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpRequest")
+            .field("url", &self.url)
+            .field("headers", &RedactedHeaders(&self.headers))
+            .field("body", &self.body)
+            .finish()
+    }
+}
+
+struct RedactedHeaders<'a>(&'a [(String, String)]);
+
+impl std::fmt::Debug for RedactedHeaders<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = formatter.debug_list();
+        for (name, value) in self.0 {
+            let value = if name.eq_ignore_ascii_case("authorization")
+                || name.eq_ignore_ascii_case("x-api-key")
+            {
+                "[REDACTED]"
+            } else {
+                value
+            };
+            list.entry(&(name, value));
+        }
+        list.finish()
+    }
+}
+
 /// Chat client configuration owned by the integration.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ChatConfig {
     pub provider: Provider,
     pub api_key: Option<String>,
@@ -167,6 +201,20 @@ pub struct ChatConfig {
     /// Sampling temperature. `None` keeps the provider default; agent loops
     /// that require strict JSON replies benefit from a low value such as 0.0.
     pub temperature: Option<f32>,
+}
+
+impl std::fmt::Debug for ChatConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatConfig")
+            .field("provider", &self.provider)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .finish()
+    }
 }
 
 impl ChatConfig {
@@ -202,6 +250,19 @@ impl ChatConfig {
             return Err(ProviderError::InvalidConfiguration(
                 "max_tokens must be positive".into(),
             ));
+        }
+        if let Some(api_key) = self.api_key.as_deref() {
+            let api_key = api_key.trim();
+            if api_key.len() > MAX_API_KEY_BYTES {
+                return Err(ProviderError::InvalidConfiguration(
+                    "API key exceeds its byte limit".into(),
+                ));
+            }
+            if api_key.chars().any(char::is_control) {
+                return Err(ProviderError::InvalidConfiguration(
+                    "API key contains a control character".into(),
+                ));
+            }
         }
         if let Some(temperature) = self.temperature {
             if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
@@ -495,28 +556,27 @@ pub fn parse_chat_response_full(
             .get("content")
             .and_then(Value::as_array)
             .map(|parts| {
-                parts
-                    .iter()
-                    .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }),
-        Provider::OpenAiCompatible => response
-            .pointer("/choices/0/message/content")
-            .and_then(content_text),
-        Provider::Ollama => response
-            .pointer("/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| {
-                response
-                    .get("response")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            }),
-    }
-    .unwrap_or_default();
+                join_model_text(
+                    parts
+                        .iter()
+                        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|part| part.get("text").and_then(Value::as_str)),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default(),
+        Provider::OpenAiCompatible => match response.pointer("/choices/0/message/content") {
+            Some(content) => content_text(content)?.unwrap_or_default(),
+            None => String::new(),
+        },
+        Provider::Ollama => bounded_model_text(
+            response
+                .pointer("/message/content")
+                .and_then(Value::as_str)
+                .or_else(|| response.get("response").and_then(Value::as_str))
+                .unwrap_or_default(),
+        )?,
+    };
     if text.trim().is_empty() {
         return Err(ProviderError::EmptyResponse);
     }
@@ -572,17 +632,61 @@ pub(crate) fn parse_usage(provider: Provider, response: &Value) -> Option<Usage>
     (usage.input_tokens.is_some() || usage.output_tokens.is_some()).then_some(usage)
 }
 
-pub(crate) fn content_text(value: &Value) -> Option<String> {
+pub(crate) fn content_text(value: &Value) -> Result<Option<String>, ProviderError> {
     if let Some(text) = value.as_str() {
-        return Some(text.to_string());
+        return bounded_model_text(text).map(Some);
     }
-    value.as_array().map(|parts| {
-        parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
+    value
+        .as_array()
+        .map(|parts| {
+            join_model_text(
+                parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str)),
+            )
+            .map(Some)
+        })
+        .unwrap_or(Ok(None))
+}
+
+/// Join provider text blocks without first collecting or allocating an
+/// unbounded intermediate string. The separator counts toward the same
+/// cumulative model-text budget as the block contents.
+pub(crate) fn join_model_text<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+) -> Result<String, ProviderError> {
+    let mut joined = String::new();
+    let mut first = true;
+    for part in parts {
+        let separator_bytes = usize::from(!first);
+        let total = joined
+            .len()
+            .checked_add(separator_bytes)
+            .and_then(|length| length.checked_add(part.len()))
+            .ok_or(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES,
+            })?;
+        if total > MAX_MODEL_TEXT_BYTES {
+            return Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES,
+            });
+        }
+        if !first {
+            joined.push('\n');
+        }
+        joined.push_str(part);
+        first = false;
+    }
+    Ok(joined)
+}
+
+fn bounded_model_text(text: &str) -> Result<String, ProviderError> {
+    if text.len() > MAX_MODEL_TEXT_BYTES {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: MAX_MODEL_TEXT_BYTES,
+        });
+    }
+    Ok(text.to_string())
 }
 
 #[cfg(test)]
@@ -634,6 +738,21 @@ mod tests {
         let body: Value = serde_json::from_str(&ollama.body).unwrap();
         assert_eq!(body["stream"], false);
         assert_eq!(body["options"]["num_predict"], 512);
+    }
+
+    #[test]
+    fn debug_output_never_exposes_api_credentials() {
+        let secret = "sk-test-never-log-this-value";
+        let mut chat = config(Provider::Anthropic);
+        chat.api_key = Some(secret.into());
+        let config_debug = format!("{chat:?}");
+        assert!(config_debug.contains("[REDACTED]"));
+        assert!(!config_debug.contains(secret));
+
+        let request = build_chat_request(&chat, None, &[user("hello")]).unwrap();
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains("[REDACTED]"));
+        assert!(!request_debug.contains(secret));
     }
 
     #[test]
@@ -718,6 +837,14 @@ mod tests {
         let mut bad = config(Provider::Ollama);
         bad.temperature = Some(2.5);
         assert!(bad.validate().is_err());
+        let mut bad = config(Provider::OpenAiCompatible);
+        bad.api_key = Some("safe-prefix\r\nx-injected: yes".into());
+        let error = bad.validate().unwrap_err().to_string();
+        assert!(error.contains("control character"));
+        assert!(!error.contains("safe-prefix"));
+        let mut bad = config(Provider::OpenAiCompatible);
+        bad.api_key = Some("x".repeat(MAX_API_KEY_BYTES + 1));
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -798,6 +925,49 @@ mod tests {
         assert!(matches!(
             parse_chat_response(Provider::Anthropic, &empty),
             Err(ProviderError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn response_text_budget_is_enforced_while_blocks_are_joined() {
+        // Each block fits independently, but the joined value (including its
+        // separator) does not. Parsing must reject before constructing an
+        // oversized aggregate string.
+        let half = "x".repeat(MAX_MODEL_TEXT_BYTES / 2);
+        let anthropic = json!({
+            "content": [
+                {"type": "text", "text": half},
+                {"type": "text", "text": half},
+            ]
+        });
+        assert!(matches!(
+            parse_chat_response_full(Provider::Anthropic, &anthropic),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES
+            })
+        ));
+
+        let openai = json!({
+            "choices": [{"message": {"content": [
+                {"type": "text", "text": half},
+                {"type": "text", "text": half},
+            ]}}]
+        });
+        assert!(matches!(
+            parse_chat_response_full(Provider::OpenAiCompatible, &openai),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES
+            })
+        ));
+
+        let ollama = json!({
+            "message": {"content": "x".repeat(MAX_MODEL_TEXT_BYTES + 1)}
+        });
+        assert!(matches!(
+            parse_chat_response_full(Provider::Ollama, &ollama),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_MODEL_TEXT_BYTES
+            })
         ));
     }
 
