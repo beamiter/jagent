@@ -4,12 +4,13 @@
 //! value to the caller; this module has no PTY, shell, process, or UI access and
 //! therefore cannot execute a command by itself.
 
-use crate::safety::{is_dangerous, MAX_COMMAND_BYTES};
+use crate::safety::{is_dangerous, is_unsafe_invisible_char, MAX_COMMAND_BYTES};
 use crate::text::elide_middle;
 use crate::tools::{
     AgentProtocol, ToolResponse, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_NAME_BYTES, TOOL_DONE,
     TOOL_RUN, TOOL_SAY,
 };
+use serde::de::{self, DeserializeSeed, Deserializer, VariantAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,7 @@ pub enum ProposalStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum Turn {
     User(String),
     AssistantThought(String),
@@ -338,7 +340,7 @@ fn validate_command(command: &str) -> Result<(), ParseError> {
             "contains a control character".into(),
         ));
     }
-    if command.chars().any(is_unsafe_invisible_command_char) {
+    if command.chars().any(is_unsafe_invisible_char) {
         return Err(ParseError::InvalidCommand(
             "contains an invisible or bidirectional formatting character".into(),
         ));
@@ -346,37 +348,8 @@ fn validate_command(command: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
-/// Characters that can visually reorder or hide shell input without being
-/// classified as control characters by [`char::is_control`]. A review-first
-/// approval card must display the same visible ordering that is handed to the
-/// shell. Ordinary non-ASCII text, combining marks, and emoji that do not rely
-/// on invisible presentation selectors remain valid.
-fn is_unsafe_invisible_command_char(character: char) -> bool {
-    (character.is_whitespace() && character != ' ')
-        || matches!(
-            character,
-            '\u{00ad}' // soft hyphen
-            | '\u{034f}' // combining grapheme joiner
-            | '\u{061c}' // Arabic letter mark
-            | '\u{115f}'..='\u{1160}' // Hangul fillers
-            | '\u{17b4}'..='\u{17b5}' // Khmer inherent vowels
-            | '\u{180b}'..='\u{180f}' // Mongolian selectors/separator
-            | '\u{200b}'..='\u{200f}' // zero-width + direction marks
-            | '\u{2028}'..='\u{202e}' // line/paragraph + bidi embedding/override
-            | '\u{2060}'..='\u{206f}' // invisible operators, isolates, deprecated controls
-            | '\u{3164}' // Hangul filler
-            | '\u{fe00}'..='\u{fe0f}' // variation selectors
-            | '\u{feff}' // zero-width no-break space / BOM
-            | '\u{ffa0}' // halfwidth Hangul filler
-            | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
-            | '\u{1d173}'..='\u{1d17a}' // musical format controls
-            | '\u{e0001}' // language tag
-            | '\u{e0020}'..='\u{e007f}' // tag characters
-            | '\u{e0100}'..='\u{e01ef}' // supplementary variation selectors
-        )
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub enum AgentState {
     Ready,
     AwaitingModel,
@@ -1165,8 +1138,11 @@ pub const MAX_AGENT_SNAPSHOT_JSON_BYTES: usize = 256 * 1024;
 /// Serializable capture of an [`AgentSession`] for cross-restart persistence.
 /// Serialization is pure; where and how the JSON is stored stays with the
 /// embedding application.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// The type deliberately does **not** implement [`serde::Deserialize`].
+/// [`Self::from_json`] is the only wire path, so no caller can reach the
+/// unbounded Serde collection decoding this schema previously used.
+#[derive(Debug, Clone, Serialize)]
 pub struct AgentSessionSnapshot {
     version: u32,
     transcript: Vec<Turn>,
@@ -1189,13 +1165,455 @@ impl AgentSessionSnapshot {
         Ok(encoded)
     }
 
+    /// Decode a snapshot under the schema's own allocation budgets.
+    ///
+    /// The encoded envelope is bounded first, then decoding itself refuses the
+    /// 129th transcript entry before constructing it, rejects unknown and
+    /// duplicate fields, and charges each retained string against both its own
+    /// field limit and the cumulative transcript budget. Trailing content after
+    /// the snapshot object is rejected as well.
     pub fn from_json(encoded: &str) -> Result<Self, AgentSnapshotError> {
         if encoded.len() > MAX_AGENT_SNAPSHOT_JSON_BYTES {
             return Err(AgentSnapshotError::TooLarge {
                 limit: MAX_AGENT_SNAPSHOT_JSON_BYTES,
             });
         }
-        serde_json::from_str(encoded).map_err(|error| AgentSnapshotError::Decode(error.to_string()))
+        let mut deserializer = serde_json::Deserializer::from_str(encoded);
+        let snapshot = SnapshotSeed
+            .deserialize(&mut deserializer)
+            .map_err(|error| AgentSnapshotError::Decode(error.to_string()))?;
+        deserializer
+            .end()
+            .map_err(|error| AgentSnapshotError::Decode(error.to_string()))?;
+        Ok(snapshot)
+    }
+}
+
+/// Allocation budget shared by every seed decoding one snapshot.
+///
+/// [`AgentSessionSnapshot::from_json`] already refuses an oversized encoded
+/// envelope, but a 256 KiB document can still describe tens of thousands of
+/// tiny transcript entries or a handful of near-envelope-sized strings.
+/// Ordinary Serde collection deserialization would allocate all of them and
+/// only meet the transcript bounds afterwards, so the seeds below charge as
+/// they decode and fail closed at the first entry that does not fit.
+struct SnapshotBudget {
+    remaining_text: usize,
+}
+
+impl SnapshotBudget {
+    fn new() -> Self {
+        Self {
+            remaining_text: MAX_STORED_TRANSCRIPT_BYTES,
+        }
+    }
+
+    /// Validate one string against its own field limit and the cumulative
+    /// transcript budget *before* it is retained in a [`Turn`].
+    fn charge<E: de::Error>(
+        &mut self,
+        field: &'static str,
+        text: &str,
+        max_bytes: usize,
+    ) -> Result<(), E> {
+        if text.len() > max_bytes {
+            return Err(de::Error::custom(format_args!(
+                "transcript field '{field}' exceeds its {max_bytes}-byte limit"
+            )));
+        }
+        self.remaining_text = self.remaining_text.checked_sub(text.len()).ok_or_else(|| {
+            de::Error::custom(format_args!(
+                "transcript exceeds its {MAX_STORED_TRANSCRIPT_BYTES}-byte cumulative limit"
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// Decode one string, rejecting it before it is owned if it does not fit.
+struct BoundedText<'a> {
+    budget: &'a mut SnapshotBudget,
+    field: &'static str,
+    max_bytes: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BoundedText<'_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BoundedText<'_> {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "a '{}' string of at most {} bytes",
+            self.field, self.max_bytes
+        )
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        self.budget.charge(self.field, value, self.max_bytes)?;
+        Ok(value.to_owned())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(variant_identifier)]
+enum TurnTag {
+    User,
+    AssistantThought,
+    AssistantSay,
+    AssistantProposed,
+    Observation,
+    ProtocolError,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ProposedField {
+    Id,
+    Command,
+    Status,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum ObservationField {
+    ProposalId,
+    ExitCode,
+    OutputSample,
+}
+
+#[derive(Deserialize)]
+#[serde(field_identifier, rename_all = "snake_case")]
+enum SnapshotField {
+    Version,
+    Transcript,
+    TranscriptTruncated,
+    State,
+    TurnsUsed,
+    MaxTurns,
+    NextProposalId,
+}
+
+const TURN_VARIANTS: &[&str] = &[
+    "User",
+    "AssistantThought",
+    "AssistantSay",
+    "AssistantProposed",
+    "Observation",
+    "ProtocolError",
+];
+const PROPOSED_FIELDS: &[&str] = &["id", "command", "status"];
+const OBSERVATION_FIELDS: &[&str] = &["proposal_id", "exit_code", "output_sample"];
+const SNAPSHOT_FIELDS: &[&str] = &[
+    "version",
+    "transcript",
+    "transcript_truncated",
+    "state",
+    "turns_used",
+    "max_turns",
+    "next_proposal_id",
+];
+
+struct TurnSeed<'a> {
+    budget: &'a mut SnapshotBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for TurnSeed<'_> {
+    type Value = Turn;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_enum("Turn", TURN_VARIANTS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for TurnSeed<'_> {
+    type Value = Turn;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an agent transcript turn")
+    }
+
+    fn visit_enum<A: de::EnumAccess<'de>>(self, data: A) -> Result<Self::Value, A::Error> {
+        let budget = self.budget;
+        let (tag, variant) = data.variant::<TurnTag>()?;
+        let text = |budget, field, max_bytes| BoundedText {
+            budget,
+            field,
+            max_bytes,
+        };
+        match tag {
+            TurnTag::User => Ok(Turn::User(variant.newtype_variant_seed(text(
+                budget,
+                "User",
+                MAX_MESSAGE_BYTES,
+            ))?)),
+            TurnTag::AssistantThought => {
+                Ok(Turn::AssistantThought(variant.newtype_variant_seed(
+                    text(budget, "AssistantThought", MAX_THOUGHT_BYTES),
+                )?))
+            }
+            TurnTag::AssistantSay => Ok(Turn::AssistantSay(variant.newtype_variant_seed(text(
+                budget,
+                "AssistantSay",
+                MAX_MESSAGE_BYTES,
+            ))?)),
+            TurnTag::ProtocolError => Ok(Turn::ProtocolError(
+                variant.newtype_variant_seed(text(budget, "ProtocolError", MAX_MESSAGE_BYTES))?,
+            )),
+            TurnTag::AssistantProposed => {
+                variant.struct_variant(PROPOSED_FIELDS, ProposedSeed { budget })
+            }
+            TurnTag::Observation => {
+                variant.struct_variant(OBSERVATION_FIELDS, ObservationSeed { budget })
+            }
+        }
+    }
+}
+
+struct ProposedSeed<'a> {
+    budget: &'a mut SnapshotBudget,
+}
+
+impl<'de> Visitor<'de> for ProposedSeed<'_> {
+    type Value = Turn;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a proposed-command turn")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let budget = self.budget;
+        let mut id = None;
+        let mut command = None;
+        let mut status = None;
+        while let Some(key) = map.next_key::<ProposedField>()? {
+            match key {
+                ProposedField::Id => {
+                    if id.is_some() {
+                        return Err(de::Error::duplicate_field("id"));
+                    }
+                    id = Some(map.next_value::<ProposalId>()?);
+                }
+                ProposedField::Command => {
+                    if command.is_some() {
+                        return Err(de::Error::duplicate_field("command"));
+                    }
+                    command = Some(map.next_value_seed(BoundedText {
+                        budget: &mut *budget,
+                        field: "command",
+                        max_bytes: MAX_COMMAND_BYTES,
+                    })?);
+                }
+                ProposedField::Status => {
+                    if status.is_some() {
+                        return Err(de::Error::duplicate_field("status"));
+                    }
+                    status = Some(map.next_value::<ProposalStatus>()?);
+                }
+            }
+        }
+        Ok(Turn::AssistantProposed {
+            id: id.ok_or_else(|| de::Error::missing_field("id"))?,
+            command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+            status: status.ok_or_else(|| de::Error::missing_field("status"))?,
+        })
+    }
+}
+
+struct ObservationSeed<'a> {
+    budget: &'a mut SnapshotBudget,
+}
+
+impl<'de> Visitor<'de> for ObservationSeed<'_> {
+    type Value = Turn;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an observation turn")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let budget = self.budget;
+        let mut proposal_id = None;
+        let mut exit_code = None;
+        let mut output_sample = None;
+        while let Some(key) = map.next_key::<ObservationField>()? {
+            match key {
+                ObservationField::ProposalId => {
+                    if proposal_id.is_some() {
+                        return Err(de::Error::duplicate_field("proposal_id"));
+                    }
+                    proposal_id = Some(map.next_value::<ProposalId>()?);
+                }
+                ObservationField::ExitCode => {
+                    if exit_code.is_some() {
+                        return Err(de::Error::duplicate_field("exit_code"));
+                    }
+                    exit_code = Some(map.next_value::<i32>()?);
+                }
+                ObservationField::OutputSample => {
+                    if output_sample.is_some() {
+                        return Err(de::Error::duplicate_field("output_sample"));
+                    }
+                    output_sample = Some(map.next_value_seed(BoundedText {
+                        budget: &mut *budget,
+                        field: "output_sample",
+                        max_bytes: MAX_OBSERVATION_BYTES,
+                    })?);
+                }
+            }
+        }
+        Ok(Turn::Observation {
+            proposal_id: proposal_id.ok_or_else(|| de::Error::missing_field("proposal_id"))?,
+            exit_code: exit_code.ok_or_else(|| de::Error::missing_field("exit_code"))?,
+            output_sample: output_sample
+                .ok_or_else(|| de::Error::missing_field("output_sample"))?,
+        })
+    }
+}
+
+struct TranscriptSeed<'a> {
+    budget: &'a mut SnapshotBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for TranscriptSeed<'_> {
+    type Value = Vec<Turn>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for TranscriptSeed<'_> {
+    type Value = Vec<Turn>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX_STORED_TRANSCRIPT_ENTRIES} agent transcript turns"
+        )
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let budget = self.budget;
+        // A hostile size hint must not preallocate on its own.
+        let mut turns = Vec::with_capacity(
+            seq.size_hint()
+                .unwrap_or(0)
+                .min(MAX_STORED_TRANSCRIPT_ENTRIES),
+        );
+        while turns.len() < MAX_STORED_TRANSCRIPT_ENTRIES {
+            let Some(turn) = seq.next_element_seed(TurnSeed {
+                budget: &mut *budget,
+            })?
+            else {
+                return Ok(turns);
+            };
+            turns.push(turn);
+        }
+        // Detect a 129th entry without building it: `IgnoredAny` proves the
+        // array is over-wide while allocating no turn at all.
+        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+            return Err(de::Error::custom(format_args!(
+                "transcript exceeds its {MAX_STORED_TRANSCRIPT_ENTRIES}-entry limit"
+            )));
+        }
+        Ok(turns)
+    }
+}
+
+/// The bounded wire decoder for [`AgentSessionSnapshot`].
+struct SnapshotSeed;
+
+impl<'de> DeserializeSeed<'de> for SnapshotSeed {
+    type Value = AgentSessionSnapshot;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_struct("AgentSessionSnapshot", SNAPSHOT_FIELDS, self)
+    }
+}
+
+impl<'de> Visitor<'de> for SnapshotSeed {
+    type Value = AgentSessionSnapshot;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an agent session snapshot object")
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut budget = SnapshotBudget::new();
+        let mut version = None;
+        let mut transcript = None;
+        let mut transcript_truncated = None;
+        let mut state = None;
+        let mut turns_used = None;
+        let mut max_turns = None;
+        let mut next_proposal_id = None;
+        while let Some(key) = map.next_key::<SnapshotField>()? {
+            match key {
+                SnapshotField::Version => {
+                    if version.is_some() {
+                        return Err(de::Error::duplicate_field("version"));
+                    }
+                    version = Some(map.next_value::<u32>()?);
+                }
+                SnapshotField::Transcript => {
+                    if transcript.is_some() {
+                        return Err(de::Error::duplicate_field("transcript"));
+                    }
+                    transcript = Some(map.next_value_seed(TranscriptSeed {
+                        budget: &mut budget,
+                    })?);
+                }
+                SnapshotField::TranscriptTruncated => {
+                    if transcript_truncated.is_some() {
+                        return Err(de::Error::duplicate_field("transcript_truncated"));
+                    }
+                    transcript_truncated = Some(map.next_value::<bool>()?);
+                }
+                SnapshotField::State => {
+                    if state.is_some() {
+                        return Err(de::Error::duplicate_field("state"));
+                    }
+                    state = Some(map.next_value::<AgentState>()?);
+                }
+                SnapshotField::TurnsUsed => {
+                    if turns_used.is_some() {
+                        return Err(de::Error::duplicate_field("turns_used"));
+                    }
+                    turns_used = Some(map.next_value::<u32>()?);
+                }
+                SnapshotField::MaxTurns => {
+                    if max_turns.is_some() {
+                        return Err(de::Error::duplicate_field("max_turns"));
+                    }
+                    max_turns = Some(map.next_value::<u32>()?);
+                }
+                SnapshotField::NextProposalId => {
+                    if next_proposal_id.is_some() {
+                        return Err(de::Error::duplicate_field("next_proposal_id"));
+                    }
+                    next_proposal_id = Some(map.next_value::<u64>()?);
+                }
+            }
+        }
+        Ok(AgentSessionSnapshot {
+            version: version.ok_or_else(|| de::Error::missing_field("version"))?,
+            transcript: transcript.ok_or_else(|| de::Error::missing_field("transcript"))?,
+            transcript_truncated: transcript_truncated
+                .ok_or_else(|| de::Error::missing_field("transcript_truncated"))?,
+            state: state.ok_or_else(|| de::Error::missing_field("state"))?,
+            turns_used: turns_used.ok_or_else(|| de::Error::missing_field("turns_used"))?,
+            max_turns: max_turns.ok_or_else(|| de::Error::missing_field("max_turns"))?,
+            next_proposal_id: next_proposal_id
+                .ok_or_else(|| de::Error::missing_field("next_proposal_id"))?,
+        })
     }
 }
 
@@ -1346,6 +1764,94 @@ mod tests {
             AgentSession::restore(snapshot),
             Err(AgentSnapshotError::Invalid(_))
         ));
+    }
+
+    /// Build a syntactically valid snapshot document around `transcript`.
+    fn snapshot_json(transcript: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"version":1,"transcript":[{}],"transcript_truncated":false,"#,
+                r#""state":"Ready","turns_used":1,"max_turns":10,"next_proposal_id":1}}"#
+            ),
+            transcript
+        )
+    }
+
+    fn decode_error(json: &str) -> String {
+        match AgentSessionSnapshot::from_json(json) {
+            Err(AgentSnapshotError::Decode(message)) => message,
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decoding_stops_before_building_the_129th_transcript_entry() {
+        let entry = r#"{"User":"x"}"#;
+
+        let widest_accepted = vec![entry; MAX_STORED_TRANSCRIPT_ENTRIES].join(",");
+        let snapshot = AgentSessionSnapshot::from_json(&snapshot_json(&widest_accepted))
+            .expect("the entry limit itself still decodes");
+        assert_eq!(snapshot.transcript.len(), MAX_STORED_TRANSCRIPT_ENTRIES);
+
+        // Far more entries than the limit still fit inside the encoded
+        // envelope, which is exactly the amplification the visitor prevents:
+        // decoding fails without ever allocating the extra turns.
+        let over_wide = vec![entry; 8 * MAX_STORED_TRANSCRIPT_ENTRIES].join(",");
+        let json = snapshot_json(&over_wide);
+        assert!(json.len() < MAX_AGENT_SNAPSHOT_JSON_BYTES);
+        assert!(
+            decode_error(&json).contains("128-entry limit"),
+            "wide transcripts must be refused while decoding"
+        );
+    }
+
+    #[test]
+    fn decoding_charges_per_field_and_cumulative_text_budgets() {
+        let oversized = "t".repeat(MAX_THOUGHT_BYTES + 1);
+        let json = snapshot_json(&format!(r#"{{"AssistantThought":"{oversized}"}}"#));
+        assert!(decode_error(&json).contains("'AssistantThought' exceeds"));
+
+        let oversized = "o".repeat(MAX_OBSERVATION_BYTES + 1);
+        let json = snapshot_json(&format!(
+            r#"{{"Observation":{{"proposal_id":1,"exit_code":0,"output_sample":"{oversized}"}}}}"#
+        ));
+        assert!(decode_error(&json).contains("'output_sample' exceeds"));
+
+        // Every individual message fits, but together they exceed what a live
+        // session could ever have retained.
+        let message = "m".repeat(MAX_MESSAGE_BYTES);
+        let entry = format!(r#"{{"User":"{message}"}}"#);
+        let entries = MAX_STORED_TRANSCRIPT_BYTES / MAX_MESSAGE_BYTES + 1;
+        let json = snapshot_json(&vec![entry; entries].join(","));
+        assert!(json.len() < MAX_AGENT_SNAPSHOT_JSON_BYTES);
+        assert!(decode_error(&json).contains("cumulative limit"));
+    }
+
+    #[test]
+    fn decoding_rejects_duplicate_unknown_and_trailing_content() {
+        let valid = snapshot_json(r#"{"User":"hi"}"#);
+        assert!(AgentSessionSnapshot::from_json(&valid).is_ok());
+
+        let duplicated = valid.replace(r#""turns_used":1"#, r#""turns_used":1,"turns_used":2"#);
+        assert!(decode_error(&duplicated).contains("duplicate field `turns_used`"));
+
+        let duplicated_turn_field = snapshot_json(
+            r#"{"AssistantProposed":{"id":1,"command":"ls","command":"rm -rf /","status":"Pending"}}"#,
+        );
+        assert!(decode_error(&duplicated_turn_field).contains("duplicate field `command`"));
+
+        let unknown = valid.replace(r#""version":1"#, r#""version":1,"trailer":"x""#);
+        assert!(decode_error(&unknown).contains("trailer"));
+
+        let unknown_turn_field = snapshot_json(
+            r#"{"Observation":{"proposal_id":1,"exit_code":0,"output_sample":"ok","extra":1}}"#,
+        );
+        assert!(decode_error(&unknown_turn_field).contains("extra"));
+
+        let missing = valid.replace(r#""max_turns":10,"#, "");
+        assert!(decode_error(&missing).contains("max_turns"));
+
+        assert!(decode_error(&format!("{valid}{valid}")).contains("trailing"));
     }
 
     #[test]

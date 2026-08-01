@@ -5,6 +5,7 @@
 //! already trusts (curl child process, ureq, …) and hands the response JSON to
 //! [`parse_chat_response`]. Nothing in this module opens a socket.
 
+use crate::safety::is_unsafe_invisible_char;
 use crate::text::elide_middle;
 use crate::tools::{agent_body_fields, AgentProtocol};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,20 @@ pub const MAX_REQUEST_TURN_BYTES: usize = 192 * 1024;
 /// request construction and rejects configuration mistakes without exposing
 /// or echoing the credential in an error.
 pub const MAX_API_KEY_BYTES: usize = 16 * 1024;
+/// Byte ceiling for a configured model identifier.
+pub const MAX_MODEL_BYTES: usize = 1024;
+/// Byte ceiling for a configured base URL.
+pub const MAX_BASE_URL_BYTES: usize = 4 * 1024;
+/// Byte ceiling for one request's system prompt. A system prompt carries the
+/// protocol and safety instructions, so an over-budget one is rejected rather
+/// than elided: silently truncating it could drop the rules the reply is
+/// parsed against.
+pub const MAX_REQUEST_SYSTEM_BYTES: usize = 64 * 1024;
+/// Byte ceiling for one encoded non-streaming response envelope, applied by
+/// [`parse_chat_response_bytes`]. Integrations that decode the body themselves
+/// must apply an equivalent transport limit before calling the `Value`-based
+/// entry points.
+pub const MAX_RESPONSE_JSON_BYTES: usize = 1024 * 1024;
 
 /// Supported wire protocols. OpenAI-compatible intentionally includes local
 /// and hosted services which implement the Chat Completions endpoint.
@@ -229,23 +244,13 @@ impl ChatConfig {
         }
     }
 
+    /// Reject any configuration this crate would otherwise turn into a
+    /// request. Every bound here is the library's own: an integration may add
+    /// stricter policy, but it can no longer be the only thing standing
+    /// between a hostile settings file and an outbound HTTP request.
     pub fn validate(&self) -> Result<(), ProviderError> {
-        if self.model.trim().is_empty() {
-            return Err(ProviderError::InvalidConfiguration(
-                "model must not be empty".into(),
-            ));
-        }
-        let base_url = self.base_url.trim();
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://"))
-            || base_url
-                .split_once("://")
-                .is_none_or(|(_, host)| host.is_empty())
-            || base_url.chars().any(char::is_whitespace)
-        {
-            return Err(ProviderError::InvalidConfiguration(
-                "base URL must be an absolute http(s) URL without whitespace".into(),
-            ));
-        }
+        validate_model(&self.model)?;
+        validate_base_url(self.provider, self.base_url.trim())?;
         if self.max_tokens == 0 {
             return Err(ProviderError::InvalidConfiguration(
                 "max_tokens must be positive".into(),
@@ -273,6 +278,86 @@ impl ChatConfig {
         }
         Ok(())
     }
+}
+
+fn validate_model(model: &str) -> Result<(), ProviderError> {
+    if model.trim().is_empty()
+        || model.len() > MAX_MODEL_BYTES
+        || model.chars().any(char::is_control)
+        || model.chars().any(is_unsafe_invisible_char)
+    {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "model must be visible, non-empty text of at most {MAX_MODEL_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// Accept only endpoints this crate is willing to send a credential to.
+///
+/// A base URL usually arrives from a settings file or an environment variable,
+/// so it is attacker-reachable in exactly the situations where the request
+/// carries an API key. Userinfo would smuggle credentials into a persisted
+/// URL, a query or fragment is not a base-URL component (the provider endpoint
+/// is appended after this string), and visually ambiguous characters would let
+/// a configured host read as one origin while resolving as another.
+fn validate_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderError> {
+    let invalid = || {
+        ProviderError::InvalidConfiguration(format!(
+            "base URL must be an absolute HTTPS URL of at most {MAX_BASE_URL_BYTES} bytes with \
+             no credentials, query, fragment, backslash, control, or visually ambiguous \
+             characters (plain HTTP is accepted only for a loopback Ollama endpoint)"
+        ))
+    };
+    if base_url.is_empty()
+        || base_url.len() > MAX_BASE_URL_BYTES
+        || base_url.contains([' ', '?', '#', '\\'])
+        || base_url.chars().any(char::is_control)
+        || base_url.chars().any(is_unsafe_invisible_char)
+    {
+        return Err(invalid());
+    }
+    let (scheme, rest) = base_url.split_once("://").ok_or_else(invalid)?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(invalid());
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" if provider == Provider::Ollama && is_loopback_authority(authority) => Ok(()),
+        _ => Err(invalid()),
+    }
+}
+
+/// True for `localhost`, an IPv4 loopback literal, or a bracketed IPv6
+/// loopback literal, each with an optional numeric port.
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((literal, port)) = rest.split_once(']') else {
+            return false;
+        };
+        if !port.is_empty() && !port.strip_prefix(':').is_some_and(is_port) {
+            return false;
+        }
+        literal
+    } else {
+        match authority.split_once(':') {
+            Some((host, port)) if is_port(port) => host,
+            Some(_) => return false,
+            None => authority,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn is_port(port: &str) -> bool {
+    !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit())
 }
 
 /// Bound a conversation history to the request budgets, newest-first, and
@@ -411,6 +496,18 @@ fn build_request_with(
     extra_body_fields: &[(&'static str, Value)],
 ) -> Result<HttpRequest, ProviderError> {
     config.validate()?;
+    if let Some(system) = system {
+        if system.len() > MAX_REQUEST_SYSTEM_BYTES {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "system prompt exceeds the {MAX_REQUEST_SYSTEM_BYTES}-byte request limit"
+            )));
+        }
+    }
+    // `bound_history` is idempotent, so a caller that already bounded (or
+    // redacted and bounded) its history sends exactly what it prepared, while
+    // a caller that forgot cannot make this crate emit an unbounded body.
+    let (history, _omitted) = bound_history(history);
+    let history = &history[..];
     let api_key = config
         .api_key
         .as_deref()
@@ -528,9 +625,31 @@ pub struct ChatResponse {
     pub usage: Option<Usage>,
 }
 
+/// Extract the assistant text from one non-streaming chat response body.
+///
+/// This is the bounded entry point: the encoded envelope is refused above
+/// [`MAX_RESPONSE_JSON_BYTES`] before `serde_json` allocates anything from it.
+/// The [`Value`]-based functions below stay available for integrations that
+/// already decode the body, but those make the transport's own envelope limit
+/// an integration requirement.
+pub fn parse_chat_response_bytes(provider: Provider, body: &[u8]) -> Result<String, ProviderError> {
+    if body.len() > MAX_RESPONSE_JSON_BYTES {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: MAX_RESPONSE_JSON_BYTES,
+        });
+    }
+    let response: Value = serde_json::from_slice(body)
+        .map_err(|error| ProviderError::MalformedResponse(error.to_string()))?;
+    parse_chat_response(provider, &response)
+}
+
 /// Extract the assistant text from one non-streaming chat response.
 /// A reached token limit is surfaced as a visible trailing note, never as an
 /// error, so partial answers stay reviewable.
+///
+/// `response` is already decoded, so the caller's transport must have applied
+/// its own encoded-envelope limit; [`parse_chat_response_bytes`] does that for
+/// integrations that would rather not.
 pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<String, ProviderError> {
     let parsed = parse_chat_response_full(provider, response)?;
     let mut text = parsed.text;
@@ -845,6 +964,139 @@ mod tests {
         let mut bad = config(Provider::OpenAiCompatible);
         bad.api_key = Some("x".repeat(MAX_API_KEY_BYTES + 1));
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn base_urls_must_be_https_unless_ollama_stays_on_loopback() {
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let mut config = config(provider);
+            config.base_url = provider.default_base_url().into();
+            assert!(
+                config.validate().is_ok(),
+                "{provider:?} must accept its own default endpoint"
+            );
+        }
+
+        // Plain HTTP is a loopback Ollama concession, not a general one.
+        for loopback in [
+            "http://localhost:11434",
+            "http://LOCALHOST",
+            "http://127.0.0.1:11434",
+            "http://127.6.6.6",
+            "http://[::1]:11434",
+        ] {
+            let mut ollama = config(Provider::Ollama);
+            ollama.base_url = loopback.into();
+            assert!(ollama.validate().is_ok(), "{loopback} is loopback");
+
+            let mut cloud = config(Provider::OpenAiCompatible);
+            cloud.base_url = loopback.into();
+            assert!(
+                cloud.validate().is_err(),
+                "{loopback} must not downgrade a cloud provider to HTTP"
+            );
+        }
+        for remote in [
+            "http://example.com",
+            "http://localhost.example.com",
+            "http://127.0.0.1.example.com",
+            "http://[::2]:11434",
+            "http://127.0.0.1:not-a-port",
+        ] {
+            let mut ollama = config(Provider::Ollama);
+            ollama.base_url = remote.into();
+            assert!(
+                ollama.validate().is_err(),
+                "{remote} must not pass as loopback"
+            );
+        }
+    }
+
+    #[test]
+    fn base_urls_and_models_reject_smuggled_components() {
+        for hostile in [
+            "https:///missing-authority",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?api-key=secret",
+            "https://example.com/v1#fragment",
+            "https://example.com\\v1",
+            "https://exam\u{200b}ple.com",
+            "https://example.com/\u{202e}v1",
+            "https://example.com/v 1",
+            "ftp://example.com",
+            "example.com",
+            "",
+        ] {
+            let mut bad = config(Provider::OpenAiCompatible);
+            bad.base_url = hostile.into();
+            assert!(bad.validate().is_err(), "{hostile:?} must be rejected");
+        }
+
+        let mut long = config(Provider::OpenAiCompatible);
+        long.base_url = format!("https://example.com/{}", "x".repeat(MAX_BASE_URL_BYTES));
+        assert!(long.validate().is_err());
+
+        for hostile in ["gpt\u{202e}4o", "gpt\u{200b}4o", "gpt\t4o", "gpt\n4o"] {
+            let mut bad = config(Provider::OpenAiCompatible);
+            bad.model = hostile.into();
+            assert!(bad.validate().is_err(), "{hostile:?} must be rejected");
+        }
+        let mut long = config(Provider::OpenAiCompatible);
+        long.model = "m".repeat(MAX_MODEL_BYTES + 1);
+        assert!(long.validate().is_err());
+    }
+
+    #[test]
+    fn builders_bound_history_and_system_prompts_without_the_caller() {
+        let history: Vec<Message> = (0..MAX_REQUEST_HISTORY_TURNS * 3)
+            .map(|index| user(&format!("turn {index}")))
+            .collect();
+        let request =
+            build_chat_request(&config(Provider::Anthropic), Some("sys"), &history).unwrap();
+        let body: Value = serde_json::from_str(&request.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), MAX_REQUEST_HISTORY_TURNS);
+        // The newest turns are the ones kept.
+        assert_eq!(
+            messages.last().unwrap()["content"],
+            format!("turn {}", MAX_REQUEST_HISTORY_TURNS * 3 - 1)
+        );
+
+        // Bounding is idempotent: preparing the history first sends the same body.
+        let (bounded, _) = bound_history(&history);
+        let prepared =
+            build_chat_request(&config(Provider::Anthropic), Some("sys"), &bounded).unwrap();
+        assert_eq!(prepared.body, request.body);
+
+        let oversized = "s".repeat(MAX_REQUEST_SYSTEM_BYTES + 1);
+        assert!(matches!(
+            build_chat_request(&config(Provider::Anthropic), Some(&oversized), &history),
+            Err(ProviderError::InvalidConfiguration(_))
+        ));
+    }
+
+    #[test]
+    fn byte_oriented_response_parsing_bounds_the_envelope() {
+        let body = serde_json::json!({"content": [{"type": "text", "text": "hi"}]}).to_string();
+        assert_eq!(
+            parse_chat_response_bytes(Provider::Anthropic, body.as_bytes()).unwrap(),
+            "hi"
+        );
+        assert!(matches!(
+            parse_chat_response_bytes(Provider::Anthropic, b"{not json"),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+        let huge = vec![b' '; MAX_RESPONSE_JSON_BYTES + 1];
+        assert!(matches!(
+            parse_chat_response_bytes(Provider::Anthropic, &huge),
+            Err(ProviderError::ResponseTooLarge {
+                limit: MAX_RESPONSE_JSON_BYTES
+            })
+        ));
     }
 
     #[test]

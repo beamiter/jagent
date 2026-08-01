@@ -3,6 +3,37 @@
 
 pub(crate) const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
+/// Characters that can visually reorder or hide text without being classified
+/// as control characters by [`char::is_control`]. A review-first approval card
+/// must display the same visible ordering that is handed to the shell, and a
+/// configured endpoint must read as the host it actually resolves to. Ordinary
+/// non-ASCII text, combining marks, and emoji that do not rely on invisible
+/// presentation selectors remain valid.
+pub(crate) fn is_unsafe_invisible_char(character: char) -> bool {
+    (character.is_whitespace() && character != ' ')
+        || matches!(
+            character,
+            '\u{00ad}' // soft hyphen
+            | '\u{034f}' // combining grapheme joiner
+            | '\u{061c}' // Arabic letter mark
+            | '\u{115f}'..='\u{1160}' // Hangul fillers
+            | '\u{17b4}'..='\u{17b5}' // Khmer inherent vowels
+            | '\u{180b}'..='\u{180f}' // Mongolian selectors/separator
+            | '\u{200b}'..='\u{200f}' // zero-width + direction marks
+            | '\u{2028}'..='\u{202e}' // line/paragraph + bidi embedding/override
+            | '\u{2060}'..='\u{206f}' // invisible operators, isolates, deprecated controls
+            | '\u{3164}' // Hangul filler
+            | '\u{fe00}'..='\u{fe0f}' // variation selectors
+            | '\u{feff}' // zero-width no-break space / BOM
+            | '\u{ffa0}' // halfwidth Hangul filler
+            | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
+            | '\u{1d173}'..='\u{1d17a}' // musical format controls
+            | '\u{e0001}' // language tag
+            | '\u{e0020}'..='\u{e007f}' // tag characters
+            | '\u{e0100}'..='\u{e01ef}' // supplementary variation selectors
+        )
+}
+
 /// Warn about recognizable destructive shell patterns. This never authorizes
 /// or blocks a proposal; it gives the approval UI a reason to slow the user.
 pub fn is_dangerous(command: &str) -> Option<&'static str> {
