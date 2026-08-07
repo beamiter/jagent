@@ -19,6 +19,7 @@ the parts that must behave identically everywhere.
 | `prompt`   | Agent system prompts — `build_agent_system_prompt` (JSON protocol) and `build_agent_tool_system_prompt` (schema-carried protocol) — and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
 | `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events. Tool calls have per-call and whole-response bounds and are published only after the enclosing response completes; truncation, payload after an end signal, malformed indexes/frames, and empty text responses fail closed. Pair with `build_chat_request_streaming`. |
 | `tools`    | The same three actions carried by the providers' **native** tool-calling: provider-correct schemas (Anthropic `input_schema`, OpenAI `function`/`parameters`; Ollama returns `InvalidConfiguration`), plus `parse_tool_response` → `ToolResponse::to_action` ingestion into the identical `ParsedAction` values. Token-limited output never becomes an action. Fully additive: `AgentProtocol::Text` reproduces 0.4 byte-for-byte. |
+| `redact`   | High-confidence scrubbing for AI-bound text: common provider and service tokens, private-key blocks, JWTs, explicit bearer credentials, and passwords embedded in URL userinfo. Non-secret URL and authentication framing is preserved for context. |
 
 ## Invariants
 
