@@ -503,8 +503,10 @@ fn bounded_name(value: Option<&Value>) -> Result<String, ProviderError> {
 mod tests {
     use super::*;
     use crate::provider::{
-        build_agent_chat_request, build_agent_chat_request_streaming, build_chat_request,
-        build_chat_request_streaming, ChatConfig, Message, Role,
+        build_agent_chat_request, build_agent_chat_request_streaming,
+        build_agent_chat_request_streaming_with_report, build_agent_chat_request_with_report,
+        build_chat_request, build_chat_request_streaming, ChatConfig, Message, Role,
+        MAX_REQUEST_HISTORY_TURNS,
     };
 
     fn config(provider: Provider) -> ChatConfig {
@@ -565,6 +567,70 @@ mod tests {
             request.body,
             r#"{"max_tokens":512,"messages":[{"content":"hello","role":"user"}],"model":"test-model","system":"sys"}"#
         );
+    }
+
+    #[test]
+    fn reported_agent_builders_preserve_legacy_bytes_and_omission_counts() {
+        let long_history: Vec<Message> = (0..MAX_REQUEST_HISTORY_TURNS * 2)
+            .map(|index| Message {
+                role: Role::User,
+                text: format!("turn {index}"),
+            })
+            .collect();
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let config = config(provider);
+            let protocols: &[AgentProtocol] = if provider == Provider::Ollama {
+                &[AgentProtocol::Text]
+            } else {
+                &[AgentProtocol::Text, AgentProtocol::NativeTools]
+            };
+            for &protocol in protocols {
+                let built = build_agent_chat_request_with_report(
+                    &config,
+                    Some("sys"),
+                    &long_history,
+                    protocol,
+                )
+                .unwrap();
+                assert_eq!(
+                    built.omitted_history_turns, MAX_REQUEST_HISTORY_TURNS,
+                    "{provider:?} {protocol:?}"
+                );
+                assert_eq!(
+                    built.request,
+                    build_agent_chat_request(&config, Some("sys"), &long_history, protocol,)
+                        .unwrap(),
+                    "{provider:?} {protocol:?}"
+                );
+
+                let streaming = build_agent_chat_request_streaming_with_report(
+                    &config,
+                    Some("sys"),
+                    &long_history,
+                    protocol,
+                )
+                .unwrap();
+                assert_eq!(
+                    streaming.omitted_history_turns, MAX_REQUEST_HISTORY_TURNS,
+                    "{provider:?} {protocol:?}"
+                );
+                assert_eq!(
+                    streaming.request,
+                    build_agent_chat_request_streaming(
+                        &config,
+                        Some("sys"),
+                        &long_history,
+                        protocol,
+                    )
+                    .unwrap(),
+                    "{provider:?} {protocol:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -696,6 +762,24 @@ mod tests {
             AgentProtocol::Text
         )
         .is_ok());
+        assert!(matches!(
+            build_agent_chat_request_with_report(
+                &config(Provider::Ollama),
+                Some("sys"),
+                &history(),
+                AgentProtocol::NativeTools
+            ),
+            Err(ProviderError::InvalidConfiguration(_))
+        ));
+        assert!(matches!(
+            build_agent_chat_request_streaming_with_report(
+                &config(Provider::Ollama),
+                Some("sys"),
+                &history(),
+                AgentProtocol::NativeTools
+            ),
+            Err(ProviderError::InvalidConfiguration(_))
+        ));
     }
 
     fn anthropic_reply(blocks: Value) -> Value {

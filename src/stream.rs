@@ -1,7 +1,7 @@
 //! Sans-IO incremental parsing of streaming chat responses.
 //!
 //! [`StreamParser`] consumes the raw HTTP response body of a streaming chat
-//! request (see [`crate::provider::build_chat_request_streaming`]) as it
+//! request (see [`crate::provider::build_chat_request_streaming_with_report`]) as it
 //! arrives and yields [`StreamEvent`]s. It is a push parser: the integration
 //! feeds whatever byte chunks its transport produces — split mid-line,
 //! mid-UTF-8 sequence, or mid-frame — and calls [`StreamParser::finish`] at

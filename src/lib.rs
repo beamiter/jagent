@@ -12,9 +12,11 @@
 //! - [`safety`] — recognizable-danger warnings and a retired auto-approval
 //!   compatibility hook that always fails closed.
 //! - [`provider`] — provider-neutral chat request construction (Anthropic /
-//!   OpenAI-compatible / Ollama) returning plain [`provider::HttpRequest`]
-//!   data, plus strict response extraction with byte-oriented entry points
-//!   that bound the encoded envelope before JSON allocation.
+//!   OpenAI-compatible / Ollama) returning [`provider::BuiltRequest`] data
+//!   that keeps its plain [`provider::HttpRequest`] and the number of history
+//!   turns omitted by that build, plus strict response extraction with
+//!   byte-oriented entry points that bound the encoded envelope before JSON
+//!   allocation.
 //! - [`prompt`] — the agent system prompt and user-role context encoding.
 //!   Terminal bytes and environment metadata are always carried as explicitly
 //!   untrusted user-role data, never interpolated into system instructions.
@@ -61,7 +63,8 @@ pub use prompt::{
     EnvironmentMeta, GitMeta,
 };
 pub use provider::{
-    ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role, Usage,
+    BuiltRequest, ChatConfig, ChatResponse, HttpRequest, Message, Provider, ProviderError, Role,
+    Usage,
 };
 pub use redact::redact_secrets;
 pub use safety::{is_auto_approvable, is_dangerous};

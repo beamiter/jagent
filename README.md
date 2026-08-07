@@ -18,9 +18,9 @@ the parts that must behave identically everywhere.
 |------------|----------|
 | `session`  | Pure agent state machine: strict, pre-parse-bounded `run`/`say`/`done` protocol (`parse_action` for JSON-in-text, `parse_tool_action` for native tool calls — both yielding the same `ParsedAction`), proposal approval/rejection/manual-review transitions, validated restart snapshots, bounded transcript, turn budget, cancellation. |
 | `safety`   | `is_dangerous` destructive-pattern warnings and the compatibility `is_auto_approvable` hook, which now always fails closed because command text alone cannot prove what a configured shell will execute. |
-| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data (`build_agent_chat_request` adds an `AgentProtocol` selector), plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
+| `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning `BuiltRequest { request, omitted_history_turns }` (`build_agent_chat_request_with_report` adds an `AgentProtocol` selector), plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). Compatibility builders returning only `HttpRequest` remain byte-identical but deliberately discard the report. |
 | `prompt`   | Agent system prompts — `build_agent_system_prompt` (JSON protocol) and `build_agent_tool_system_prompt` (schema-carried protocol) — and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
-| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events. Raw bytes, decoded frames, text, tool arguments, and calls are independently bounded; tool calls are published only after the enclosing response completes. Truncation, payload after an end signal, malformed indexes/frames, and empty text responses fail closed. Pair with `build_chat_request_streaming`. |
+| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events. Raw bytes, decoded frames, text, tool arguments, and calls are independently bounded; tool calls are published only after the enclosing response completes. Truncation, payload after an end signal, malformed indexes/frames, and empty text responses fail closed. Pair with `build_chat_request_streaming_with_report`. |
 | `tools`    | The same three actions carried by the providers' **native** tool-calling: provider-correct schemas (Anthropic `input_schema`, OpenAI `function`/`parameters`; Ollama returns `InvalidConfiguration`), plus `parse_tool_response` → `ToolResponse::to_action` ingestion into the identical `ParsedAction` values. Token-limited output never becomes an action. Fully additive: `AgentProtocol::Text` reproduces 0.4 byte-for-byte. |
 | `redact`   | High-confidence scrubbing for AI-bound text: common provider and service tokens, private-key blocks, JWTs, explicit bearer credentials, and passwords embedded in URL userinfo. Non-secret URL and authentication framing is preserved for context. |
 
@@ -75,11 +75,15 @@ let mut session = AgentSession::new(16);
 session.submit_user("free up disk space in this repo")?;
 
 let config = provider::ChatConfig::new(jagent::Provider::Anthropic);
-let request = provider::build_chat_request(
+let built = provider::build_chat_request_with_report(
     &config,
     Some(&jagent::build_agent_system_prompt()),
     &[provider::Message { role: jagent::Role::User, text: session.build_user_prompt() }],
 )?;
+if built.omitted_history_turns > 0 {
+    // Tell the user this build sent an incomplete conversation window.
+}
+let request = built.request;
 // ... perform `request` with your own HTTP stack ...
 // let reply = provider::parse_chat_response(config.provider, &response_json)?;
 // match session.accept_model_reply(&reply)? {
@@ -95,7 +99,7 @@ the action schema, so no JSON-in-text parsing is involved:
 use jagent::{provider, tools, AgentProtocol, AgentSession, ModelOutcome};
 
 let protocol = AgentProtocol::NativeTools;
-let request = provider::build_agent_chat_request(
+let built = provider::build_agent_chat_request_with_report(
     &config,
     Some(&jagent::build_agent_tool_system_prompt()),
     &[provider::Message {
@@ -104,6 +108,10 @@ let request = provider::build_agent_chat_request(
     }],
     protocol,
 )?;
+if built.omitted_history_turns > 0 {
+    // Tell the user this build sent an incomplete conversation window.
+}
+let request = built.request;
 // ... perform `request` with your own HTTP stack ...
 // let reply = tools::parse_tool_response(config.provider, &response_json)?;
 // match session.accept_model_tool_reply(&reply)? {

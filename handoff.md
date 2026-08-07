@@ -22,6 +22,9 @@ test suite and strict Clippy gate pass at this handoff.
 - The public request builders bound history themselves (`bound_history` is
   idempotent, so a caller that already prepared its history sends the same bytes)
   and reject an over-budget system prompt rather than eliding safety instructions.
+  The four `*_with_report` entry points return `BuiltRequest`, preserving how
+  many turns that build omitted; compatibility entry points delegate to the
+  same one-pass implementation and return byte-identical `HttpRequest` values.
 - `parse_chat_response_bytes` is a bounded, byte-oriented response entry point.
 - The 0.6 public wire boundary is explicit: the string-owning `Turn`, `Message`,
   and `BlockContext` values are serialize-only, while allocation-free scalar
@@ -39,13 +42,6 @@ test suite and strict Clippy gate pass at this handoff.
   temporary-allocation path.
 
 ## Remaining boundaries
-
-### Report what the request builders dropped
-
-`build_chat_request*` now bounds history internally and discards the omitted-turn
-count. A caller cannot distinguish "sent everything" from "silently sent the newest
-40 turns". Surface the omission (a returned count, or a builder that fails closed on
-an unbounded input) so an integration can tell the user their context was trimmed.
 
 ### Keep transport metadata bounded around streaming
 

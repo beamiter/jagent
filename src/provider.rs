@@ -1,9 +1,11 @@
 //! Provider-neutral chat request construction and response parsing.
 //!
-//! Sans-IO: [`build_chat_request`] returns an [`HttpRequest`] value describing
-//! exactly one POST; the integration performs it with whatever HTTP stack it
+//! Sans-IO: [`build_chat_request_with_report`] returns a [`BuiltRequest`]
+//! describing exactly one POST and how many history turns this build omitted;
+//! the integration performs its [`HttpRequest`] with whatever HTTP stack it
 //! already trusts (curl child process, ureq, …) and hands the response JSON to
-//! [`parse_chat_response`]. Nothing in this module opens a socket.
+//! [`parse_chat_response`]. Nothing in this module opens a socket. The shorter
+//! [`build_chat_request`] compatibility entry point returns only the request.
 
 use crate::safety::is_unsafe_invisible_char;
 use crate::text::elide_middle;
@@ -200,6 +202,19 @@ impl std::fmt::Debug for HttpRequest {
     }
 }
 
+/// One bounded provider request together with the history loss introduced by
+/// this build operation.
+///
+/// `omitted_history_turns` counts only turns that these request builders
+/// removed. If an integration bounds history before calling a builder, it
+/// remains responsible for carrying that earlier omission count forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "inspect omitted_history_turns before sending the request"]
+pub struct BuiltRequest {
+    pub request: HttpRequest,
+    pub omitted_history_turns: usize,
+}
+
 struct RedactedHeaders<'a>(&'a [(String, String)]);
 
 impl std::fmt::Debug for RedactedHeaders<'_> {
@@ -374,8 +389,10 @@ fn is_port(port: &str) -> bool {
     !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit())
 }
 
-/// Bound a conversation history to the request budgets, newest-first, and
-/// never let the retained window begin with an assistant turn.
+/// Bound a conversation history to the request budgets, newest-first. Leading
+/// assistant turns are removed while at least one later turn can remain; a
+/// singleton assistant turn is retained for compatibility with existing wire
+/// requests.
 /// Returns the retained history and how many older turns were omitted.
 pub fn bound_history(history: &[Message]) -> (Vec<Message>, usize) {
     bound_history_with(history, str::to_string)
@@ -420,13 +437,26 @@ pub fn bound_history_with(
     (retained_reversed, omitted)
 }
 
-/// Build one chat POST. `history` should already be bounded (see
-/// [`bound_history`]); this function applies the provider wire format only.
+/// Build one bounded chat POST, discarding the number of history turns this
+/// operation omitted. New integrations should prefer
+/// [`build_chat_request_with_report`]; this compatibility entry point keeps
+/// its established return type and exact request bytes.
 pub fn build_chat_request(
     config: &ChatConfig,
     system: Option<&str>,
     history: &[Message],
 ) -> Result<HttpRequest, ProviderError> {
+    build_chat_request_with_report(config, system, history).map(|built| built.request)
+}
+
+/// Build one bounded chat POST while preserving the number of history turns
+/// this operation omitted. The request bytes are identical to
+/// [`build_chat_request`].
+pub fn build_chat_request_with_report(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+) -> Result<BuiltRequest, ProviderError> {
     build_request(config, system, history, false)
 }
 
@@ -439,6 +469,17 @@ pub fn build_chat_request_streaming(
     system: Option<&str>,
     history: &[Message],
 ) -> Result<HttpRequest, ProviderError> {
+    build_chat_request_streaming_with_report(config, system, history).map(|built| built.request)
+}
+
+/// [`build_chat_request_streaming`] while preserving the number of history
+/// turns this build omitted. The request bytes are identical to the
+/// compatibility entry point.
+pub fn build_chat_request_streaming_with_report(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+) -> Result<BuiltRequest, ProviderError> {
     build_request(config, system, history, true)
 }
 
@@ -459,6 +500,19 @@ pub fn build_agent_chat_request(
     history: &[Message],
     protocol: AgentProtocol,
 ) -> Result<HttpRequest, ProviderError> {
+    build_agent_chat_request_with_report(config, system, history, protocol)
+        .map(|built| built.request)
+}
+
+/// [`build_agent_chat_request`] while preserving the number of history turns
+/// this build omitted. The request bytes are identical to the compatibility
+/// entry point.
+pub fn build_agent_chat_request_with_report(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+) -> Result<BuiltRequest, ProviderError> {
     build_agent_request(config, system, history, protocol, false)
 }
 
@@ -471,6 +525,19 @@ pub fn build_agent_chat_request_streaming(
     history: &[Message],
     protocol: AgentProtocol,
 ) -> Result<HttpRequest, ProviderError> {
+    build_agent_chat_request_streaming_with_report(config, system, history, protocol)
+        .map(|built| built.request)
+}
+
+/// [`build_agent_chat_request_streaming`] while preserving the number of
+/// history turns this build omitted. The request bytes are identical to the
+/// compatibility entry point.
+pub fn build_agent_chat_request_streaming_with_report(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+) -> Result<BuiltRequest, ProviderError> {
     build_agent_request(config, system, history, protocol, true)
 }
 
@@ -480,7 +547,7 @@ fn build_agent_request(
     history: &[Message],
     protocol: AgentProtocol,
     stream: bool,
-) -> Result<HttpRequest, ProviderError> {
+) -> Result<BuiltRequest, ProviderError> {
     match protocol {
         AgentProtocol::Text => build_request(config, system, history, stream),
         AgentProtocol::NativeTools => {
@@ -498,7 +565,7 @@ fn build_request(
     system: Option<&str>,
     history: &[Message],
     stream: bool,
-) -> Result<HttpRequest, ProviderError> {
+) -> Result<BuiltRequest, ProviderError> {
     build_request_with(config, system, history, stream, &[])
 }
 
@@ -508,7 +575,7 @@ fn build_request_with(
     history: &[Message],
     stream: bool,
     extra_body_fields: &[(&'static str, Value)],
-) -> Result<HttpRequest, ProviderError> {
+) -> Result<BuiltRequest, ProviderError> {
     config.validate()?;
     if let Some(system) = system {
         if system.len() > MAX_REQUEST_SYSTEM_BYTES {
@@ -520,7 +587,7 @@ fn build_request_with(
     // `bound_history` is idempotent, so a caller that already bounded (or
     // redacted and bounded) its history sends exactly what it prepared, while
     // a caller that forgot cannot make this crate emit an unbounded body.
-    let (history, _omitted) = bound_history(history);
+    let (history, omitted_history_turns) = bound_history(history);
     let history = &history[..];
     let api_key = config
         .api_key
@@ -547,10 +614,13 @@ fn build_request_with(
     for (field, value) in extra_body_fields {
         body[*field] = value.clone();
     }
-    Ok(HttpRequest {
-        url: config.provider.endpoint(&config.base_url),
-        headers,
-        body: body.to_string(),
+    Ok(BuiltRequest {
+        request: HttpRequest {
+            url: config.provider.endpoint(&config.base_url),
+            headers,
+            body: body.to_string(),
+        },
+        omitted_history_turns,
     })
 }
 
@@ -874,6 +944,13 @@ mod tests {
         }
     }
 
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            text: text.into(),
+        }
+    }
+
     #[test]
     fn request_shapes_match_each_provider() {
         let history = [user("hello")];
@@ -1099,28 +1176,140 @@ mod tests {
         let history: Vec<Message> = (0..MAX_REQUEST_HISTORY_TURNS * 3)
             .map(|index| user(&format!("turn {index}")))
             .collect();
-        let request =
-            build_chat_request(&config(Provider::Anthropic), Some("sys"), &history).unwrap();
-        let body: Value = serde_json::from_str(&request.body).unwrap();
-        let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), MAX_REQUEST_HISTORY_TURNS);
-        // The newest turns are the ones kept.
-        assert_eq!(
-            messages.last().unwrap()["content"],
-            format!("turn {}", MAX_REQUEST_HISTORY_TURNS * 3 - 1)
-        );
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let config = config(provider);
+            let built = build_chat_request_with_report(&config, Some("sys"), &history).unwrap();
+            assert_eq!(
+                built.omitted_history_turns,
+                MAX_REQUEST_HISTORY_TURNS * 2,
+                "{provider:?}"
+            );
+            assert_eq!(
+                build_chat_request(&config, Some("sys"), &history).unwrap(),
+                built.request,
+                "legacy and reported builders must be byte-identical for {provider:?}"
+            );
 
-        // Bounding is idempotent: preparing the history first sends the same body.
-        let (bounded, _) = bound_history(&history);
-        let prepared =
-            build_chat_request(&config(Provider::Anthropic), Some("sys"), &bounded).unwrap();
-        assert_eq!(prepared.body, request.body);
+            let body: Value = serde_json::from_str(&built.request.body).unwrap();
+            let messages = body["messages"].as_array().unwrap();
+            let messages = if provider == Provider::Anthropic {
+                messages.as_slice()
+            } else {
+                // OpenAI-compatible and Ollama carry `system` as their first
+                // message; the history window follows it.
+                &messages[1..]
+            };
+            assert_eq!(messages.len(), MAX_REQUEST_HISTORY_TURNS);
+            // The newest turns are the ones kept.
+            assert_eq!(
+                messages.last().unwrap()["content"],
+                format!("turn {}", MAX_REQUEST_HISTORY_TURNS * 3 - 1)
+            );
+
+            let streaming =
+                build_chat_request_streaming_with_report(&config, Some("sys"), &history).unwrap();
+            assert_eq!(
+                streaming.omitted_history_turns, built.omitted_history_turns,
+                "{provider:?}"
+            );
+            assert_eq!(
+                build_chat_request_streaming(&config, Some("sys"), &history).unwrap(),
+                streaming.request,
+                "streaming legacy and reported builders must agree for {provider:?}"
+            );
+
+            // Bounding is idempotent. The second invocation reports only the
+            // loss it introduced, not the 80 turns its caller already removed.
+            let (bounded, omitted) = bound_history(&history);
+            assert_eq!(omitted, MAX_REQUEST_HISTORY_TURNS * 2);
+            let prepared = build_chat_request_with_report(&config, Some("sys"), &bounded).unwrap();
+            assert_eq!(prepared.omitted_history_turns, 0, "{provider:?}");
+            assert_eq!(prepared.request, built.request, "{provider:?}");
+        }
 
         let oversized = "s".repeat(MAX_REQUEST_SYSTEM_BYTES + 1);
         assert!(matches!(
             build_chat_request(&config(Provider::Anthropic), Some(&oversized), &history),
             Err(ProviderError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn reported_builder_counts_byte_budget_omissions() {
+        let history = vec![
+            user(&"a".repeat(MAX_REQUEST_TURN_BYTES)),
+            user(&"b".repeat(MAX_REQUEST_TURN_BYTES)),
+            user(&"c".repeat(MAX_REQUEST_TURN_BYTES)),
+        ];
+        let built =
+            build_chat_request_with_report(&config(Provider::OpenAiCompatible), None, &history)
+                .unwrap();
+        assert_eq!(built.omitted_history_turns, 2);
+        let body: Value = serde_json::from_str(&built.request.body).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]["content"].as_str().unwrap().starts_with('c'));
+    }
+
+    #[test]
+    fn singleton_assistant_preserves_the_legacy_wire_and_reports_no_omission() {
+        let (bounded, omitted) = bound_history(&[assistant("orphan")]);
+        assert_eq!(bounded, vec![assistant("orphan")]);
+        assert_eq!(omitted, 0);
+
+        let golden = [
+            (
+                Provider::Anthropic,
+                r#"{"max_tokens":512,"messages":[{"content":"orphan","role":"assistant"}],"model":"test-model","system":"sys"}"#,
+            ),
+            (
+                Provider::OpenAiCompatible,
+                r#"{"max_tokens":512,"messages":[{"content":"sys","role":"system"},{"content":"orphan","role":"assistant"}],"model":"test-model"}"#,
+            ),
+            (
+                Provider::Ollama,
+                r#"{"messages":[{"content":"sys","role":"system"},{"content":"orphan","role":"assistant"}],"model":"test-model","options":{"num_predict":512},"stream":false}"#,
+            ),
+        ];
+        for (provider, expected_body) in golden {
+            let config = config(provider);
+            let history = [assistant("orphan")];
+            let built = build_chat_request_with_report(&config, Some("sys"), &history).unwrap();
+            assert_eq!(built.omitted_history_turns, 0, "{provider:?}");
+            assert_eq!(built.request.body, expected_body, "{provider:?}");
+            assert_eq!(
+                build_chat_request(&config, Some("sys"), &history)
+                    .unwrap()
+                    .body,
+                expected_body,
+                "legacy builder drifted for {provider:?}"
+            );
+        }
+
+        let (bounded, omitted) = bound_history(&[assistant("old"), user("current")]);
+        assert_eq!(bounded, vec![user("current")]);
+        assert_eq!(omitted, 1);
+    }
+
+    #[test]
+    fn oversized_single_turn_is_elided_but_not_reported_as_omitted() {
+        let oversized = "界".repeat(MAX_REQUEST_TURN_BYTES / "界".len() + 1);
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let built =
+                build_chat_request_with_report(&config(provider), None, &[user(&oversized)])
+                    .unwrap();
+            assert_eq!(built.omitted_history_turns, 0, "{provider:?}");
+            assert!(built.request.body.contains("bytes elided"), "{provider:?}");
+            assert!(!built.request.body.contains(&oversized), "{provider:?}");
+        }
     }
 
     #[test]
