@@ -13,6 +13,7 @@ use crate::tools::{
 use serde::de::{self, DeserializeSeed, Deserializer, VariantAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -878,7 +879,21 @@ impl AgentSession {
             && (self.transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES
                 || stored_transcript_bytes(&self.transcript) > MAX_STORED_TRANSCRIPT_BYTES)
         {
-            self.transcript.remove(0);
+            // An observation is meaningful only together with the approved
+            // proposal it reports on. Treat that adjacent pair as one oldest
+            // history unit: removing just the proposal would leave a live
+            // session able to snapshot an orphan observation that strict
+            // restoration must reject. Other turns remain independently
+            // trimmable so one large message does not evict extra context.
+            let remove_count = match self.transcript.as_slice() {
+                [Turn::AssistantProposed { id, .. }, Turn::Observation { proposal_id, .. }, ..]
+                    if id == proposal_id =>
+                {
+                    2
+                }
+                _ => 1,
+            };
+            self.transcript.drain(..remove_count);
             self.transcript_truncated = true;
         }
     }
@@ -965,19 +980,13 @@ impl AgentSession {
                 ));
             }
             AgentState::AwaitingObservation { proposal_id }
-                if !snapshot.transcript.iter().any(|turn| {
-                    matches!(
-                        turn,
-                        Turn::AssistantProposed {
-                            id,
-                            status: ProposalStatus::Approved,
-                            ..
-                        } if *id == proposal_id
-                    )
-                }) =>
+                if facts.pending_proposal.is_some()
+                    || facts.proposal_statuses.get(&proposal_id)
+                        != Some(&ProposalStatus::Approved)
+                    || facts.observed_proposals.contains(&proposal_id) =>
             {
                 return Err(AgentSnapshotError::Invalid(
-                    "observation state does not identify an approved proposal",
+                    "observation state does not identify one unobserved approved proposal",
                 ));
             }
             AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => {}
@@ -1027,6 +1036,8 @@ impl AgentSession {
 struct SnapshotTranscriptFacts {
     highest_proposal_id: u64,
     pending_proposal: Option<ProposalId>,
+    proposal_statuses: HashMap<ProposalId, ProposalStatus>,
+    observed_proposals: HashSet<ProposalId>,
 }
 
 /// Validate every invariant that public session transitions establish before
@@ -1080,6 +1091,7 @@ fn validate_snapshot_transcript(
                     ));
                 }
                 facts.highest_proposal_id = id.get();
+                facts.proposal_statuses.insert(*id, *status);
                 if *status == ProposalStatus::Pending
                     && facts.pending_proposal.replace(*id).is_some()
                 {
@@ -1096,6 +1108,13 @@ fn validate_snapshot_transcript(
                 if proposal_id.get() == 0 || output_sample.len() > MAX_OBSERVATION_BYTES {
                     return Err(AgentSnapshotError::Invalid(
                         "observation violates its safety bounds",
+                    ));
+                }
+                if facts.proposal_statuses.get(proposal_id) != Some(&ProposalStatus::Approved)
+                    || !facts.observed_proposals.insert(*proposal_id)
+                {
+                    return Err(AgentSnapshotError::Invalid(
+                        "observation does not identify one previously unobserved approved proposal",
                     ));
                 }
             }
@@ -1877,6 +1896,200 @@ mod tests {
         assert!(id.get() > proposal_id.get(), "ids must stay unique");
     }
 
+    fn persisted_snapshot(
+        transcript: Vec<Turn>,
+        state: AgentState,
+        next_proposal_id: u64,
+    ) -> AgentSessionSnapshot {
+        let snapshot = AgentSessionSnapshot {
+            version: AGENT_SNAPSHOT_VERSION,
+            transcript,
+            transcript_truncated: false,
+            state,
+            turns_used: 1,
+            max_turns: 10,
+            next_proposal_id,
+        };
+        let encoded = snapshot.to_json().expect("encode hostile fixture");
+        AgentSessionSnapshot::from_json(&encoded).expect("decode hostile fixture under budgets")
+    }
+
+    #[test]
+    fn restore_rejects_unknown_nonapproved_and_duplicate_observations() {
+        let approved = ProposalId(1);
+        let unknown = ProposalId(2);
+        let proposal = Turn::AssistantProposed {
+            id: approved,
+            command: "printf reviewed".into(),
+            status: ProposalStatus::Approved,
+        };
+        let observation = |proposal_id| Turn::Observation {
+            proposal_id,
+            exit_code: 0,
+            output_sample: "ok".into(),
+        };
+
+        let unknown_observation = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                proposal.clone(),
+                observation(unknown),
+            ],
+            AgentState::Ready,
+            3,
+        );
+        assert!(matches!(
+            AgentSession::restore(unknown_observation),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("previously unobserved approved proposal")
+        ));
+
+        let rejected_observation = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantProposed {
+                    id: approved,
+                    command: "printf rejected".into(),
+                    status: ProposalStatus::Rejected,
+                },
+                observation(approved),
+            ],
+            AgentState::Ready,
+            2,
+        );
+        assert!(matches!(
+            AgentSession::restore(rejected_observation),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("previously unobserved approved proposal")
+        ));
+
+        let duplicate_observation = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                proposal,
+                observation(approved),
+                observation(approved),
+            ],
+            AgentState::Ready,
+            2,
+        );
+        assert!(matches!(
+            AgentSession::restore(duplicate_observation),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("previously unobserved approved proposal")
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_awaiting_observation_after_output_was_recorded() {
+        let id = ProposalId(1);
+        let snapshot = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantProposed {
+                    id,
+                    command: "printf reviewed".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::Observation {
+                    proposal_id: id,
+                    exit_code: 0,
+                    output_sample: "done".into(),
+                },
+            ],
+            AgentState::AwaitingObservation { proposal_id: id },
+            2,
+        );
+
+        assert!(matches!(
+            AgentSession::restore(snapshot),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("unobserved approved proposal")
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_awaiting_observation_with_a_pending_proposal() {
+        let approved = ProposalId(1);
+        let pending = ProposalId(2);
+        let snapshot = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantProposed {
+                    id: approved,
+                    command: "printf approved".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::AssistantProposed {
+                    id: pending,
+                    command: "printf pending".into(),
+                    status: ProposalStatus::Pending,
+                },
+            ],
+            AgentState::AwaitingObservation {
+                proposal_id: approved,
+            },
+            3,
+        );
+
+        assert!(matches!(
+            AgentSession::restore(snapshot),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("unobserved approved proposal")
+        ));
+    }
+
+    #[test]
+    fn entry_compaction_keeps_proposal_observation_pairs_restorable() {
+        let mut session = AgentSession::new(MAX_SESSION_TURNS);
+        session.submit_user("run repeatedly").unwrap();
+
+        // One initial user turn plus 64 proposal/observation pairs crosses the
+        // 128-entry ceiling. The next proposal used to trim only proposal #1,
+        // leaving observation #1 at the front of a snapshot produced entirely
+        // through the public state-machine API.
+        for _ in 0..MAX_STORED_TRANSCRIPT_ENTRIES / 2 {
+            let id = accept_run_proposal(&mut session, "true");
+            let _approved = session.approve(id).unwrap();
+            session.observe(id, 0, "ok").unwrap();
+        }
+        assert!(session.snapshot().unwrap().transcript_truncated);
+
+        let _pending = accept_run_proposal(&mut session, "true");
+        let snapshot = session.snapshot().unwrap();
+        assert!(snapshot.transcript_truncated);
+        assert!(snapshot.transcript.len() <= MAX_STORED_TRANSCRIPT_ENTRIES);
+        assert!(!matches!(
+            snapshot.transcript.first(),
+            Some(Turn::Observation { .. })
+        ));
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn byte_compaction_keeps_public_session_snapshots_restorable() {
+        let mut session = AgentSession::new(MAX_SESSION_TURNS);
+        session.submit_user("run large commands").unwrap();
+        let command = "x".repeat(MAX_COMMAND_BYTES);
+        let output = "o".repeat(MAX_OBSERVATION_BYTES);
+
+        // This stays far below the entry ceiling while repeatedly crossing the
+        // aggregate byte ceiling. Check every state at which an embedding app
+        // may persist, not only the tidy boundary after an observation arrives.
+        for _ in 0..10 {
+            let id = accept_run_proposal(&mut session, &command);
+            assert_snapshot_roundtrips(&session);
+            let _approved = session.approve(id).unwrap();
+            assert_snapshot_roundtrips(&session);
+            session.observe(id, 0, &output).unwrap();
+            assert_snapshot_roundtrips(&session);
+        }
+
+        let snapshot = session.snapshot().unwrap();
+        assert!(snapshot.transcript_truncated);
+        assert!(stored_transcript_bytes(&snapshot.transcript) <= MAX_STORED_TRANSCRIPT_BYTES);
+    }
+
     #[test]
     fn restore_rejects_duplicate_ids_that_could_misbind_approval() {
         let id = ProposalId(7);
@@ -2005,6 +2218,26 @@ mod tests {
 
     fn run_reply(command: &str) -> String {
         serde_json::json!({"action":"run", "command": command}).to_string()
+    }
+
+    fn accept_run_proposal(session: &mut AgentSession, command: &str) -> ProposalId {
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(&run_reply(command))
+            .expect("accept a valid run proposal")
+        else {
+            panic!("valid run action must produce a proposal");
+        };
+        id
+    }
+
+    fn assert_snapshot_roundtrips(session: &AgentSession) {
+        let encoded = session
+            .snapshot()
+            .expect("live session has a snapshot")
+            .to_json()
+            .expect("encode live snapshot");
+        let decoded = AgentSessionSnapshot::from_json(&encoded).expect("decode live snapshot");
+        AgentSession::restore(decoded).expect("a live session's snapshot must remain restorable");
     }
 
     #[test]
