@@ -34,6 +34,11 @@ pub const MAX_SESSION_TURNS: u32 = 1_000;
 /// arbitrarily large value before the action schema rejects it.
 pub const MAX_ACTION_JSON_BYTES: usize = 128 * 1024;
 
+/// Allocation-free identifier atom used by the session snapshot schema.
+///
+/// Deserialization only reconstructs the numeric atom. It does not prove that
+/// an id belongs to a live pending proposal; approval APIs and snapshot restore
+/// enforce that contextual binding.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Serialize)]
 pub struct ProposalId(u64);
 
@@ -43,6 +48,8 @@ impl ProposalId {
     }
 }
 
+/// Allocation-free proposal-status atom used by the bounded snapshot decoder.
+/// A decoded status is not a validated proposal lifecycle by itself.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 pub enum ProposalStatus {
     Pending,
@@ -51,8 +58,17 @@ pub enum ProposalStatus {
     ManualReview,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One retained turn in an [`AgentSession`] transcript.
+///
+/// This type is serialize-only. It owns attacker-influenced strings and is not
+/// an independent wire format; persisted transcripts must enter through
+/// [`AgentSessionSnapshot::from_json`], whose private seeds enforce entry,
+/// per-field, and cumulative budgets before allocating retained turns.
+///
+/// ```compile_fail
+/// let _: jagent::Turn = serde_json::from_str(r#"{"User":"hello"}"#).unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Turn {
     User(String),
     AssistantThought(String),
@@ -349,6 +365,11 @@ fn validate_command(command: &str) -> Result<(), ParseError> {
     Ok(())
 }
 
+/// Allocation-free state atom used by the bounded snapshot schema.
+///
+/// Direct deserialization checks only this enum's local shape. It does not
+/// establish that the state agrees with a transcript, proposal lifecycle, or
+/// turn counter; [`AgentSession::restore`] performs those checks.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum AgentState {
@@ -1173,6 +1194,42 @@ pub struct AgentSessionSnapshot {
 }
 
 impl AgentSessionSnapshot {
+    /// Snapshot schema version carried by this decoded value.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Bounded, unmodified transcript decoded from the snapshot.
+    pub fn transcript(&self) -> &[Turn] {
+        &self.transcript
+    }
+
+    /// Whether older transcript entries had already been compacted away.
+    pub fn transcript_truncated(&self) -> bool {
+        self.transcript_truncated
+    }
+
+    /// Persisted state before [`AgentSession::restore`] normalizes any
+    /// interrupted observation.
+    pub fn state(&self) -> AgentState {
+        self.state
+    }
+
+    /// Number of model turns charged to the persisted task.
+    pub fn turns_used(&self) -> u32 {
+        self.turns_used
+    }
+
+    /// Persisted model-turn ceiling.
+    pub fn max_turns(&self) -> u32 {
+        self.max_turns
+    }
+
+    /// Next proposal identifier recorded by the snapshot.
+    pub fn next_proposal_id(&self) -> u64 {
+        self.next_proposal_id
+    }
+
     pub fn to_json(&self) -> Result<String, AgentSnapshotError> {
         let encoded = serde_json::to_string(self)
             .map_err(|error| AgentSnapshotError::Encode(error.to_string()))?;
@@ -1708,6 +1765,47 @@ mod tests {
         let mut restored = restored;
         let approved = restored.approve(proposal_id).unwrap();
         assert!(!approved.command.is_empty());
+    }
+
+    #[test]
+    fn snapshot_accessors_expose_the_bounded_roundtrip_without_redecoding() {
+        let mut session = AgentSession::new(7);
+        session.submit_user("inspect the tree").unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply(r#"{"action":"run","command":"find . -maxdepth 1"}"#)
+            .unwrap()
+        else {
+            panic!("expected a proposal");
+        };
+
+        let encoded = session.snapshot().unwrap().to_json().unwrap();
+        let snapshot = AgentSessionSnapshot::from_json(&encoded).unwrap();
+        assert_eq!(snapshot.version(), AGENT_SNAPSHOT_VERSION);
+        assert_eq!(snapshot.transcript(), session.transcript());
+        assert!(!snapshot.transcript_truncated());
+        assert_eq!(
+            snapshot.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+        assert_eq!(snapshot.turns_used(), 1);
+        assert_eq!(snapshot.max_turns(), 7);
+        assert_eq!(snapshot.next_proposal_id(), id.get() + 1);
+    }
+
+    #[test]
+    fn allocation_free_schema_atoms_keep_their_serde_contract() {
+        let role: crate::provider::Role = serde_json::from_str(r#""assistant""#).unwrap();
+        assert_eq!(role, crate::provider::Role::Assistant);
+
+        let proposal_id: ProposalId = serde_json::from_str("7").unwrap();
+        assert_eq!(proposal_id.get(), 7);
+        let status: ProposalStatus = serde_json::from_str(r#""ManualReview""#).unwrap();
+        assert_eq!(status, ProposalStatus::ManualReview);
+        let state: AgentState =
+            serde_json::from_str(r#"{"AwaitingApproval":{"proposal_id":7}}"#).unwrap();
+        assert_eq!(state, AgentState::AwaitingApproval { proposal_id });
+
+        assert!(serde_json::from_str::<AgentState>(r#"{"Unknown":{}}"#).is_err());
     }
 
     #[test]

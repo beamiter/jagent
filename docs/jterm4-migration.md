@@ -24,6 +24,34 @@ prompt tags or extraction state.
 | Dangerous-command warnings | `jagent::safety` | `is_auto_approvable` is retained for compatibility but always returns `false`. |
 | HTTP/process/PTY execution, configuration, UI, and durable storage | Consumer or `jterm_core` | `jagent` exposes plain request and validated snapshot values but performs no IO. |
 
+## 0.6 wire-decoding migration
+
+The string-owning public shapes `session::Turn`, `provider::Message`, and
+`prompt::BlockContext` are serialize-only in 0.6. They are values an
+integration constructs after applying its own input policy, not generic JSON
+storage schemas. `Role`, `ProposalId`, `ProposalStatus`, and `AgentState` keep
+`Deserialize` because they are allocation-free schema atoms; their surrounding
+conversation or session still needs contextual validation.
+
+Code that previously re-serialized an `AgentSessionSnapshot` into a local
+`#[derive(Deserialize)]` audit struct should instead inspect the bounded value
+directly through `version()`, `transcript()`, `transcript_truncated()`,
+`state()`, `turns_used()`, `max_turns()`, and `next_proposal_id()`. Persistent
+session bytes still enter only through `AgentSessionSnapshot::from_json`, and a
+usable session still enters only through `AgentSession::restore`.
+
+For non-streaming HTTP replies, prefer the byte APIs so the shared 1 MiB
+envelope ceiling runs before JSON allocation:
+
+- `provider::parse_chat_response_bytes` for display text;
+- `provider::parse_chat_response_full_bytes` for text plus token-limit/usage
+  metadata;
+- `tools::parse_tool_response_bytes` for native tool replies.
+
+The older `Value` APIs remain available for integrations that already decoded
+the response under an equivalent transport limit. They are not raw-network
+entry points.
+
 ## Historical compatibility notes
 
 1. The former provider `Turn { role, text }` became

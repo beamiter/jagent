@@ -45,6 +45,23 @@ the parts that must behave identically everywhere.
    known complete. A later protocol error cannot leave an actionable call
    behind, and token-limited output is never promoted to an action.
 
+## Wire decoding
+
+Version 0.6 makes the allocation boundary explicit. `session::Turn`,
+`provider::Message`, and `prompt::BlockContext` own attacker-influenced text
+but no longer implement `Deserialize`; they are in-memory construction and
+serialization values, not standalone persistence formats. The allocation-free
+schema atoms (`Role`, `ProposalId`, `ProposalStatus`, and `AgentState`) retain
+Serde decoding, but decoding one does not validate a conversation or session.
+
+Persisted Agent state must enter through `AgentSessionSnapshot::from_json` and
+then `AgentSession::restore`. Embeddings that need to audit a decoded snapshot
+without serializing it again can use its read-only field accessors. For
+non-streaming provider traffic, use `parse_chat_response_bytes`,
+`parse_chat_response_full_bytes`, or `tools::parse_tool_response_bytes`; each
+checks `MAX_RESPONSE_JSON_BYTES` before allocating a `serde_json::Value`. The
+corresponding `Value` APIs are only for trusted or already-bounded values.
+
 ## Sketch
 
 ```rust
@@ -106,6 +123,7 @@ the current stable toolchain. The MSRV gate uses the committed lockfile:
 ```text
 cargo +1.86.0 check --locked --all-targets
 cargo +1.86.0 test --locked --all-targets
+cargo +1.86.0 test --locked --doc
 ```
 
 See [the integration migration notes](docs/jterm4-migration.md) for the current

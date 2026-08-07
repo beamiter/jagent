@@ -7,7 +7,7 @@
 //! protocol text ever enters the system instruction.
 
 use crate::text::elide_middle;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::json;
 
 pub const MAX_USER_PROMPT_BYTES: usize = 64 * 1024;
@@ -18,14 +18,23 @@ pub const MAX_ENV_VALUE_BYTES: usize = 4 * 1024;
 
 /// One finished command block selected as context: the command, its bounded
 /// output, and where it ran.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+///
+/// This in-memory prompt input is serialize-only. Prompt builders bound every
+/// field before it becomes model context, but callers that persist blocks must
+/// apply encoded-envelope, field, and collection budgets while decoding.
+///
+/// ```compile_fail
+/// let _: jagent::prompt::BlockContext = serde_json::from_str(
+///     r#"{"cmd":"pwd","output":"/tmp","cwd":null,"exit_code":0,"truncated":false}"#,
+/// )
+/// .unwrap();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct BlockContext {
     pub cmd: String,
     pub output: String,
     pub cwd: Option<String>,
     pub exit_code: i32,
-    #[serde(default)]
     pub truncated: bool,
 }
 

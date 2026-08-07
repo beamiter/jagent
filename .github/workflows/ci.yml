@@ -39,3 +39,5 @@ jobs:
         run: cargo check --locked --all-targets
       - name: Test
         run: cargo test --locked --all-targets
+      - name: Compile-fail API doc tests
+        run: cargo test --locked --doc

@@ -13,7 +13,8 @@
 //!   compatibility hook that always fails closed.
 //! - [`provider`] — provider-neutral chat request construction (Anthropic /
 //!   OpenAI-compatible / Ollama) returning plain [`provider::HttpRequest`]
-//!   data, plus strict response text extraction.
+//!   data, plus strict response extraction with byte-oriented entry points
+//!   that bound the encoded envelope before JSON allocation.
 //! - [`prompt`] — the agent system prompt and user-role context encoding.
 //!   Terminal bytes and environment metadata are always carried as explicitly
 //!   untrusted user-role data, never interpolated into system instructions.
@@ -26,6 +27,14 @@
 //!   keeps today's behavior byte-for-byte, and tool calls are converted into
 //!   the same [`session::ParsedAction`] values, so the state machine and
 //!   every invariant below apply unchanged.
+//!
+//! String-owning public transcript/request/context shapes are deliberately
+//! serialize-only. Persisted Agent bytes enter through
+//! [`session::AgentSessionSnapshot::from_json`]; non-streaming provider bytes
+//! enter through [`provider::parse_chat_response_bytes`],
+//! [`provider::parse_chat_response_full_bytes`], or
+//! [`tools::parse_tool_response_bytes`]. The corresponding `serde_json::Value`
+//! APIs require trusted or already-bounded caller-owned values.
 //!
 //! # Invariants
 //!

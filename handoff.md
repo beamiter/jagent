@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-01
+Updated: 2026-08-08
 
 The current baseline hardens provider parsing, streamed responses, native tool calls,
 approval binding, task resets, transcript retention, and snapshot validation. It now
@@ -23,17 +23,17 @@ test suite and strict Clippy gate pass at this handoff.
   idempotent, so a caller that already prepared its history sends the same bytes)
   and reject an over-budget system prompt rather than eliding safety instructions.
 - `parse_chat_response_bytes` is a bounded, byte-oriented response entry point.
+- The 0.6 public wire boundary is explicit: the string-owning `Turn`, `Message`,
+  and `BlockContext` values are serialize-only, while allocation-free scalar
+  schema atoms retain `Deserialize`. Read-only `AgentSessionSnapshot` accessors
+  let integrations audit a bounded decoded snapshot without re-serializing and
+  decoding its transcript through an ordinary `Vec<Turn>`.
+- `parse_chat_response_full_bytes` and `parse_tool_response_bytes` extend the
+  shared 1 MiB pre-allocation envelope gate to structured chat metadata and
+  native tool replies. Their `Value` counterparts remain available only for
+  trusted or already-bounded caller-owned values.
 
 ## Remaining boundaries
-
-### Extend bounded decoding to the public transcript types
-
-`Turn`, `AgentState`, and `Message` still derive `Deserialize`, so an embedding
-application that decodes them directly — rather than through
-`AgentSessionSnapshot::from_json` — gets ordinary Serde collection behavior with no
-entry, field, or cumulative budget. Either expose the bounded seeds for these types
-or make the constraint explicit in their documentation so integrations do not build
-a second, unbounded wire path around the hardened one.
 
 ### Report what the request builders dropped
 
@@ -56,6 +56,7 @@ Run before the next release:
 ```text
 cargo fmt --all -- --check
 cargo test --locked --all-targets --all-features --no-fail-fast
+cargo test --locked --doc
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
 ```

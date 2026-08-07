@@ -41,7 +41,9 @@
 //! [`ProviderError::InvalidConfiguration`] there rather than emitting a
 //! request that would silently degrade to prose.
 
-use crate::provider::{Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES};
+use crate::provider::{
+    decode_response_value, Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES,
+};
 use crate::session::{parse_tool_action, ParseError, ParsedAction, MAX_THOUGHT_BYTES};
 use crate::text::elide_middle;
 use serde_json::{json, Value};
@@ -281,14 +283,29 @@ fn tool_specs() -> [ToolSpec; 3] {
     ]
 }
 
-/// Extract text and native tool calls from one non-streaming reply.
+/// Extract text and native tool calls from one bounded, encoded non-streaming
+/// reply.
+///
+/// The shared provider envelope ceiling is checked before `serde_json`
+/// constructs a [`Value`]. This is the canonical native-tool wire entry point.
+pub fn parse_tool_response_bytes(
+    provider: Provider,
+    body: &[u8],
+) -> Result<ToolResponse, ProviderError> {
+    let response = decode_response_value(body)?;
+    parse_tool_response(provider, &response)
+}
+
+/// Extract text and native tool calls from one non-streaming reply that the
+/// caller has already decoded under a transport envelope limit.
 ///
 /// This is the tool-mode counterpart of
 /// [`crate::provider::parse_chat_response_full`]. Unlike that function an
 /// empty text body is not an error — a reply that is nothing but a tool call
 /// is the normal case. Deciding what the calls *mean* is
 /// [`ToolResponse::to_action`]'s job, so every fail-closed rule lives in one
-/// place.
+/// place. `response` must be trusted or already bounded; network bytes should
+/// enter through [`parse_tool_response_bytes`].
 pub fn parse_tool_response(
     provider: Provider,
     response: &Value,
@@ -694,6 +711,44 @@ mod tests {
             "choices": [{"message": message, "finish_reason": "tool_calls"}],
             "usage": {"prompt_tokens": 11, "completion_tokens": 22},
         })
+    }
+
+    #[test]
+    fn byte_oriented_tool_parsing_bounds_the_envelope_before_decoding() {
+        let reply = anthropic_reply(json!([
+            {"type": "tool_use", "id": "toolu_bytes", "name": "run",
+             "input": {"command": "pwd"}},
+        ]));
+        let body = serde_json::to_vec(&reply).unwrap();
+        let parsed = parse_tool_response_bytes(Provider::Anthropic, &body).unwrap();
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].id, "toolu_bytes");
+        assert_eq!(
+            parsed.usage,
+            Some(Usage {
+                input_tokens: Some(11),
+                output_tokens: Some(22),
+            })
+        );
+        assert_eq!(
+            parsed.to_action().unwrap(),
+            ParsedAction::Run {
+                thought: None,
+                command: "pwd".into(),
+            }
+        );
+
+        assert!(matches!(
+            parse_tool_response_bytes(Provider::Anthropic, b"{not json"),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+        let huge = vec![b' '; crate::provider::MAX_RESPONSE_JSON_BYTES + 1];
+        assert!(matches!(
+            parse_tool_response_bytes(Provider::Anthropic, &huge),
+            Err(ProviderError::ResponseTooLarge {
+                limit: crate::provider::MAX_RESPONSE_JSON_BYTES
+            })
+        ));
     }
 
     #[test]

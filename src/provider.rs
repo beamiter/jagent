@@ -108,6 +108,11 @@ impl FromStr for Provider {
     }
 }
 
+/// Allocation-free role atom used by the provider request schema.
+///
+/// `Deserialize` is intentionally available for this scalar enum. Decoding a
+/// [`Role`] does not decode or bound a conversation; persisted or network
+/// history needs an embedding-owned envelope and collection budget.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -124,9 +129,18 @@ impl Role {
     }
 }
 
-/// One turn in a provider-neutral conversation transcript.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
+/// One in-memory turn used to construct a provider-neutral chat request.
+///
+/// This type is serialize-only by design: it is an input value, not a
+/// persistence or network decoder. Request builders bound values that already
+/// exist in memory, but an embedding that stores history must bound its encoded
+/// envelope, entry count, and cumulative text while decoding.
+///
+/// ```compile_fail
+/// let _: jagent::provider::Message =
+///     serde_json::from_str(r#"{"role":"user","text":"hello"}"#).unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Message {
     pub role: Role,
     pub text: String,
@@ -633,25 +647,39 @@ pub struct ChatResponse {
 /// already decode the body, but those make the transport's own envelope limit
 /// an integration requirement.
 pub fn parse_chat_response_bytes(provider: Provider, body: &[u8]) -> Result<String, ProviderError> {
-    if body.len() > MAX_RESPONSE_JSON_BYTES {
-        return Err(ProviderError::ResponseTooLarge {
-            limit: MAX_RESPONSE_JSON_BYTES,
-        });
-    }
-    let response: Value = serde_json::from_slice(body)
-        .map_err(|error| ProviderError::MalformedResponse(error.to_string()))?;
-    parse_chat_response(provider, &response)
+    let parsed = parse_chat_response_full_bytes(provider, body)?;
+    Ok(chat_response_text(parsed))
+}
+
+/// Parse one non-streaming chat response into its structured parts from a
+/// bounded encoded envelope.
+///
+/// This is the canonical byte-oriented entry point for callers that need
+/// token-limit and usage metadata. The size check happens before
+/// `serde_json` constructs a [`Value`].
+pub fn parse_chat_response_full_bytes(
+    provider: Provider,
+    body: &[u8],
+) -> Result<ChatResponse, ProviderError> {
+    let response = decode_response_value(body)?;
+    parse_chat_response_full(provider, &response)
 }
 
 /// Extract the assistant text from one non-streaming chat response.
 /// A reached token limit is surfaced as a visible trailing note, never as an
 /// error, so partial answers stay reviewable.
 ///
-/// `response` is already decoded, so the caller's transport must have applied
-/// its own encoded-envelope limit; [`parse_chat_response_bytes`] does that for
-/// integrations that would rather not.
+/// `response` is already decoded. This API is only for trusted or
+/// already-bounded caller-owned values: the caller's transport must have
+/// applied an encoded-envelope limit before allocating it.
+/// [`parse_chat_response_bytes`] does that for integrations that do not need
+/// structured metadata.
 pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<String, ProviderError> {
     let parsed = parse_chat_response_full(provider, response)?;
+    Ok(chat_response_text(parsed))
+}
+
+fn chat_response_text(parsed: ChatResponse) -> String {
     let mut text = parsed.text;
     if parsed.reached_token_limit {
         text.push_str(
@@ -659,12 +687,16 @@ pub fn parse_chat_response(provider: Provider, response: &Value) -> Result<Strin
              increase max_tokens.]",
         );
     }
-    Ok(text)
+    text
 }
 
 /// [`parse_chat_response`] returning the structured parts: raw text, the
 /// token-limit flag (so integrations word their own advisory note), and any
 /// token usage the provider reported.
+///
+/// `response` must be trusted or already bounded. Network bytes should enter
+/// through [`parse_chat_response_full_bytes`] so the encoded envelope is
+/// checked before a [`Value`] is allocated.
 pub fn parse_chat_response_full(
     provider: Provider,
     response: &Value,
@@ -709,6 +741,18 @@ pub fn parse_chat_response_full(
         reached_token_limit,
         usage: parse_usage(provider, response),
     })
+}
+
+/// Decode a provider response only after enforcing the shared encoded-body
+/// ceiling. Kept crate-visible so native-tool parsing uses the identical gate.
+pub(crate) fn decode_response_value(body: &[u8]) -> Result<Value, ProviderError> {
+    if body.len() > MAX_RESPONSE_JSON_BYTES {
+        return Err(ProviderError::ResponseTooLarge {
+            limit: MAX_RESPONSE_JSON_BYTES,
+        });
+    }
+    serde_json::from_slice(body)
+        .map_err(|error| ProviderError::MalformedResponse(error.to_string()))
 }
 
 /// Did the provider stop at the output-token limit? Shared by the text and
@@ -1086,13 +1130,39 @@ mod tests {
             parse_chat_response_bytes(Provider::Anthropic, body.as_bytes()).unwrap(),
             "hi"
         );
+
+        let structured = serde_json::json!({
+            "content": [{"type": "text", "text": "partial"}],
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 17, "output_tokens": 23},
+        })
+        .to_string();
+        assert_eq!(
+            parse_chat_response_full_bytes(Provider::Anthropic, structured.as_bytes()).unwrap(),
+            ChatResponse {
+                text: "partial".into(),
+                reached_token_limit: true,
+                usage: Some(Usage {
+                    input_tokens: Some(17),
+                    output_tokens: Some(23),
+                }),
+            }
+        );
+        let rendered =
+            parse_chat_response_bytes(Provider::Anthropic, structured.as_bytes()).unwrap();
+        assert!(rendered.starts_with("partial\n\n[Response reached"));
+
         assert!(matches!(
             parse_chat_response_bytes(Provider::Anthropic, b"{not json"),
             Err(ProviderError::MalformedResponse(_))
         ));
+        assert!(matches!(
+            parse_chat_response_full_bytes(Provider::Anthropic, b"{not json"),
+            Err(ProviderError::MalformedResponse(_))
+        ));
         let huge = vec![b' '; MAX_RESPONSE_JSON_BYTES + 1];
         assert!(matches!(
-            parse_chat_response_bytes(Provider::Anthropic, &huge),
+            parse_chat_response_full_bytes(Provider::Anthropic, &huge),
             Err(ProviderError::ResponseTooLarge {
                 limit: MAX_RESPONSE_JSON_BYTES
             })
