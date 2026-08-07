@@ -20,7 +20,7 @@ the parts that must behave identically everywhere.
 | `safety`   | `is_dangerous` destructive-pattern warnings and the compatibility `is_auto_approvable` hook, which now always fails closed because command text alone cannot prove what a configured shell will execute. |
 | `provider` | Anthropic / OpenAI-compatible / Ollama chat request construction returning plain `HttpRequest { url, headers, body }` data (`build_agent_chat_request` adds an `AgentProtocol` selector), plus strict response text extraction (structured variant with token usage via `parse_chat_response_full`) and history bounding with an optional per-turn preparation hook (`bound_history_with`). |
 | `prompt`   | Agent system prompts — `build_agent_system_prompt` (JSON protocol) and `build_agent_tool_system_prompt` (schema-carried protocol) — and user-role context encoding (`BlockContext`, `EnvironmentMeta`) with explicit untrusted-data framing. |
-| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events. Tool calls have per-call and whole-response bounds and are published only after the enclosing response completes; truncation, payload after an end signal, malformed indexes/frames, and empty text responses fail closed. Pair with `build_chat_request_streaming`. |
+| `stream`   | Sans-IO streaming-response parser: push raw body bytes into a `StreamParser` (Anthropic SSE / OpenAI-compatible SSE / Ollama NDJSON) and receive `TextDelta` / `ToolCall` / `ReachedTokenLimit` / `Usage` / `Done` events. Raw bytes, decoded frames, text, tool arguments, and calls are independently bounded; tool calls are published only after the enclosing response completes. Truncation, payload after an end signal, malformed indexes/frames, and empty text responses fail closed. Pair with `build_chat_request_streaming`. |
 | `tools`    | The same three actions carried by the providers' **native** tool-calling: provider-correct schemas (Anthropic `input_schema`, OpenAI `function`/`parameters`; Ollama returns `InvalidConfiguration`), plus `parse_tool_response` → `ToolResponse::to_action` ingestion into the identical `ParsedAction` values. Token-limited output never becomes an action. Fully additive: `AgentProtocol::Text` reproduces 0.4 byte-for-byte. |
 | `redact`   | High-confidence scrubbing for AI-bound text: common provider and service tokens, private-key blocks, JWTs, explicit bearer credentials, and passwords embedded in URL userinfo. Non-secret URL and authentication framing is preserved for context. |
 
@@ -61,6 +61,10 @@ non-streaming provider traffic, use `parse_chat_response_bytes`,
 `parse_chat_response_full_bytes`, or `tools::parse_tool_response_bytes`; each
 checks `MAX_RESPONSE_JSON_BYTES` before allocating a `serde_json::Value`. The
 corresponding `Value` APIs are only for trusted or already-bounded values.
+`StreamParser` independently caps a streaming response at
+`MAX_STREAM_RESPONSE_BYTES` and `MAX_STREAM_FRAMES`, in addition to its
+per-frame and retained-content ceilings; HTTP headers and socket deadlines
+remain the transport integration's responsibility.
 
 ## Sketch
 

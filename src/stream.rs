@@ -30,10 +30,11 @@
 //! frame, payload after an end signal, an empty completed text response, a
 //! provider-reported stream error, or an exceeded bound emits one
 //! [`StreamEvent::Protocol`], after which the parser is inert and ignores all
-//! further input. Bounds (invariant #3): a single buffered line/frame,
-//! cumulative delivered text/tool arguments, and the number of calls are
-//! capped. Completed tool blocks remain private until the enclosing response
-//! succeeds, so a later error cannot leave an actionable call behind.
+//! further input. Bounds (invariant #3): the raw response, number of decoded
+//! frames, a single buffered line/frame, cumulative delivered text/tool
+//! arguments, and the number of calls are capped. Completed tool blocks remain
+//! private until the enclosing response succeeds, so a later error cannot
+//! leave an actionable call behind.
 //!
 //! UTF-8 handling: input is buffered as bytes and split only at `\n`, so a
 //! multi-byte sequence split across pushes is reassembled before decoding. A
@@ -53,6 +54,23 @@ use serde_json::Value;
 /// Detail quoted from provider-reported stream errors is elided to this many
 /// bytes before being embedded in a [`StreamEvent::Protocol`] message.
 const MAX_ERROR_DETAIL_BYTES: usize = 256;
+
+/// Maximum raw body bytes one [`StreamParser`] will inspect for a response.
+///
+/// Streaming JSON carries framing overhead beyond the retained 256-KiB model
+/// text budget, but it must not become an unlimited sequence of keep-alives or
+/// semantically irrelevant frames. Integrations should use the same ceiling at
+/// their transport boundary where possible; the parser enforces it again so
+/// its public sans-IO API is safe on its own.
+pub const MAX_STREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum JSON/SSE payload frames decoded for one response.
+///
+/// This independently bounds CPU and repeated temporary `serde_json::Value`
+/// allocations when an attacker sends many tiny frames inside the raw-byte
+/// ceiling. SSE comments and blank lines consume the raw-byte budget but are
+/// not decoded frames.
+pub const MAX_STREAM_FRAMES: usize = 4096;
 
 /// One parsed increment of a streaming chat response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +131,8 @@ pub struct StreamParser {
     /// SSE only: accumulated `data:` payload of the event being assembled.
     event_data: String,
     event_has_data: bool,
+    raw_response_bytes: usize,
+    decoded_frames: usize,
     delivered_text_bytes: usize,
     /// Whether any delivered text survives Unicode whitespace trimming. This
     /// lets completion mirror the non-streaming parser's empty-response rule
@@ -155,6 +175,8 @@ impl StreamParser {
             line: Vec::new(),
             event_data: String::new(),
             event_has_data: false,
+            raw_response_bytes: 0,
+            decoded_frames: 0,
             delivered_text_bytes: 0,
             saw_non_whitespace_text: false,
             saw_text_block: false,
@@ -177,6 +199,14 @@ impl StreamParser {
             if self.phase != Phase::Streaming {
                 break;
             }
+            if self.raw_response_bytes == MAX_STREAM_RESPONSE_BYTES {
+                self.fail(
+                    &format!("stream response exceeds the {MAX_STREAM_RESPONSE_BYTES} byte limit"),
+                    &mut events,
+                );
+                break;
+            }
+            self.raw_response_bytes += 1;
             if byte == b'\n' {
                 let line = std::mem::take(&mut self.line);
                 self.handle_line(&line, &mut events);
@@ -275,6 +305,9 @@ impl StreamParser {
     }
 
     fn dispatch_sse_frame(&mut self, data: &str, events: &mut Vec<StreamEvent>) {
+        if !self.begin_decoded_frame(events) {
+            return;
+        }
         match self.provider {
             Provider::Anthropic => self.anthropic_frame(data, events),
             // Ollama never assembles SSE events; the arm is unreachable but
@@ -491,6 +524,9 @@ impl StreamParser {
         if line.trim().is_empty() {
             return;
         }
+        if !self.begin_decoded_frame(events) {
+            return;
+        }
         let Ok(frame) = serde_json::from_str::<Value>(line) else {
             self.fail("malformed JSON in stream frame", events);
             return;
@@ -524,6 +560,18 @@ impl StreamParser {
             self.merge_usage(Some(&frame), "prompt_eval_count", "eval_count");
             self.complete(events);
         }
+    }
+
+    fn begin_decoded_frame(&mut self, events: &mut Vec<StreamEvent>) -> bool {
+        if self.decoded_frames == MAX_STREAM_FRAMES {
+            self.fail(
+                &format!("stream contains more than {MAX_STREAM_FRAMES} decoded frames"),
+                events,
+            );
+            return false;
+        }
+        self.decoded_frames += 1;
+        true
     }
 
     /// Merge one OpenAI-compatible `tool_calls` delta entry. Fragments are
@@ -1224,6 +1272,50 @@ mod tests {
             matches!(&events[0], StreamEvent::Protocol(message) if message.contains("byte limit"))
         );
         assert_eq!(parser.push(b"\n"), vec![]);
+        assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn raw_stream_envelope_accepts_its_limit_and_rejects_the_next_byte() {
+        let final_frame = ndjson_line(&json!({
+            "message": {"content": "ok"},
+            "done": true,
+        }));
+        let padding_len = MAX_STREAM_RESPONSE_BYTES - final_frame.len();
+
+        let mut exact = vec![b'\n'; padding_len];
+        exact.extend_from_slice(final_frame.as_bytes());
+        let mut parser = StreamParser::new(Provider::Ollama);
+        assert_eq!(
+            parser.push(&exact),
+            vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done]
+        );
+
+        let mut oversized = vec![b'\n'; padding_len + 1];
+        oversized.extend_from_slice(final_frame.as_bytes());
+        let mut parser = StreamParser::new(Provider::Ollama);
+        let events = parser.push(&oversized);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Protocol(message)] if message.contains("stream response")
+        ));
+        assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn tiny_irrelevant_frames_have_an_independent_count_budget() {
+        let ignored = openai_line(&json!({}));
+        let mut parser = StreamParser::new(Provider::OpenAiCompatible);
+        assert!(parser
+            .push(ignored.repeat(MAX_STREAM_FRAMES).as_bytes())
+            .is_empty());
+
+        let events = parser.push(ignored.as_bytes());
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Protocol(message)] if message.contains("decoded frames")
+        ));
+        assert_eq!(parser.push(ignored.as_bytes()), vec![]);
         assert_eq!(parser.finish(), vec![]);
     }
 
