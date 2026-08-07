@@ -1,4 +1,5 @@
-//! Review-first terminal AI agent core, extracted from jterm4.
+//! Review-first terminal AI agent core shared by `jsh` and the
+//! `jterm_core`-based terminal family.
 //!
 //! This crate is deliberately **sans-IO**: it has no HTTP client, no PTY, no
 //! process spawning, and no UI. Integrations (terminal emulators, shells)
@@ -26,7 +27,7 @@
 //!   the same [`session::ParsedAction`] values, so the state machine and
 //!   every invariant below apply unchanged.
 //!
-//! # Invariants (inherited from jterm4)
+//! # Invariants
 //!
 //! 1. Generated commands are never executed without an explicit caller action
 //!    on an [`session::ApprovedCommand`].

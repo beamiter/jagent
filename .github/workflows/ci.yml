@@ -20,10 +20,22 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
+        run: cargo clippy --locked --all-targets -- -D warnings
       - name: Docs
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV (Rust 1.86)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.86.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --locked --all-targets
+      - name: Test
+        run: cargo test --locked --all-targets

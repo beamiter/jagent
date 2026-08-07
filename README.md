@@ -1,9 +1,12 @@
 # jagent
 
-Review-first terminal AI agent core, extracted from
-[jterm4](https://github.com/beamiter/jterm4)'s native Shell Agent so the same
-agent behavior can be embedded in [jsh](https://github.com/beamiter/jsh) and
-other terminals (jterm1/2/3).
+Review-first terminal AI agent core shared across the current terminal stack.
+[jsh](https://github.com/beamiter/jsh) and
+[forge](https://github.com/beamiter/forge) depend on it directly, while
+[jterm_core](https://github.com/beamiter/jterm_core) carries the common
+terminal integration used by [anvil](https://github.com/beamiter/anvil),
+[ember](https://github.com/beamiter/ember), forge, and
+[frost](https://github.com/beamiter/frost).
 
 The crate is deliberately **sans-IO**: no HTTP client, no PTY, no process
 spawning, no UI. Integrations provide transport and execution; jagent provides
@@ -93,6 +96,20 @@ the same state machine, and approval still returns an `ApprovedCommand` that
 only the caller can act on. A reply must carry **exactly one** tool call — zero
 fails closed even when prose is present, and prose alongside a call is kept as
 the action's visible thought rather than dropped.
+
+## Development
+
+The minimum supported Rust version (MSRV) is **1.86**. CI runs the check and
+test suites against that compiler and keeps formatting, Clippy, and rustdoc on
+the current stable toolchain. The MSRV gate uses the committed lockfile:
+
+```text
+cargo +1.86.0 check --locked --all-targets
+cargo +1.86.0 test --locked --all-targets
+```
+
+See [the integration migration notes](docs/jterm4-migration.md) for the current
+ownership boundary between this crate, `jterm_core`, and its consumers.
 
 ## License
 
