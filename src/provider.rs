@@ -12,6 +12,7 @@ use crate::text::elide_middle;
 use crate::tools::{agent_body_fields, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::str::FromStr;
 
 pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -37,6 +38,8 @@ pub const MAX_REQUEST_SYSTEM_BYTES: usize = 64 * 1024;
 /// must apply an equivalent transport limit before calling the `Value`-based
 /// entry points.
 pub const MAX_RESPONSE_JSON_BYTES: usize = 1024 * 1024;
+/// Byte ceiling for one provider name parsed from configuration.
+pub const MAX_PROVIDER_NAME_BYTES: usize = 64;
 
 /// Supported wire protocols. OpenAI-compatible intentionally includes local
 /// and hosted services which implement the Chat Completions endpoint.
@@ -99,13 +102,25 @@ impl FromStr for Provider {
     type Err = ProviderError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "anthropic" | "claude" => Ok(Self::Anthropic),
-            "openai" | "openai-compatible" | "openai_compatible" => Ok(Self::OpenAiCompatible),
-            "ollama" => Ok(Self::Ollama),
-            other => Err(ProviderError::InvalidConfiguration(format!(
-                "unknown AI provider '{other}'"
-            ))),
+        let value = value.trim();
+        if value.len() > MAX_PROVIDER_NAME_BYTES || value.chars().any(char::is_control) {
+            return Err(ProviderError::InvalidConfiguration(
+                "AI provider name is invalid or exceeds its byte limit".into(),
+            ));
+        }
+        if value.eq_ignore_ascii_case("anthropic") || value.eq_ignore_ascii_case("claude") {
+            Ok(Self::Anthropic)
+        } else if value.eq_ignore_ascii_case("openai")
+            || value.eq_ignore_ascii_case("openai-compatible")
+            || value.eq_ignore_ascii_case("openai_compatible")
+        {
+            Ok(Self::OpenAiCompatible)
+        } else if value.eq_ignore_ascii_case("ollama") {
+            Ok(Self::Ollama)
+        } else {
+            Err(ProviderError::InvalidConfiguration(format!(
+                "unknown AI provider '{value}'"
+            )))
         }
     }
 }
@@ -197,7 +212,11 @@ impl std::fmt::Debug for HttpRequest {
             .debug_struct("HttpRequest")
             .field("url", &self.url)
             .field("headers", &RedactedHeaders(&self.headers))
-            .field("body", &self.body)
+            // Request bodies contain user context and can therefore contain
+            // credentials that no finite pattern list will reliably catch.
+            // Keep Debug useful for transport diagnostics without turning an
+            // innocent tracing statement into a second secret sink.
+            .field("body_bytes", &self.body.len())
             .finish()
     }
 }
@@ -242,8 +261,10 @@ pub struct ChatConfig {
     pub model: String,
     pub base_url: String,
     pub max_tokens: u32,
-    /// Sampling temperature. `None` keeps the provider default; agent loops
-    /// that require strict JSON replies benefit from a low value such as 0.0.
+    /// Sampling temperature. `None` keeps the provider/model default and is
+    /// the portable choice: some reasoning-capable models reject an explicit
+    /// temperature. Set a value only when the selected endpoint documents
+    /// support for it.
     pub temperature: Option<f32>,
 }
 
@@ -279,7 +300,10 @@ impl ChatConfig {
     /// between a hostile settings file and an outbound HTTP request.
     pub fn validate(&self) -> Result<(), ProviderError> {
         validate_model(&self.model)?;
-        validate_base_url(self.provider, self.base_url.trim())?;
+        // Validate the exact bytes that request construction will use. The
+        // previous `trim()` accepted surrounding whitespace here but later
+        // built an unusable, transport-dependent URL from the original value.
+        validate_base_url(&self.base_url)?;
         if self.max_tokens == 0 {
             return Err(ProviderError::InvalidConfiguration(
                 "max_tokens must be positive".into(),
@@ -311,12 +335,14 @@ impl ChatConfig {
 
 fn validate_model(model: &str) -> Result<(), ProviderError> {
     if model.trim().is_empty()
+        || model.trim() != model
         || model.len() > MAX_MODEL_BYTES
         || model.chars().any(char::is_control)
         || model.chars().any(is_unsafe_invisible_char)
     {
         return Err(ProviderError::InvalidConfiguration(format!(
-            "model must be visible, non-empty text of at most {MAX_MODEL_BYTES} bytes"
+            "model must be visible, non-empty text of at most {MAX_MODEL_BYTES} bytes with no \
+             surrounding whitespace"
         )));
     }
     Ok(())
@@ -329,16 +355,21 @@ fn validate_model(model: &str) -> Result<(), ProviderError> {
 /// carries an API key. Userinfo would smuggle credentials into a persisted
 /// URL, a query or fragment is not a base-URL component (the provider endpoint
 /// is appended after this string), and visually ambiguous characters would let
-/// a configured host read as one origin while resolving as another.
-fn validate_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderError> {
+/// a configured host read as one origin while resolving as another. Plain
+/// HTTP is accepted only for a syntactic loopback host. This applies to every
+/// provider because OpenAI-compatible local servers and local provider
+/// proxies are common, while a remote clear-text endpoint would expose both
+/// prompts and credentials.
+fn validate_base_url(base_url: &str) -> Result<(), ProviderError> {
     let invalid = || {
         ProviderError::InvalidConfiguration(format!(
             "base URL must be an absolute HTTPS URL of at most {MAX_BASE_URL_BYTES} bytes with \
-             no credentials, query, fragment, backslash, control, or visually ambiguous \
-             characters (plain HTTP is accepted only for a loopback Ollama endpoint)"
+             no surrounding whitespace, credentials, query, fragment, backslash, control, or \
+             visually ambiguous characters (plain HTTP is accepted only for a loopback endpoint)"
         ))
     };
     if base_url.is_empty()
+        || base_url.trim() != base_url
         || base_url.len() > MAX_BASE_URL_BYTES
         || base_url.contains([' ', '?', '#', '\\'])
         || base_url.chars().any(char::is_control)
@@ -348,12 +379,12 @@ fn validate_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderE
     }
     let (scheme, rest) = base_url.split_once("://").ok_or_else(invalid)?;
     let authority = rest.split('/').next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') {
+    if authority.contains('@') || authority_host(authority).is_none() {
         return Err(invalid());
     }
     match scheme {
         "https" => Ok(()),
-        "http" if provider == Provider::Ollama && is_loopback_authority(authority) => Ok(()),
+        "http" if is_loopback_authority(authority) => Ok(()),
         _ => Err(invalid()),
     }
 }
@@ -361,20 +392,8 @@ fn validate_base_url(provider: Provider, base_url: &str) -> Result<(), ProviderE
 /// True for `localhost`, an IPv4 loopback literal, or a bracketed IPv6
 /// loopback literal, each with an optional numeric port.
 fn is_loopback_authority(authority: &str) -> bool {
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        let Some((literal, port)) = rest.split_once(']') else {
-            return false;
-        };
-        if !port.is_empty() && !port.strip_prefix(':').is_some_and(is_port) {
-            return false;
-        }
-        literal
-    } else {
-        match authority.split_once(':') {
-            Some((host, port)) if is_port(port) => host,
-            Some(_) => return false,
-            None => authority,
-        }
+    let Some(host) = authority_host(authority) else {
+        return false;
     };
     host.eq_ignore_ascii_case("localhost")
         || host
@@ -385,8 +404,40 @@ fn is_loopback_authority(authority: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+/// Resolve the host slice only when the complete authority has a syntactically
+/// valid bracket/port shape. This deliberately does not perform DNS or IDNA
+/// processing, which belongs to the transport, but it prevents validation
+/// from accepting a malformed authority that a transport might reinterpret.
+fn authority_host(authority: &str) -> Option<&str> {
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (literal, suffix) = rest.split_once(']')?;
+        if literal.parse::<std::net::Ipv6Addr>().is_err() {
+            return None;
+        }
+        if !suffix.is_empty() && !suffix.strip_prefix(':').is_some_and(is_port) {
+            return None;
+        }
+        return Some(literal);
+    }
+    if authority.contains(['[', ']']) {
+        return None;
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && !host.is_empty() && is_port(port) => {
+            Some(host)
+        }
+        Some(_) => None,
+        None => Some(authority),
+    }
+}
+
 fn is_port(port: &str) -> bool {
-    !port.is_empty() && port.chars().all(|digit| digit.is_ascii_digit())
+    !port.is_empty()
+        && port.chars().all(|digit| digit.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 /// Bound a conversation history to the request budgets, newest-first. Leading
@@ -395,7 +446,50 @@ fn is_port(port: &str) -> bool {
 /// requests.
 /// Returns the retained history and how many older turns were omitted.
 pub fn bound_history(history: &[Message]) -> (Vec<Message>, usize) {
-    bound_history_with(history, str::to_string)
+    let prepared = bound_history_cow_with_report(history, Cow::Borrowed);
+    (prepared.messages, prepared.report.omitted_history_turns)
+}
+
+/// Machine-readable account of the transformations applied while preparing a
+/// provider history window.
+///
+/// `changed_history_turns` counts retained turns changed by the caller's
+/// preparation hook (for example secret redaction). `elided_history_turns`
+/// counts retained turns whose prepared text exceeded the per-turn budget.
+/// Together with `omitted_history_turns`, these fields make every lossy
+/// history transformation visible without including any sensitive content in
+/// the report itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HistoryReport {
+    /// Number of turns supplied before preparation and bounding.
+    pub input_history_turns: usize,
+    /// Number of turns retained in the prepared request window.
+    pub sent_history_turns: usize,
+    /// Number of older turns omitted entirely.
+    pub omitted_history_turns: usize,
+    /// Number of retained turns changed by the preparation hook.
+    pub changed_history_turns: usize,
+    /// Number of retained turns shortened by middle elision.
+    pub elided_history_turns: usize,
+    /// UTF-8 text bytes retained across the sent turns, excluding JSON and
+    /// provider framing overhead.
+    pub sent_history_text_bytes: usize,
+}
+
+/// A bounded history together with a complete loss/preparation report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "inspect report before sending a request built from this history"]
+pub struct PreparedHistory {
+    /// Bounded turns, kept in their original chronological order.
+    pub messages: Vec<Message>,
+    /// Non-sensitive diagnostics for the preparation and bounding pass.
+    pub report: HistoryReport,
+}
+
+/// [`bound_history`] with machine-readable diagnostics for elision as well as
+/// whole-turn omission.
+pub fn bound_history_with_report(history: &[Message]) -> PreparedHistory {
+    bound_history_cow_with_report(history, Cow::Borrowed)
 }
 
 /// [`bound_history`] with a per-turn preparation hook (redaction, normalization)
@@ -405,13 +499,44 @@ pub fn bound_history_with(
     history: &[Message],
     prepare: impl Fn(&str) -> String,
 ) -> (Vec<Message>, usize) {
-    let mut retained_reversed = Vec::new();
+    let prepared = bound_history_prepared_with_report(history, prepare);
+    (prepared.messages, prepared.report.omitted_history_turns)
+}
+
+/// [`bound_history_with`] plus diagnostics describing every retained turn
+/// changed by `prepare` and every retained turn elided by the byte budget.
+pub fn bound_history_prepared_with_report(
+    history: &[Message],
+    prepare: impl Fn(&str) -> String,
+) -> PreparedHistory {
+    bound_history_cow_with_report(history, |text| Cow::Owned(prepare(text)))
+}
+
+/// Prepare and bound history without requiring the preparation hook to clone
+/// clean or oversized input. A hook such as
+/// [`crate::redact::redact_secrets_cow`] can borrow an unchanged turn; the
+/// final retained [`Message`] is allocated only after the per-turn ceiling is
+/// known.
+pub fn bound_history_cow_with_report<'a>(
+    history: &'a [Message],
+    prepare: impl Fn(&'a str) -> Cow<'a, str>,
+) -> PreparedHistory {
+    struct PreparedTurn {
+        message: Message,
+        changed: bool,
+        elided: bool,
+    }
+
+    let mut retained_reversed: Vec<PreparedTurn> = Vec::new();
     let mut retained_bytes = 0_usize;
     for turn in history.iter().rev() {
         if retained_reversed.len() >= MAX_REQUEST_HISTORY_TURNS {
             break;
         }
-        let text = elide_middle(&prepare(&turn.text), MAX_REQUEST_TURN_BYTES);
+        let prepared = prepare(&turn.text);
+        let changed = prepared.as_ref() != turn.text;
+        let elided = prepared.len() > MAX_REQUEST_TURN_BYTES;
+        let text = elide_middle(&prepared, MAX_REQUEST_TURN_BYTES);
         let cost = text.len().saturating_add(32);
         if !retained_reversed.is_empty()
             && retained_bytes.saturating_add(cost) > MAX_REQUEST_HISTORY_BYTES
@@ -419,22 +544,43 @@ pub fn bound_history_with(
             break;
         }
         retained_bytes = retained_bytes.saturating_add(cost);
-        retained_reversed.push(Message {
-            role: turn.role,
-            text,
+        retained_reversed.push(PreparedTurn {
+            message: Message {
+                role: turn.role,
+                text,
+            },
+            changed,
+            elided,
         });
     }
     retained_reversed.reverse();
-    let mut omitted = history.len().saturating_sub(retained_reversed.len());
+    let mut omitted_history_turns = history.len().saturating_sub(retained_reversed.len());
     while retained_reversed.len() > 1
         && retained_reversed
             .first()
-            .is_some_and(|turn| turn.role == Role::Assistant)
+            .is_some_and(|turn| turn.message.role == Role::Assistant)
     {
         retained_reversed.remove(0);
-        omitted = omitted.saturating_add(1);
+        omitted_history_turns = omitted_history_turns.saturating_add(1);
     }
-    (retained_reversed, omitted)
+    let report = HistoryReport {
+        input_history_turns: history.len(),
+        sent_history_turns: retained_reversed.len(),
+        omitted_history_turns,
+        changed_history_turns: retained_reversed.iter().filter(|turn| turn.changed).count(),
+        elided_history_turns: retained_reversed.iter().filter(|turn| turn.elided).count(),
+        sent_history_text_bytes: retained_reversed
+            .iter()
+            .map(|turn| turn.message.text.len())
+            .fold(0_usize, usize::saturating_add),
+    };
+    PreparedHistory {
+        messages: retained_reversed
+            .into_iter()
+            .map(|turn| turn.message)
+            .collect(),
+        report,
+    }
 }
 
 /// Build one bounded chat POST, discarding the number of history turns this
@@ -491,9 +637,9 @@ pub fn build_chat_request_streaming_with_report(
 /// `tool_choice` fields (see [`crate::tools`]) and changes nothing else;
 /// replies are then ingested with [`crate::tools::parse_tool_response`].
 ///
-/// Ollama has no standard tool-calling in the chat endpoint this crate
-/// targets, so native mode returns [`ProviderError::InvalidConfiguration`]
-/// there instead of emitting a request that would degrade to prose.
+/// Ollama receives the same OpenAI-shaped function definitions but no
+/// `tool_choice` field because `/api/chat` does not expose one. Response
+/// ingestion still enforces jagent's exact-one-call rule.
 pub fn build_agent_chat_request(
     config: &ChatConfig,
     system: Option<&str>,
@@ -989,9 +1135,13 @@ mod tests {
         assert!(config_debug.contains("[REDACTED]"));
         assert!(!config_debug.contains(secret));
 
-        let request = build_chat_request(&chat, None, &[user("hello")]).unwrap();
+        // The same value in the body must stay out of Debug too. Request
+        // context is sensitive even when it does not match a known token
+        // shape, so Debug reports only the encoded length.
+        let request = build_chat_request(&chat, None, &[user(secret)]).unwrap();
         let request_debug = format!("{request:?}");
         assert!(request_debug.contains("[REDACTED]"));
+        assert!(request_debug.contains("body_bytes"));
         assert!(!request_debug.contains(secret));
     }
 
@@ -1065,6 +1215,13 @@ mod tests {
 
     #[test]
     fn invalid_configuration_is_rejected() {
+        assert_eq!("CLAUDE".parse::<Provider>().unwrap(), Provider::Anthropic);
+        assert!("x"
+            .repeat(MAX_PROVIDER_NAME_BYTES + 1)
+            .parse::<Provider>()
+            .is_err());
+        assert!("open\nai".parse::<Provider>().is_err());
+
         let mut bad = config(Provider::Ollama);
         bad.base_url = "localhost:11434".into();
         assert!(bad.validate().is_err());
@@ -1088,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn base_urls_must_be_https_unless_ollama_stays_on_loopback() {
+    fn base_urls_must_be_https_unless_the_endpoint_is_loopback() {
         for provider in [
             Provider::Anthropic,
             Provider::OpenAiCompatible,
@@ -1102,7 +1259,9 @@ mod tests {
             );
         }
 
-        // Plain HTTP is a loopback Ollama concession, not a general one.
+        // Local OpenAI-compatible servers and provider proxies commonly use
+        // clear-text loopback HTTP. The exception is based on the host, not
+        // the provider label.
         for loopback in [
             "http://localhost:11434",
             "http://LOCALHOST",
@@ -1110,16 +1269,18 @@ mod tests {
             "http://127.6.6.6",
             "http://[::1]:11434",
         ] {
-            let mut ollama = config(Provider::Ollama);
-            ollama.base_url = loopback.into();
-            assert!(ollama.validate().is_ok(), "{loopback} is loopback");
-
-            let mut cloud = config(Provider::OpenAiCompatible);
-            cloud.base_url = loopback.into();
-            assert!(
-                cloud.validate().is_err(),
-                "{loopback} must not downgrade a cloud provider to HTTP"
-            );
+            for provider in [
+                Provider::Anthropic,
+                Provider::OpenAiCompatible,
+                Provider::Ollama,
+            ] {
+                let mut local = config(provider);
+                local.base_url = loopback.into();
+                assert!(
+                    local.validate().is_ok(),
+                    "{loopback} is loopback for {provider:?}"
+                );
+            }
         }
         for remote in [
             "http://example.com",
@@ -1127,13 +1288,20 @@ mod tests {
             "http://127.0.0.1.example.com",
             "http://[::2]:11434",
             "http://127.0.0.1:not-a-port",
+            "http://127.0.0.1:65536",
         ] {
-            let mut ollama = config(Provider::Ollama);
-            ollama.base_url = remote.into();
-            assert!(
-                ollama.validate().is_err(),
-                "{remote} must not pass as loopback"
-            );
+            for provider in [
+                Provider::Anthropic,
+                Provider::OpenAiCompatible,
+                Provider::Ollama,
+            ] {
+                let mut endpoint = config(provider);
+                endpoint.base_url = remote.into();
+                assert!(
+                    endpoint.validate().is_err(),
+                    "{remote} must not pass as loopback for {provider:?}"
+                );
+            }
         }
     }
 
@@ -1141,6 +1309,9 @@ mod tests {
     fn base_urls_and_models_reject_smuggled_components() {
         for hostile in [
             "https:///missing-authority",
+            "https://:443",
+            "https://[::1",
+            "https://example.com:99999",
             "https://user:secret@example.com/v1",
             "https://example.com/v1?api-key=secret",
             "https://example.com/v1#fragment",
@@ -1148,6 +1319,8 @@ mod tests {
             "https://exam\u{200b}ple.com",
             "https://example.com/\u{202e}v1",
             "https://example.com/v 1",
+            " https://example.com/v1",
+            "https://example.com/v1 ",
             "ftp://example.com",
             "example.com",
             "",
@@ -1161,7 +1334,14 @@ mod tests {
         long.base_url = format!("https://example.com/{}", "x".repeat(MAX_BASE_URL_BYTES));
         assert!(long.validate().is_err());
 
-        for hostile in ["gpt\u{202e}4o", "gpt\u{200b}4o", "gpt\t4o", "gpt\n4o"] {
+        for hostile in [
+            "gpt\u{202e}4o",
+            "gpt\u{200b}4o",
+            "gpt\t4o",
+            "gpt\n4o",
+            " gpt-4o",
+            "gpt-4o ",
+        ] {
             let mut bad = config(Provider::OpenAiCompatible);
             bad.model = hostile.into();
             assert!(bad.validate().is_err(), "{hostile:?} must be rejected");
@@ -1310,6 +1490,49 @@ mod tests {
             assert!(built.request.body.contains("bytes elided"), "{provider:?}");
             assert!(!built.request.body.contains(&oversized), "{provider:?}");
         }
+    }
+
+    #[test]
+    fn detailed_history_report_surfaces_elision_preparation_and_omission() {
+        let oversized = "界".repeat(MAX_REQUEST_TURN_BYTES / "界".len() + 1);
+        let history = vec![
+            assistant("orphaned assistant"),
+            user("secret"),
+            user(&oversized),
+        ];
+        let prepared = bound_history_prepared_with_report(&history, |text| {
+            if text == "secret" {
+                "[REDACTED]".to_string()
+            } else {
+                text.to_string()
+            }
+        });
+
+        // Leading assistant context is omitted, while the two user turns are
+        // retained. The report distinguishes preparation, middle-elision,
+        // and whole-turn loss.
+        assert_eq!(prepared.report.input_history_turns, 3);
+        assert_eq!(prepared.report.sent_history_turns, 2);
+        assert_eq!(prepared.report.omitted_history_turns, 1);
+        assert_eq!(prepared.report.changed_history_turns, 1);
+        assert_eq!(prepared.report.elided_history_turns, 1);
+        assert_eq!(
+            prepared.report.sent_history_text_bytes,
+            prepared
+                .messages
+                .iter()
+                .map(|message| message.text.len())
+                .sum::<usize>()
+        );
+        assert_eq!(prepared.messages[0].text, "[REDACTED]");
+        assert!(prepared.messages[1].text.contains("bytes elided"));
+
+        let prepared =
+            bound_history_prepared_with_report(&history[1..2], |_| "[REDACTED]".to_string());
+        assert_eq!(prepared.report.changed_history_turns, 1);
+        assert_eq!(prepared.report.elided_history_turns, 0);
+        assert_eq!(prepared.report.omitted_history_turns, 0);
+        assert_eq!(prepared.messages[0].text, "[REDACTED]");
     }
 
     #[test]

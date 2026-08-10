@@ -15,6 +15,7 @@
 //! survive copy/paste through the AI panel back to the user.
 
 use regex::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 struct SecretPattern {
@@ -41,6 +42,13 @@ fn patterns() -> &'static [SecretPattern] {
             (
                 "[REDACTED:aws-access-key]",
                 r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b",
+            ),
+            // AWS secret keys are intentionally recognized only when paired
+            // with their explicit setting name; the bare 40-character shape
+            // is too generic for command/build output.
+            (
+                "AWS_SECRET_ACCESS_KEY=[REDACTED:aws-secret-key]",
+                r#"(?i)\bAWS_SECRET_ACCESS_KEY[ \t]*[=:][ \t]*[\"']?[A-Za-z0-9/+=]{40}[\"']?"#,
             ),
             // GitHub fine-grained PAT (long form).
             ("[REDACTED:github-pat]", r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
@@ -84,6 +92,13 @@ fn patterns() -> &'static [SecretPattern] {
                 "${scheme} [REDACTED:bearer-token]",
                 r"(?i)(?P<scheme>\bbearer)[ \t]+[A-Za-z0-9._~+/=-]{16,}",
             ),
+            // Basic auth is explicit authentication framing around a
+            // base64-encoded username/password pair. Preserve the scheme but
+            // never forward the credential payload.
+            (
+                "${scheme} [REDACTED:basic-credentials]",
+                r"(?i)(?P<scheme>\bbasic)[ \t]+[A-Za-z0-9+/]{12,}={0,2}",
+            ),
         ];
         pats.iter()
             .map(|(replacement, pattern)| SecretPattern {
@@ -95,14 +110,13 @@ fn patterns() -> &'static [SecretPattern] {
 }
 
 /// Walk the input through every pattern, replacing matches with
-/// `[REDACTED:<kind>]`. Allocates only when something matches — short
-/// circuits on a clean string so the common case (most block output) is
-/// just a couple of regex `is_match` probes.
-pub fn redact_secrets(input: &str) -> String {
-    let mut current = std::borrow::Cow::Borrowed(input);
+/// `[REDACTED:<kind>]` and borrowing the original text when nothing matched.
+/// This is the allocation-aware entry point for request preparation pipelines.
+pub fn redact_secrets_cow(input: &str) -> Cow<'_, str> {
+    let mut current = Cow::Borrowed(input);
     for pattern in patterns() {
         if pattern.regex.is_match(&current) {
-            current = std::borrow::Cow::Owned(
+            current = Cow::Owned(
                 pattern
                     .regex
                     .replace_all(&current, pattern.replacement)
@@ -110,7 +124,15 @@ pub fn redact_secrets(input: &str) -> String {
             );
         }
     }
-    current.into_owned()
+    current
+}
+
+/// Owned compatibility wrapper around [`redact_secrets_cow`].
+///
+/// This always returns a [`String`], so clean input is copied. New pipelines
+/// that can preserve a borrow should prefer [`redact_secrets_cow`].
+pub fn redact_secrets(input: &str) -> String {
+    redact_secrets_cow(input).into_owned()
 }
 
 #[cfg(test)]
@@ -120,6 +142,7 @@ mod tests {
     #[test]
     fn passthrough_when_nothing_to_redact() {
         let s = "the quick brown fox 1234567890 deadbeefcafef00d";
+        assert!(matches!(redact_secrets_cow(s), Cow::Borrowed(value) if value == s));
         assert_eq!(redact_secrets(s), s);
     }
 
@@ -136,6 +159,14 @@ mod tests {
         let s = "ASIAY34FZKBOKMUTVV7A is current STS";
         let out = redact_secrets(s);
         assert!(out.contains("[REDACTED:aws-access-key]"), "got {out}");
+    }
+
+    #[test]
+    fn redacts_labeled_aws_secret_without_matching_unlabeled_base64() {
+        let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let out = redact_secrets(&format!("AWS_SECRET_ACCESS_KEY='{secret}'"));
+        assert_eq!(out, "AWS_SECRET_ACCESS_KEY=[REDACTED:aws-secret-key]");
+        assert_eq!(redact_secrets(secret), secret);
     }
 
     #[test]
@@ -219,6 +250,14 @@ mod tests {
         // CLI arguments that merely happen to follow the word "bearer".
         let safe = "document bearer abc123";
         assert_eq!(redact_secrets(safe), safe);
+    }
+
+    #[test]
+    fn redacts_basic_authorization_credentials() {
+        let encoded = "dXNlcjp0aGlzLWlzLWEtcGFzc3dvcmQ=";
+        let out = redact_secrets(&format!("Authorization: Basic {encoded}"));
+        assert_eq!(out, "Authorization: Basic [REDACTED:basic-credentials]");
+        assert!(!out.contains(encoded));
     }
 
     #[test]

@@ -23,6 +23,7 @@ const MAX_STORED_TRANSCRIPT_ENTRIES: usize = 128;
 const MAX_OBSERVATION_BYTES: usize = 4 * 1024;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_THOUGHT_BYTES: usize = 4 * 1024;
+const COMMAND_EXECUTION_DIAGNOSTIC_PREFIX: &str = "command execution for proposal #";
 /// Maximum model turns in one task. Construction and snapshot restoration
 /// share this bound so every session created through the public API remains
 /// restorable while persisted data cannot inject an effectively unbounded
@@ -83,6 +84,11 @@ pub enum Turn {
         exit_code: i32,
         output_sample: String,
     },
+    /// A bounded diagnostic from a failed protocol, provider, model,
+    /// transport, or command-execution turn.
+    ///
+    /// The variant name is retained for snapshot compatibility; the contents
+    /// are deliberately broader than JSON parser failures.
     ProtocolError(String),
 }
 
@@ -115,7 +121,7 @@ impl Turn {
                 ..
             } => format!("Output (exit={exit_code}):\n{output_sample}"),
             Self::ProtocolError(message) => {
-                format!("[previous model reply violated the JSON protocol: {message}]")
+                format!("[previous Agent turn failed: {message}]")
             }
         }
     }
@@ -450,6 +456,48 @@ pub struct ApprovedCommand {
     pub danger: Option<&'static str>,
 }
 
+/// Borrowed view of the command proposal currently awaiting user approval.
+///
+/// The view is available only while the session is in
+/// [`AgentState::AwaitingApproval`] and its identifier still binds to the
+/// retained pending transcript entry. Holding the view prevents mutable
+/// session transitions until it is no longer used, so the returned command
+/// cannot become stale through the same borrow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingProposal<'a> {
+    /// Identifier the caller must pass back to an approval or rejection API.
+    pub id: ProposalId,
+    /// Exact command shown on the pending approval card.
+    pub command: &'a str,
+}
+
+/// Why an approved command did not produce a normal process exit status.
+///
+/// This is a command-level outcome, distinct from cancelling the entire
+/// [`AgentSession`] with [`AgentSession::cancel`]. Diagnostic text or partial
+/// output is supplied separately to
+/// [`AgentSession::observe_execution_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandExecutionFailure {
+    /// The integration could not start the process at all.
+    FailedToStart,
+    /// The integration stopped the command after its execution deadline.
+    TimedOut,
+    /// The command was cancelled without cancelling the enclosing Agent task.
+    Cancelled,
+}
+
+impl CommandExecutionFailure {
+    fn prompt_description(self) -> &'static str {
+        match self {
+            Self::FailedToStart => "failed to start",
+            Self::TimedOut => "timed out",
+            Self::Cancelled => "was cancelled",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
@@ -485,6 +533,54 @@ impl AgentSession {
 
     pub fn transcript(&self) -> &[Turn] {
         &self.transcript
+    }
+
+    /// Whether older entries have been removed from this live session by its
+    /// retained-transcript entry or byte budget.
+    ///
+    /// This reports stored transcript compaction. Individual observations and
+    /// the final provider prompt have their own sampling bounds, so callers
+    /// should not interpret `false` as a promise that every original output
+    /// byte will be sent to the model.
+    pub fn transcript_truncated(&self) -> bool {
+        self.transcript_truncated
+    }
+
+    /// Return the exact proposal currently awaiting approval, if any.
+    ///
+    /// The lookup checks both [`AgentState::AwaitingApproval`] and the retained
+    /// proposal's [`ProposalStatus::Pending`] status. It therefore fails closed
+    /// with `None` if an internally inconsistent session could ever reach this
+    /// read-only API. This is useful after restoring a snapshot and redrawing
+    /// the approval card without scanning [`Self::transcript`] manually.
+    ///
+    /// ```
+    /// use jagent::{AgentSession, ModelOutcome};
+    ///
+    /// let mut session = AgentSession::new(4);
+    /// session.submit_user("show files").unwrap();
+    /// let ModelOutcome::Proposal { id, .. } = session
+    ///     .accept_model_reply(r#"{"action":"run","command":"ls"}"#)
+    ///     .unwrap()
+    /// else {
+    ///     panic!("expected a proposal");
+    /// };
+    /// let pending = session.pending_proposal().unwrap();
+    /// assert_eq!(pending.id, id);
+    /// assert_eq!(pending.command, "ls");
+    /// ```
+    pub fn pending_proposal(&self) -> Option<PendingProposal<'_>> {
+        let AgentState::AwaitingApproval { proposal_id } = self.state else {
+            return None;
+        };
+        self.transcript.iter().rev().find_map(|turn| match turn {
+            Turn::AssistantProposed {
+                id,
+                command,
+                status: ProposalStatus::Pending,
+            } if *id == proposal_id => Some(PendingProposal { id: *id, command }),
+            _ => None,
+        })
     }
 
     pub fn state(&self) -> AgentState {
@@ -590,6 +686,23 @@ impl AgentSession {
         self.accept_parsed_action(|| reply.to_action())
     }
 
+    /// Ingest a complete, protocol-aware provider response.
+    ///
+    /// This is the preferred high-level entry point for responses produced by
+    /// [`crate::response::AgentResponse::parse_bytes`] or
+    /// [`crate::response::AgentStream`]. It resolves both text and native-tool
+    /// replies through [`crate::response::AgentResponse::to_action`] and then
+    /// uses the same state transition path as [`Self::accept_model_reply`] and
+    /// [`Self::accept_model_tool_reply`]. In particular, a provider-reported
+    /// token limit fails with [`ParseError::TruncatedResponse`] before even a
+    /// syntactically complete-looking command can become a proposal.
+    pub fn accept_agent_response(
+        &mut self,
+        response: &crate::response::AgentResponse,
+    ) -> Result<ModelOutcome, SessionError> {
+        self.accept_parsed_action(|| response.to_action())
+    }
+
     fn accept_parsed_action(
         &mut self,
         parse: impl FnOnce() -> Result<ParsedAction, ParseError>,
@@ -661,7 +774,18 @@ impl AgentSession {
             return Err(self.invalid_transition("record a model failure"));
         }
         let message = elide_middle(&message.into(), MAX_MESSAGE_BYTES);
-        if let Some(Turn::ProtocolError(previous)) = self.transcript.last_mut() {
+        // Repeated provider attempts replace one another, but a command
+        // execution diagnostic is model context that the next successful
+        // attempt still needs to see.
+        let replace_previous = matches!(
+            self.transcript.last(),
+            Some(Turn::ProtocolError(previous))
+                if !previous.starts_with(COMMAND_EXECUTION_DIAGNOSTIC_PREFIX)
+        );
+        if replace_previous {
+            let Some(Turn::ProtocolError(previous)) = self.transcript.last_mut() else {
+                unreachable!("replace_previous only matches a diagnostic turn")
+            };
             *previous = message;
             self.compact_transcript();
         } else {
@@ -729,19 +853,67 @@ impl AgentSession {
             danger: is_dangerous(command),
             command: command.clone(),
         };
+        // Editing the command and lengthening the rendered status can push a
+        // previously in-budget transcript over its retained byte ceiling.
+        // Compact before exposing a snapshot-capable post-approval state.
+        self.compact_transcript();
         self.state = AgentState::AwaitingObservation { proposal_id: id };
         Ok(approved)
     }
 
+    /// Reject the pending proposal and immediately request an alternative from
+    /// the model. The transcript records the rejection but no additional user
+    /// feedback, preserving the original rejection behavior.
     pub fn reject(&mut self, id: ProposalId) -> Result<(), SessionError> {
+        self.reject_inner(id, None)
+    }
+
+    /// Reject the pending proposal and record bounded user feedback for the
+    /// model's next turn.
+    ///
+    /// Feedback is trimmed and fully validated before the proposal status,
+    /// transcript, or session state is changed. Empty feedback returns
+    /// [`SessionError::EmptyUserMessage`], and feedback above the same bound as
+    /// ordinary user input returns [`SessionError::UserMessageTooLarge`]. On
+    /// either error the pending proposal remains untouched. Accepted feedback
+    /// is retained as a [`Turn::User`] immediately after the rejected proposal
+    /// and does not consume an additional model turn.
+    pub fn reject_with_feedback(
+        &mut self,
+        id: ProposalId,
+        feedback: impl Into<String>,
+    ) -> Result<(), SessionError> {
+        let feedback = feedback.into();
+        let feedback = feedback.trim();
+        if feedback.is_empty() {
+            return Err(SessionError::EmptyUserMessage);
+        }
+        if feedback.len() > MAX_MESSAGE_BYTES {
+            return Err(SessionError::UserMessageTooLarge);
+        }
+        self.reject_inner(id, Some(feedback.to_string()))
+    }
+
+    fn reject_inner(
+        &mut self,
+        id: ProposalId,
+        feedback: Option<String>,
+    ) -> Result<(), SessionError> {
         self.check_not_cancelled()?;
         self.expect_pending_proposal(id, "reject a proposal")?;
-        let turn = self.pending_proposal_mut(id)?;
-        if let Turn::AssistantProposed { status, .. } = turn {
-            *status = ProposalStatus::Rejected;
+        {
+            let turn = self.pending_proposal_mut(id)?;
+            if let Turn::AssistantProposed { status, .. } = turn {
+                *status = ProposalStatus::Rejected;
+            }
         }
-        // Rejection is part of the transcript, so the next model call can
-        // propose an alternative without requiring synthetic user text.
+        // Even a status-only transition changes the rendered transcript size.
+        self.compact_transcript();
+        if let Some(feedback) = feedback {
+            self.push_turn(Turn::User(feedback));
+        }
+        // The rejection status itself asks the next model call for an
+        // alternative. Optional feedback follows it as an ordinary user turn.
         self.state = if self.turns_used >= self.max_turns {
             AgentState::TurnLimitReached
         } else {
@@ -776,6 +948,9 @@ impl AgentSession {
         *command = edited_command;
         *status = ProposalStatus::ManualReview;
         let command = command.clone();
+        // Both the edited command and manual-review verdict can grow the
+        // retained representation without appending a new turn.
+        self.compact_transcript();
         self.state = self.ready_or_limited();
         Ok(command)
     }
@@ -787,26 +962,73 @@ impl AgentSession {
         output: &str,
     ) -> Result<(), SessionError> {
         self.check_not_cancelled()?;
-        match self.state {
-            AgentState::AwaitingObservation { proposal_id } if proposal_id == id => {}
-            AgentState::AwaitingObservation { proposal_id } => {
-                return Err(SessionError::StaleProposal {
-                    expected: proposal_id,
-                    received: id,
-                });
-            }
-            _ => return Err(self.invalid_transition("record command output")),
-        }
+        self.expect_awaiting_observation(id, "record command output")?;
         self.push_turn(Turn::Observation {
             proposal_id: id,
             exit_code,
             output_sample: sample_observation(output),
         });
-        self.state = if self.turns_used >= self.max_turns {
-            AgentState::TurnLimitReached
+        self.finish_observation();
+        Ok(())
+    }
+
+    /// Record that an approved command produced no normal process exit status.
+    ///
+    /// `detail` may contain a spawn error or partial command output. It is
+    /// sampled with the same UTF-8-safe byte bound as a normal observation and
+    /// framed as untrusted diagnostic data in the next model prompt. The
+    /// transition is proposal-id-bound exactly like [`Self::observe`], then
+    /// advances to [`AgentState::AwaitingModel`] or
+    /// [`AgentState::TurnLimitReached`]. No synthetic exit code is invented.
+    ///
+    /// The failure is stored in the existing bounded diagnostic transcript
+    /// representation, preserving the version-1 snapshot schema.
+    ///
+    /// ```
+    /// use jagent::session::CommandExecutionFailure;
+    /// use jagent::{AgentSession, AgentState, ModelOutcome};
+    ///
+    /// let mut session = AgentSession::new(4);
+    /// session.submit_user("run the check").unwrap();
+    /// let ModelOutcome::Proposal { id, .. } = session
+    ///     .accept_model_reply(r#"{"action":"run","command":"check"}"#)
+    ///     .unwrap()
+    /// else {
+    ///     panic!("expected a proposal");
+    /// };
+    /// session.approve(id).unwrap();
+    /// session
+    ///     .observe_execution_failure(
+    ///         id,
+    ///         CommandExecutionFailure::FailedToStart,
+    ///         "executable not found",
+    ///     )
+    ///     .unwrap();
+    /// assert_eq!(session.state(), AgentState::AwaitingModel);
+    /// ```
+    pub fn observe_execution_failure(
+        &mut self,
+        id: ProposalId,
+        failure: CommandExecutionFailure,
+        detail: &str,
+    ) -> Result<(), SessionError> {
+        self.check_not_cancelled()?;
+        self.expect_awaiting_observation(id, "record a command execution failure")?;
+
+        let mut message = format!(
+            "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{} {}; no normal exit status was available",
+            id.get(),
+            failure.prompt_description()
+        );
+        let detail = sample_observation(detail);
+        if detail.trim().is_empty() {
+            message.push('.');
         } else {
-            AgentState::AwaitingModel
-        };
+            message.push_str(". Untrusted diagnostic or partial output:\n");
+            message.push_str(&detail);
+        }
+        self.push_turn(Turn::ProtocolError(message));
+        self.finish_observation();
         Ok(())
     }
 
@@ -882,6 +1104,29 @@ impl AgentSession {
             }),
             _ => Err(self.invalid_transition(operation)),
         }
+    }
+
+    fn expect_awaiting_observation(
+        &self,
+        id: ProposalId,
+        operation: &'static str,
+    ) -> Result<(), SessionError> {
+        match self.state {
+            AgentState::AwaitingObservation { proposal_id } if proposal_id == id => Ok(()),
+            AgentState::AwaitingObservation { proposal_id } => Err(SessionError::StaleProposal {
+                expected: proposal_id,
+                received: id,
+            }),
+            _ => Err(self.invalid_transition(operation)),
+        }
+    }
+
+    fn finish_observation(&mut self) {
+        self.state = if self.turns_used >= self.max_turns {
+            AgentState::TurnLimitReached
+        } else {
+            AgentState::AwaitingModel
+        };
     }
 
     fn push_thought(&mut self, thought: Option<String>) {
@@ -1043,8 +1288,8 @@ impl AgentSession {
         session.compact_transcript();
         if let AgentState::AwaitingObservation { proposal_id } = session.state {
             session.push_turn(Turn::ProtocolError(format!(
-                "the application exited before proposal #{}'s output was \
-                 observed; its result is unknown",
+                "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{} has an unknown result: the application \
+                 exited before its output was observed; no normal exit status was available",
                 proposal_id.get()
             )));
             session.state = session.ready_or_limited();
@@ -2140,6 +2385,7 @@ mod tests {
     #[test]
     fn entry_compaction_keeps_proposal_observation_pairs_restorable() {
         let mut session = AgentSession::new(MAX_SESSION_TURNS);
+        assert!(!session.transcript_truncated());
         session.submit_user("run repeatedly").unwrap();
 
         // One initial user turn plus 64 proposal/observation pairs crosses the
@@ -2151,10 +2397,12 @@ mod tests {
             let _approved = session.approve(id).unwrap();
             session.observe(id, 0, "ok").unwrap();
         }
+        assert!(session.transcript_truncated());
         assert!(session.snapshot().unwrap().transcript_truncated);
 
         let _pending = accept_run_proposal(&mut session, "true");
         let snapshot = session.snapshot().unwrap();
+        assert!(session.transcript_truncated());
         assert!(snapshot.transcript_truncated);
         assert!(snapshot.transcript.len() <= MAX_STORED_TRANSCRIPT_ENTRIES);
         assert!(!matches!(
@@ -2338,6 +2586,58 @@ mod tests {
         AgentSession::restore(decoded).expect("a live session's snapshot must remain restorable");
     }
 
+    fn protocol_error_padding_with_prompt_bytes(mut bytes: usize) -> Vec<Turn> {
+        let overhead = Turn::ProtocolError(String::new()).to_prompt().len();
+        let mut turns = Vec::new();
+        while bytes > 0 {
+            assert!(bytes >= overhead, "padding target must fit one turn");
+            let mut payload_bytes = bytes.saturating_sub(overhead).min(MAX_MESSAGE_BYTES);
+            let remainder = bytes - overhead - payload_bytes;
+            if remainder > 0 && remainder < overhead {
+                // Leave exactly enough for one final diagnostic wrapper rather
+                // than an unrepresentable fragment smaller than its framing.
+                let shifted = overhead - remainder;
+                assert!(payload_bytes >= shifted);
+                payload_bytes -= shifted;
+            }
+            let turn = Turn::ProtocolError("x".repeat(payload_bytes));
+            let cost = turn.to_prompt().len();
+            assert!(cost <= bytes);
+            turns.push(turn);
+            bytes -= cost;
+        }
+        turns
+    }
+
+    fn full_budget_pending_session(command: &str) -> (AgentSession, ProposalId) {
+        let id = ProposalId(1);
+        let proposal = Turn::AssistantProposed {
+            id,
+            command: command.into(),
+            status: ProposalStatus::Pending,
+        };
+        let proposal_bytes = proposal.to_prompt().len();
+        let mut transcript =
+            protocol_error_padding_with_prompt_bytes(MAX_STORED_TRANSCRIPT_BYTES - proposal_bytes);
+        transcript.push(proposal);
+        assert_eq!(
+            stored_transcript_bytes(&transcript),
+            MAX_STORED_TRANSCRIPT_BYTES
+        );
+        let snapshot = AgentSessionSnapshot {
+            version: AGENT_SNAPSHOT_VERSION,
+            transcript,
+            transcript_truncated: false,
+            state: AgentState::AwaitingApproval { proposal_id: id },
+            turns_used: 1,
+            max_turns: 10,
+            next_proposal_id: 2,
+        };
+        let session = AgentSession::restore(snapshot).expect("full-budget fixture is valid");
+        assert!(!session.transcript_truncated());
+        (session, id)
+    }
+
     #[test]
     fn strict_parser_accepts_only_action_specific_schema() {
         assert_eq!(
@@ -2452,6 +2752,143 @@ mod tests {
     }
 
     #[test]
+    fn execution_failures_advance_without_inventing_an_exit_status() {
+        for (failure, description) in [
+            (CommandExecutionFailure::FailedToStart, "failed to start"),
+            (CommandExecutionFailure::TimedOut, "timed out"),
+            (CommandExecutionFailure::Cancelled, "was cancelled"),
+        ] {
+            let mut session = AgentSession::new(4);
+            session.submit_user("inspect").unwrap();
+            let id = accept_run_proposal(&mut session, "long-running-command");
+            let _approved = session.approve(id).unwrap();
+
+            session
+                .observe_execution_failure(id, failure, "partial output")
+                .unwrap();
+            assert_eq!(session.state(), AgentState::AwaitingModel);
+            assert!(matches!(
+                session.transcript().last(),
+                Some(Turn::ProtocolError(message))
+                    if message.contains(description)
+                        && message.contains("no normal exit status")
+                        && message.contains("partial output")
+            ));
+            let prompt = session.build_user_prompt();
+            assert!(prompt.contains("previous Agent turn failed"));
+            assert!(prompt.contains("no normal exit status was available"));
+            assert!(!prompt.contains("Output (exit="));
+            assert_snapshot_roundtrips(&session);
+        }
+    }
+
+    #[test]
+    fn execution_failure_detail_is_bounded_utf8_safe_and_untrusted() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "slow-command");
+        let _approved = session.approve(id).unwrap();
+
+        let detail = "部分输出🙂".repeat(MAX_OBSERVATION_BYTES);
+        session
+            .observe_execution_failure(id, CommandExecutionFailure::TimedOut, &detail)
+            .unwrap();
+        let Some(Turn::ProtocolError(message)) = session.transcript().last() else {
+            panic!("execution failure must be retained as a bounded diagnostic");
+        };
+        assert!(message.contains("Untrusted diagnostic or partial output"));
+        assert!(message.contains("bytes elided"));
+        assert!(message.len() <= MAX_MESSAGE_BYTES);
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn execution_failure_is_proposal_bound_and_atomic_on_error() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "pwd");
+        let _approved = session.approve(id).unwrap();
+        let state_before = session.state();
+        let transcript_before = session.transcript().to_vec();
+        let stale = ProposalId(id.get() + 1);
+
+        assert_eq!(
+            session.observe_execution_failure(
+                stale,
+                CommandExecutionFailure::FailedToStart,
+                "not found",
+            ),
+            Err(SessionError::StaleProposal {
+                expected: id,
+                received: stale,
+            })
+        );
+        assert_eq!(session.state(), state_before);
+        assert_eq!(session.transcript(), transcript_before);
+
+        session
+            .observe_execution_failure(id, CommandExecutionFailure::FailedToStart, "not found")
+            .unwrap();
+        assert!(matches!(
+            session.observe_execution_failure(id, CommandExecutionFailure::Cancelled, ""),
+            Err(SessionError::InvalidTransition { .. })
+        ));
+    }
+
+    #[test]
+    fn model_transport_failure_does_not_erase_execution_failure_context() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "missing-command");
+        let _approved = session.approve(id).unwrap();
+        session
+            .observe_execution_failure(
+                id,
+                CommandExecutionFailure::FailedToStart,
+                "executable not found",
+            )
+            .unwrap();
+
+        session.model_failed("provider unavailable").unwrap();
+        assert_eq!(session.state(), AgentState::Ready);
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("no normal exit status was available"));
+        assert!(prompt.contains("provider unavailable"));
+        assert!(session.can_retry_model());
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn pending_proposal_is_a_state_bound_borrowed_view() {
+        let mut session = AgentSession::new(4);
+        assert_eq!(session.pending_proposal(), None);
+
+        session.submit_user("show files").unwrap();
+        assert_eq!(session.pending_proposal(), None);
+        let id = accept_run_proposal(&mut session, "ls -la");
+        assert_eq!(
+            session.pending_proposal(),
+            Some(PendingProposal {
+                id,
+                command: "ls -la",
+            })
+        );
+
+        let snapshot = session.snapshot().unwrap();
+        let restored = AgentSession::restore(snapshot).unwrap();
+        assert_eq!(
+            restored.pending_proposal(),
+            Some(PendingProposal {
+                id,
+                command: "ls -la",
+            })
+        );
+
+        session.reject(id).unwrap();
+        assert_eq!(session.pending_proposal(), None);
+    }
+
+    #[test]
     fn edit_and_approve_returns_only_edited_command() {
         let mut session = AgentSession::new(3);
         session.submit_user("inspect").unwrap();
@@ -2508,6 +2945,37 @@ mod tests {
     }
 
     #[test]
+    fn in_place_proposal_transitions_recompact_before_snapshotting() {
+        let (mut approved, approved_id) = full_budget_pending_session("true");
+        let _approved_command = approved.approve(approved_id).unwrap();
+        assert!(approved.transcript_truncated());
+        assert!(stored_transcript_bytes(approved.transcript()) <= MAX_STORED_TRANSCRIPT_BYTES);
+        assert_snapshot_roundtrips(&approved);
+
+        let (mut edited, edited_id) = full_budget_pending_session("true");
+        let _edited_command = edited
+            .edit_and_approve(edited_id, "x".repeat(MAX_COMMAND_BYTES))
+            .unwrap();
+        assert!(edited.transcript_truncated());
+        assert!(stored_transcript_bytes(edited.transcript()) <= MAX_STORED_TRANSCRIPT_BYTES);
+        assert_snapshot_roundtrips(&edited);
+
+        let (mut rejected, rejected_id) = full_budget_pending_session("true");
+        rejected.reject(rejected_id).unwrap();
+        assert!(rejected.transcript_truncated());
+        assert!(stored_transcript_bytes(rejected.transcript()) <= MAX_STORED_TRANSCRIPT_BYTES);
+        assert_snapshot_roundtrips(&rejected);
+
+        let (mut manual, manual_id) = full_budget_pending_session("true");
+        manual
+            .edit_for_manual_review(manual_id, "x".repeat(MAX_COMMAND_BYTES))
+            .unwrap();
+        assert!(manual.transcript_truncated());
+        assert!(stored_transcript_bytes(manual.transcript()) <= MAX_STORED_TRANSCRIPT_BYTES);
+        assert_snapshot_roundtrips(&manual);
+    }
+
+    #[test]
     fn rejection_is_recorded_and_requests_an_alternative() {
         let mut session = AgentSession::new(3);
         session.submit_user("inspect").unwrap();
@@ -2519,7 +2987,82 @@ mod tests {
         session.reject(id).unwrap();
         assert_eq!(session.state(), AgentState::AwaitingModel);
         assert!(session.build_user_prompt().contains("user rejected"));
+        assert!(matches!(
+            session.transcript().last(),
+            Some(Turn::AssistantProposed {
+                status: ProposalStatus::Rejected,
+                ..
+            })
+        ));
+        assert_eq!(session.pending_proposal(), None);
         assert!(session.approve(id).is_err());
+    }
+
+    #[test]
+    fn rejection_feedback_is_validated_atomically_and_sent_to_the_model() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "find /");
+        let state_before = session.state();
+        let transcript_before = session.transcript().to_vec();
+
+        assert_eq!(
+            session.reject_with_feedback(id, " \n\t "),
+            Err(SessionError::EmptyUserMessage)
+        );
+        assert_eq!(session.state(), state_before);
+        assert_eq!(session.transcript(), transcript_before);
+
+        assert_eq!(
+            session.reject_with_feedback(id, "x".repeat(MAX_MESSAGE_BYTES + 1)),
+            Err(SessionError::UserMessageTooLarge)
+        );
+        assert_eq!(session.state(), state_before);
+        assert_eq!(session.transcript(), transcript_before);
+        assert_eq!(
+            session.pending_proposal(),
+            Some(PendingProposal {
+                id,
+                command: "find /",
+            })
+        );
+
+        session
+            .reject_with_feedback(id, "  stay inside the repository  ")
+            .unwrap();
+        assert_eq!(session.state(), AgentState::AwaitingModel);
+        assert!(matches!(
+            session.transcript().get(session.transcript().len() - 2),
+            Some(Turn::AssistantProposed {
+                status: ProposalStatus::Rejected,
+                ..
+            })
+        ));
+        assert_eq!(
+            session.transcript().last(),
+            Some(&Turn::User("stay inside the repository".into()))
+        );
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("user rejected"));
+        assert!(prompt.contains("User: stay inside the repository"));
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn invalid_rejection_feedback_is_checked_before_proposal_identity() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "pwd");
+        let stale = ProposalId(id.get() + 1);
+
+        assert_eq!(
+            session.reject_with_feedback(stale, ""),
+            Err(SessionError::EmptyUserMessage)
+        );
+        assert_eq!(
+            session.pending_proposal(),
+            Some(PendingProposal { id, command: "pwd" })
+        );
     }
 
     #[test]
@@ -2594,6 +3137,9 @@ mod tests {
             .transcript()
             .iter()
             .any(|turn| matches!(turn, Turn::AssistantProposed { .. })));
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("previous Agent turn failed"));
+        assert!(!prompt.contains("violated the JSON protocol"));
     }
 
     #[test]
@@ -2602,6 +3148,10 @@ mod tests {
         session.submit_user("inspect").unwrap();
         session.model_failed("temporary network error").unwrap();
         assert!(session.can_retry_model());
+        let prompt = session.build_user_prompt();
+        assert!(prompt.contains("previous Agent turn failed"));
+        assert!(prompt.contains("temporary network error"));
+        assert!(!prompt.contains("violated the JSON protocol"));
         let transcript_len = session.transcript().len();
 
         session.retry_model().unwrap();
@@ -2789,6 +3339,27 @@ mod tests {
     }
 
     #[test]
+    fn turn_cap_allows_final_execution_failure_then_seals() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("run once").unwrap();
+        let id = accept_run_proposal(&mut session, "missing-command");
+        let _approved = session.approve(id).unwrap();
+        session
+            .observe_execution_failure(
+                id,
+                CommandExecutionFailure::FailedToStart,
+                "executable was not found",
+            )
+            .unwrap();
+
+        assert_eq!(session.state(), AgentState::TurnLimitReached);
+        assert!(session
+            .build_user_prompt()
+            .contains("no normal exit status was available"));
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
     fn cancellation_token_and_state_are_immediate() {
         let mut session = AgentSession::new(3);
         let token = session.cancellation_token();
@@ -2811,6 +3382,57 @@ mod tests {
                 arguments: arguments.into(),
             }],
         )
+    }
+
+    #[test]
+    fn protocol_aware_text_token_limit_never_becomes_a_proposal() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let response = crate::response::AgentResponse::Text(crate::provider::ChatResponse {
+            // This deliberately looks complete: completeness comes from the
+            // provider stop reason, not from successfully parsing the bytes.
+            text: run_reply("rm -rf important-data"),
+            reached_token_limit: true,
+            usage: Some(crate::provider::Usage {
+                input_tokens: Some(10),
+                output_tokens: Some(20),
+            }),
+        });
+
+        assert_eq!(
+            session.accept_agent_response(&response),
+            Err(SessionError::Protocol(ParseError::TruncatedResponse))
+        );
+        assert_eq!(session.state(), AgentState::Ready);
+        assert!(session.can_retry_model());
+        assert!(!session
+            .transcript()
+            .iter()
+            .any(|turn| matches!(turn, Turn::AssistantProposed { .. })));
+    }
+
+    #[test]
+    fn protocol_aware_native_response_matches_the_legacy_ingestion_path() {
+        let reply = ToolResponse::new(
+            "Inspecting first.",
+            vec![crate::tools::ToolCall {
+                id: "toolu_1".into(),
+                name: "run".into(),
+                arguments: r#"{"command":"ls -la"}"#.into(),
+            }],
+        );
+        let response = crate::response::AgentResponse::NativeTools(reply.clone());
+        let mut direct = AgentSession::new(4);
+        let mut protocol_aware = AgentSession::new(4);
+        direct.submit_user("show files").unwrap();
+        protocol_aware.submit_user("show files").unwrap();
+
+        let direct_outcome = direct.accept_model_tool_reply(&reply).unwrap();
+        let protocol_aware_outcome = protocol_aware.accept_agent_response(&response).unwrap();
+        assert_eq!(protocol_aware_outcome, direct_outcome);
+        assert_eq!(protocol_aware.state(), direct.state());
+        assert_eq!(protocol_aware.turns_used(), direct.turns_used());
+        assert_eq!(protocol_aware.transcript(), direct.transcript());
     }
 
     #[test]

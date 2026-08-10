@@ -1,63 +1,149 @@
 # Engineering handoff
 
-Updated: 2026-08-08
+Updated: 2026-08-10
+Release target: 0.7.0
 
-The current baseline hardens provider parsing, streamed responses, native tool calls,
-approval binding, task resets, transcript retention, and snapshot validation. It now
-also decodes agent snapshots under their own allocation budgets and enforces provider
-configuration and request budgets at the public API boundary. The full all-feature
-test suite and strict Clippy gate pass at this handoff.
+Version 0.7 adds an integration-first path over the hardened 0.6 primitives.
+The low-level provider, tool, stream, and session APIs remain available, while
+new integrations can bind request preparation, response decoding, and session
+ingestion to one `AgentProtocol` and receive machine-readable history
+transformation reports.
 
-## Completed since the previous handoff
+## 0.7 release surface
 
-- `AgentSessionSnapshot` no longer implements `Deserialize`. `from_json` decodes
-  through `DeserializeSeed`/`Visitor` implementations that refuse the 129th
-  transcript entry before constructing it, reject unknown and duplicate fields,
-  charge per-field and cumulative text budgets while decoding, and reject trailing
-  content. The schema and the `AgentSnapshotError` categories are unchanged, and
-  `restore` keeps its semantic audit for hand-built snapshots.
-- `ChatConfig::validate` bounds model and base-URL lengths and rejects URL userinfo,
-  query, fragment, backslash, whitespace, control, and visually ambiguous characters.
-  HTTPS is required except for a loopback Ollama endpoint.
-- The public request builders bound history themselves (`bound_history` is
-  idempotent, so a caller that already prepared its history sends the same bytes)
-  and reject an over-budget system prompt rather than eliding safety instructions.
-  The four `*_with_report` entry points return `BuiltRequest`, preserving how
-  many turns that build omitted; compatibility entry points delegate to the
-  same one-pass implementation and return byte-identical `HttpRequest` values.
-- `parse_chat_response_bytes` is a bounded, byte-oriented response entry point.
-- The 0.6 public wire boundary is explicit: the string-owning `Turn`, `Message`,
-  and `BlockContext` values are serialize-only, while allocation-free scalar
-  schema atoms retain `Deserialize`. Read-only `AgentSessionSnapshot` accessors
-  let integrations audit a bounded decoded snapshot without re-serializing and
-  decoding its transcript through an ordinary `Vec<Turn>`.
-- `parse_chat_response_full_bytes` and `parse_tool_response_bytes` extend the
-  shared 1 MiB pre-allocation envelope gate to structured chat metadata and
-  native tool replies. Their `Value` counterparts remain available only for
-  trusted or already-bounded caller-owned values.
-- `StreamParser` now enforces an 8 MiB raw-response ceiling and a 4,096-frame
-  ceiling itself, alongside its existing line/frame, delivered-text,
-  tool-argument, and call budgets. Tiny ignored frames and keep-alive floods
-  therefore cannot turn the public sans-IO parser into an unbounded CPU or
-  temporary-allocation path.
+### Recommended agent loop
 
-## Remaining boundaries
+- `AgentRequestSpec::new(history, protocol)` selects the protocol-matched
+  built-in system prompt, non-streaming delivery, and high-confidence secret
+  redaction by default.
+- `prepare_agent_request` returns `PreparedAgentRequest { request, report }`.
+  The report distinguishes changed, middle-elided, and fully omitted history
+  turns without retaining sensitive contents. The prepared value also retains
+  the provider, protocol, and delivery mode used to build the wire request.
+- `PreparedAgentRequest::parse_response` performs one bounded JSON decode and
+  selects `ChatResponse` or `ToolResponse` according to the bound protocol.
+  Text mode rejects native calls instead of discarding them.
+- `AgentSession::accept_agent_response` is the paired high-level ingestion
+  point. Token-limited output and protocol mismatches never become actions.
+- `PreparedAgentRequest::response_stream` creates the correctly paired
+  `AgentStream`, which transparently returns low-level `StreamEvent`s while
+  folding a response internally. Conversion succeeds only after `Done`;
+  protocol error, premature EOF, and Text-mode tool calls fail closed.
+- Delivery mismatch is rejected: non-streaming requests use `parse_response`,
+  while streaming requests use `response_stream`.
+- Anthropic, OpenAI-compatible Chat Completions, and Ollama `/api/chat` all
+  support Text, NativeTools, and streaming through the high-level path.
+  Ollama uses OpenAI-shaped tools without a `tool_choice` field.
 
-### Keep transport metadata bounded around streaming
+The executable `examples/quickstart.rs` exercises the complete path without
+network or process I/O. It uses an OpenAI-compatible loopback endpoint, proves
+default redaction and report accounting, decodes a local response fixture,
+and explicitly walks proposal, approval, and observation transitions.
 
-`StreamParser` now bounds the raw body and decoded frame count itself, but it is
-sans-IO: response header counts, cumulative header bytes, connection deadlines,
-redirect policy, and socket cancellation remain the integration's responsibility.
-Keep those transport limits aligned across jsh, jterm_core, and Forge.
+### Session review lifecycle
 
-## Release checks
+- `pending_proposal()` exposes a borrowed, state-bound view of the proposal a
+  review UI should currently display.
+- `reject_with_feedback` validates feedback atomically and records it as the
+  next untrusted user turn.
+- `observe_execution_failure` records failed start, timeout, or cancellation
+  without inventing an exit code; diagnostic/partial output is sampled under
+  the observation budget.
+- `transcript_truncated()` exposes whether in-memory compaction removed older
+  activity. In-place approval, edit, rejection, and manual-review mutations
+  recompact before a snapshot can be captured.
+- The persisted `ProtocolError` variant retains snapshot compatibility but is
+  now framed as a general failed-turn diagnostic rather than falsely claiming
+  every transport or execution failure violated JSON.
 
-Run before the next release:
+### Provider and context preparation
+
+- `HistoryReport` and `PreparedHistory` expose input, sent, omitted, changed,
+  elided, and retained-text-byte counts.
+- `redact_secrets_cow` borrows clean input; `redact_secrets` remains the owned
+  compatibility wrapper.
+- `HttpRequest::Debug` reports body length instead of logging AI-bound user
+  context. Credential headers remain redacted.
+- Plain HTTP is accepted for syntactic loopback endpoints for every provider,
+  enabling local OpenAI-compatible servers and proxies. Remote endpoints still
+  require HTTPS; URL whitespace, invalid ports, credentials, query, fragment,
+  backslash, control, and ambiguous display characters are rejected.
+
+## Compatibility contract
+
+The high-level path is additive:
+
+- Existing `build_chat_request*`, `build_agent_chat_request*`,
+  `parse_chat_response*`, `parse_tool_response*`, and `StreamParser` APIs stay
+  available.
+- `AgentResponse::parse_bytes` and `AgentStream::new` remain low-level options
+  for integrations that intentionally pair provider, protocol, and delivery
+  mode themselves.
+- Existing request builders continue to apply their own safety bounds.
+  Compatibility builders returning `HttpRequest` still discard their limited
+  omission report; integrations wanting history preparation diagnostics
+  should move to `prepare_agent_request`.
+- `bound_history` and `bound_history_with` retain their tuple results. New
+  report-bearing variants expose preparation and elision separately.
+- `accept_model_reply` and `accept_model_tool_reply` remain valid for callers
+  that intentionally coordinate the protocol themselves.
+- Snapshot version 1 and its bounded decoder remain unchanged. New session
+  behavior is represented within the existing validated schema.
+
+See [docs/jterm4-migration.md](docs/jterm4-migration.md) for ownership and
+consumer migration details.
+
+## Security properties to preserve
+
+1. A model response can create only a proposal. Execution requires the exact
+   `ApprovedCommand` returned for the currently pending proposal ID.
+2. Text, native-tool, non-streaming, and streaming response paths all reject
+   truncation or protocol mismatch before action conversion.
+3. Secret redaction is a conservative outbound safeguard, not a substitute
+   for transport security or integration-owned DLP policy.
+4. Debug formatting must not create a second sink for API credentials or
+   request bodies.
+5. Provider response bytes, streaming bodies/frames, histories, prompts,
+   transcript fields, observations, tool identifiers, and arguments remain
+   independently bounded.
+6. Restore continues to validate proposal ordering, lifecycle, observation
+   binding, active state, and transcript budgets before making a session live.
+
+## Remaining integration boundaries
+
+`jagent` remains sans-IO. Consumers own:
+
+- HTTP header/count limits, TLS policy, redirects, deadlines, cancellation,
+  and response status handling;
+- API-key acquisition and storage;
+- PTY/process creation, shell semantics, execution timeout, and output capture;
+- the approval UI and deliberate execution of `ApprovedCommand`;
+- snapshot storage permissions, replacement, and lifecycle.
+
+Do not process a raw streamed `ToolCall` as authorization. Fold the complete
+stream, ingest the resulting `AgentResponse`, display the resulting proposal,
+and require explicit approval.
+
+## Release checklist
+
+Before tagging 0.7.0:
+
+1. Ensure the root package entry in `Cargo.lock` is also `0.7.0`.
+2. Run the no-I/O example and the locked stable-toolchain gates.
+3. Verify the packaged crate contains README, changelog, both license files,
+   migration notes, and the quickstart example.
 
 ```text
 cargo fmt --all -- --check
+cargo run --locked --example quickstart
+cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features --no-fail-fast
-cargo test --locked --doc
+cargo test --locked --all-features --doc
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo doc --locked --all-features --no-deps
+cargo package --locked --allow-dirty
 ```
+
+The quickstart intentionally sends nothing. A successful run proves request
+construction, secure-default reporting, bounded local response parsing, and
+the explicit review transitions only.

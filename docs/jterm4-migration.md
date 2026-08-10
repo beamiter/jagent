@@ -84,5 +84,5 @@ entry points.
    `jagent`.
 4. Present every command proposal for review and execute only the
    `ApprovedCommand` returned by an explicit approval action.
-5. Exercise both the integration's tests and jagent's Rust 1.86 locked
+5. Exercise both the integration's tests and jagent's locked stable-toolchain
    check/test gate before updating a pinned dependency revision.

@@ -16,8 +16,9 @@
 //!   `choices[0].delta.content` and `finish_reason`, plus an optional usage
 //!   frame; `data: [DONE]` terminates.
 //! - **Ollama** `/api/chat` NDJSON: one JSON object per line with
-//!   `message.content` deltas; the `"done": true` frame carries `done_reason`
-//!   and token counts and terminates.
+//!   `message.content` deltas and complete `message.tool_calls[]` entries; the
+//!   `"done": true` frame carries `done_reason` and token counts and
+//!   terminates.
 //!
 //! Semantics match [`crate::provider::parse_chat_response_full`]: the
 //! concatenated [`StreamEvent::TextDelta`]s equal the text it would extract
@@ -43,13 +44,14 @@
 //! JSON, which is valid UTF-8 by definition, so lossy replacement characters
 //! could only ever corrupt model text.
 
-use crate::provider::{Provider, Usage, MAX_MODEL_TEXT_BYTES};
+use crate::provider::{Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES};
 use crate::text::elide_middle;
 use crate::tools::{
-    ToolCall, MAX_STREAM_TOOL_CALLS, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_ID_BYTES,
-    MAX_TOOL_NAME_BYTES,
+    serialize_tool_arguments, ToolCall, MAX_STREAM_TOOL_CALLS, MAX_TOOL_ARGUMENTS_BYTES,
+    MAX_TOOL_ID_BYTES, MAX_TOOL_NAME_BYTES,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Detail quoted from provider-reported stream errors is elided to this many
 /// bytes before being embedded in a [`StreamEvent::Protocol`] message.
@@ -90,11 +92,13 @@ pub enum StreamEvent {
     /// Anthropic's `tool_use` block must first reach `content_block_stop`, and
     /// the enclosing response must then complete (`message_stop`, or EOF after
     /// an explicit stop reason); OpenAI-compatible calls are finalized at the
-    /// response completion marker. Calls are
-    /// emitted in the order they were opened, always immediately before
-    /// [`StreamEvent::Usage`] and [`StreamEvent::Done`]. A later malformed or
-    /// truncated frame therefore cannot leave an already-published call for a
-    /// caller to act on. The value is identical in shape to what
+    /// response completion marker. Ollama sends complete calls rather than
+    /// fragments, but they likewise remain private until its `"done": true`
+    /// frame. Calls are emitted in the order they were opened, always
+    /// immediately before [`StreamEvent::Usage`] and [`StreamEvent::Done`]. A
+    /// later malformed or truncated frame therefore cannot leave an
+    /// already-published call for a caller to act on. The value is identical
+    /// in shape to what
     /// [`crate::tools::parse_tool_response`] extracts from the equivalent
     /// non-streaming reply, so
     /// [`crate::tools::ToolResponse::to_action`] applies unchanged.
@@ -120,6 +124,51 @@ enum Phase {
     Failed,
 }
 
+/// Provider block type retained for the lifetime of one Anthropic response.
+/// Known delta kinds are accepted only for the block type that owns them;
+/// unknown block/delta pairs remain forward-compatible without allowing a
+/// known text/tool/thinking delta to be rebound to the wrong kind of block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicBlockKind {
+    Text,
+    ToolUse,
+    Thinking,
+    Other,
+}
+
+impl AnthropicBlockKind {
+    fn accepts_delta(self, delta_type: &str) -> bool {
+        match self {
+            Self::Text => matches!(delta_type, "text_delta" | "citations_delta"),
+            Self::ToolUse => delta_type == "input_json_delta",
+            Self::Thinking => matches!(delta_type, "thinking_delta" | "signature_delta"),
+            Self::Other => !matches!(
+                delta_type,
+                "text_delta"
+                    | "citations_delta"
+                    | "input_json_delta"
+                    | "thinking_delta"
+                    | "signature_delta"
+            ),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::ToolUse => "tool_use",
+            Self::Thinking => "thinking",
+            Self::Other => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AnthropicBlockState {
+    kind: AnthropicBlockKind,
+    open: bool,
+}
+
 /// Push parser for one streaming chat response body. See the module
 /// documentation for wire formats, bounds, and failure semantics.
 #[derive(Debug)]
@@ -141,6 +190,10 @@ pub struct StreamParser {
     /// Anthropic only: a text content block was opened; a later one is
     /// joined with `"\n"` to match the non-streaming extraction.
     saw_text_block: bool,
+    /// Anthropic content-block indexes are response-wide identities. Retain
+    /// closed entries too, so an index cannot be reused after its first block
+    /// closes and a delta/stop cannot be rebound to a different block kind.
+    anthropic_blocks: HashMap<u64, AnthropicBlockState>,
     /// The provider signaled end-of-message (`stop_reason`/`finish_reason`)
     /// even if its closing sentinel frame has not arrived yet.
     saw_message_end: bool,
@@ -148,7 +201,8 @@ pub struct StreamParser {
     usage: Usage,
     /// Tool calls still accumulating, in the order they were opened. Keyed by
     /// the provider's own index (Anthropic content-block index, OpenAI
-    /// `tool_calls[].index`).
+    /// `tool_calls[].index`) or an internal response-wide ordinal (Ollama,
+    /// whose complete calls need no fragment correlation).
     pending_tools: Vec<PendingToolCall>,
     /// Calls whose provider-specific block is closed but whose enclosing
     /// response has not completed yet. Holding these back makes publication
@@ -180,6 +234,7 @@ impl StreamParser {
             delivered_text_bytes: 0,
             saw_non_whitespace_text: false,
             saw_text_block: false,
+            anthropic_blocks: HashMap::new(),
             saw_message_end: false,
             reached_token_limit: false,
             usage: Usage::default(),
@@ -338,80 +393,122 @@ impl StreamParser {
                 );
             }
             "content_block_start" => {
-                let block = frame.get("content_block");
-                let block_type = block
-                    .and_then(|block| block.get("type"))
-                    .and_then(Value::as_str);
-                if block_type == Some("tool_use") {
-                    // `input` in this frame is always `{}`; the arguments
-                    // arrive as input_json_delta fragments.
-                    let name = block
-                        .and_then(|block| block.get("name"))
-                        .and_then(Value::as_str);
+                let Some(index) = block_index(&frame) else {
+                    self.fail("content_block_start carries no valid index", events);
+                    return;
+                };
+                let Some(block) = frame.get("content_block").and_then(Value::as_object) else {
+                    self.fail("content_block_start carries no content block", events);
+                    return;
+                };
+                let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+                    self.fail("content_block_start carries no block type", events);
+                    return;
+                };
+                let block_kind = match block_type {
+                    "text" => AnthropicBlockKind::Text,
+                    "tool_use" => AnthropicBlockKind::ToolUse,
+                    "thinking" => AnthropicBlockKind::Thinking,
+                    _ => AnthropicBlockKind::Other,
+                };
+                if block_kind == AnthropicBlockKind::ToolUse {
+                    let name = block.get("name").and_then(Value::as_str);
                     let Some(name) = name else {
                         self.fail("tool_use block carries no name", events);
                         return;
                     };
-                    let id = block
-                        .and_then(|block| block.get("id"))
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    let Some(index) = block_index(&frame) else {
-                        self.fail("tool_use block carries no valid index", events);
-                        return;
+                    let id = match block.get("id") {
+                        None | Some(Value::Null) => "",
+                        Some(Value::String(id)) => id,
+                        Some(_) => {
+                            self.fail("tool call id is not a string", events);
+                            return;
+                        }
                     };
+                    // `input` in this frame is the required empty-object
+                    // placeholder; the arguments arrive only as
+                    // input_json_delta fragments.
+                    if !block
+                        .get("input")
+                        .and_then(Value::as_object)
+                        .is_some_and(serde_json::Map::is_empty)
+                    {
+                        self.fail("tool_use block input is not an empty object", events);
+                        return;
+                    }
+                    if !self.open_anthropic_block(index, block_kind, events) {
+                        return;
+                    }
                     self.open_tool_call(index, id, name, events);
                     return;
                 }
-                if block_type == Some("text") {
+                if !self.open_anthropic_block(index, block_kind, events) {
+                    return;
+                }
+                if block_kind == AnthropicBlockKind::Text {
                     if self.saw_text_block {
                         // parse_chat_response_full joins multiple text blocks
                         // with "\n"; mirror it so accumulation matches.
                         self.deliver_text("\n", events);
                     }
                     self.saw_text_block = true;
-                    if let Some(text) = block
-                        .and_then(|block| block.get("text"))
-                        .and_then(Value::as_str)
-                    {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
                         self.deliver_text(text, events);
                     }
                 }
             }
             "content_block_delta" => {
-                let delta = frame.get("delta");
-                let delta_type = delta
-                    .and_then(|delta| delta.get("type"))
-                    .and_then(Value::as_str);
-                if delta_type == Some("text_delta") {
-                    match delta
-                        .and_then(|delta| delta.get("text"))
-                        .and_then(Value::as_str)
-                    {
-                        Some(text) => self.deliver_text(text, events),
-                        None => self.fail("text_delta frame carries no text", events),
+                let Some(delta) = frame.get("delta").and_then(Value::as_object) else {
+                    self.fail("content_block_delta carries no delta object", events);
+                    return;
+                };
+                let Some(delta_type) = delta.get("type").and_then(Value::as_str) else {
+                    self.fail("content_block_delta carries no delta type", events);
+                    return;
+                };
+                // Validate required payload fields before lifecycle lookup so
+                // malformed known deltas retain their precise diagnostics.
+                let payload = match delta_type {
+                    "text_delta" => match delta.get("text").and_then(Value::as_str) {
+                        Some(text) => Some(text),
+                        None => {
+                            self.fail("text_delta frame carries no text", events);
+                            return;
+                        }
+                    },
+                    "input_json_delta" => match delta.get("partial_json").and_then(Value::as_str) {
+                        Some(fragment) => Some(fragment),
+                        None => {
+                            self.fail("input_json_delta frame carries no partial_json", events);
+                            return;
+                        }
+                    },
+                    _ => None,
+                };
+                let Some(index) = block_index(&frame) else {
+                    self.fail("content_block_delta carries no valid index", events);
+                    return;
+                };
+                if !self.match_anthropic_delta(index, delta_type, events) {
+                    return;
+                }
+                match (delta_type, payload) {
+                    ("text_delta", Some(text)) => self.deliver_text(text, events),
+                    ("input_json_delta", Some(fragment)) => {
+                        self.extend_tool_call(index, fragment, events)
                     }
-                } else if delta_type == Some("input_json_delta") {
-                    match delta
-                        .and_then(|delta| delta.get("partial_json"))
-                        .and_then(Value::as_str)
-                    {
-                        Some(fragment) => match block_index(&frame) {
-                            Some(index) => self.extend_tool_call(index, fragment, events),
-                            None => {
-                                self.fail("tool-call argument delta carries no valid index", events)
-                            }
-                        },
-                        None => self.fail("input_json_delta frame carries no partial_json", events),
-                    }
+                    _ => {}
                 }
                 // thinking deltas are non-text content; the non-streaming
                 // parser ignores those blocks as well.
             }
-            "content_block_stop" => match block_index(&frame) {
-                Some(index) => self.close_tool_call(index),
-                None => self.fail("content_block_stop carries no valid index", events),
-            },
+            "content_block_stop" => {
+                let Some(index) = block_index(&frame) else {
+                    self.fail("content_block_stop carries no valid index", events);
+                    return;
+                };
+                self.close_anthropic_block(index, events);
+            }
             "message_delta" => {
                 self.merge_usage(frame.get("usage"), "input_tokens", "output_tokens");
                 if let Some(stop_reason) =
@@ -440,6 +537,98 @@ impl StreamParser {
             // ping and future event types carry no text, stop reason, usage,
             // or tool call.
             _ => {}
+        }
+    }
+
+    /// Register one Anthropic content block before any text or tool state is
+    /// mutated. Indexes are response-wide identities: both a duplicate open
+    /// and reuse after close are protocol failures.
+    fn open_anthropic_block(
+        &mut self,
+        index: u64,
+        kind: AnthropicBlockKind,
+        events: &mut Vec<StreamEvent>,
+    ) -> bool {
+        if let Some(previous) = self.anthropic_blocks.get(&index).copied() {
+            let message = if previous.kind == AnthropicBlockKind::ToolUse
+                && kind == AnthropicBlockKind::ToolUse
+            {
+                // Preserve the established diagnostic for the tool-only case.
+                "stream reused a tool-call index"
+            } else {
+                "Anthropic stream reused a content-block index"
+            };
+            self.fail(message, events);
+            return false;
+        }
+        self.anthropic_blocks
+            .insert(index, AnthropicBlockState { kind, open: true });
+        true
+    }
+
+    /// Require a delta to identify one currently-open block and to carry a
+    /// delta kind owned by that block type. This prevents, for example, a text
+    /// block from receiving tool arguments or a duplicate text start from
+    /// later closing an already-open tool call at the same index.
+    fn match_anthropic_delta(
+        &mut self,
+        index: u64,
+        delta_type: &str,
+        events: &mut Vec<StreamEvent>,
+    ) -> bool {
+        let Some(state) = self.anthropic_blocks.get(&index).copied() else {
+            let message = if delta_type == "input_json_delta" {
+                "tool-call arguments arrived for an unopened tool call".to_string()
+            } else {
+                "Anthropic content-block delta references an unopened block".to_string()
+            };
+            self.fail(&message, events);
+            return false;
+        };
+        if !state.open {
+            self.fail(
+                "Anthropic content-block delta arrived after its block closed",
+                events,
+            );
+            return false;
+        }
+        if !state.kind.accepts_delta(delta_type) {
+            self.fail(
+                &format!(
+                    "Anthropic {delta_type} does not match the open {} block",
+                    state.kind.label()
+                ),
+                events,
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Close exactly the block that opened this index. Unknown and repeated
+    /// stops fail closed; only a matched tool block moves its private call into
+    /// the completed-but-not-yet-published collection.
+    fn close_anthropic_block(&mut self, index: u64, events: &mut Vec<StreamEvent>) {
+        let kind = {
+            let Some(state) = self.anthropic_blocks.get_mut(&index) else {
+                self.fail(
+                    "Anthropic content_block_stop references an unopened block",
+                    events,
+                );
+                return;
+            };
+            if !state.open {
+                self.fail(
+                    "Anthropic content_block_stop repeated for a closed block",
+                    events,
+                );
+                return;
+            }
+            state.open = false;
+            state.kind
+        };
+        if kind == AnthropicBlockKind::ToolUse {
+            self.close_tool_call(index);
         }
     }
 
@@ -553,12 +742,114 @@ impl StreamParser {
                 return;
             }
         }
+        match frame.pointer("/message/tool_calls") {
+            Some(Value::Array(entries)) => {
+                for entry in entries {
+                    self.append_ollama_tool_call(entry, events);
+                    if self.phase != Phase::Streaming {
+                        return;
+                    }
+                }
+            }
+            Some(Value::Null) | None => {}
+            Some(_) => {
+                self.fail("Ollama message tool_calls is not an array", events);
+                return;
+            }
+        }
         if frame.get("done").and_then(Value::as_bool) == Some(true) {
             if frame.get("done_reason").and_then(Value::as_str) == Some("length") {
                 self.emit_token_limit(events);
             }
             self.merge_usage(Some(&frame), "prompt_eval_count", "eval_count");
             self.complete(events);
+        }
+    }
+
+    /// Append one complete Ollama `/api/chat` tool call. Unlike OpenAI's
+    /// streaming shape, Ollama's native `arguments` value is a complete JSON
+    /// object (compatible string-valued calls are complete too), and later
+    /// chunks append array entries rather than fragments. The optional
+    /// provider index is therefore validated but is not used to merge calls;
+    /// a private response-wide ordinal preserves arrival order.
+    fn append_ollama_tool_call(&mut self, entry: &Value, events: &mut Vec<StreamEvent>) {
+        let Some(entry) = entry.as_object() else {
+            self.fail("Ollama tool_calls entry is not an object", events);
+            return;
+        };
+        let Some(function) = entry.get("function").and_then(Value::as_object) else {
+            self.fail("Ollama tool_calls entry has no function object", events);
+            return;
+        };
+        match function.get("index") {
+            None | Some(Value::Null) => {}
+            Some(index) if index.as_u64().is_some() => {}
+            Some(_) => {
+                self.fail(
+                    "Ollama tool call index is not a nonnegative integer",
+                    events,
+                );
+                return;
+            }
+        }
+        let Some(name) = function.get("name").and_then(Value::as_str) else {
+            self.fail("Ollama tool call has no string name", events);
+            return;
+        };
+        let id = match entry.get("id") {
+            None | Some(Value::Null) => "",
+            Some(Value::String(id)) => id,
+            Some(_) => {
+                self.fail("Ollama tool call id is not a string", events);
+                return;
+            }
+        };
+
+        // This ordinal is private bookkeeping: Ollama calls are already
+        // complete, so their optional provider indexes must never trigger the
+        // OpenAI fragment-concatenation path.
+        let index = self
+            .pending_tools
+            .len()
+            .saturating_add(self.completed_tools.len()) as u64;
+        self.open_tool_call(index, id, name, events);
+        if self.phase != Phase::Streaming {
+            return;
+        }
+
+        let arguments = match function.get("arguments") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(arguments)) => arguments.to_string(),
+            Some(arguments @ Value::Object(_)) => match serialize_tool_arguments(arguments) {
+                Ok(arguments) => arguments,
+                Err(ProviderError::ResponseTooLarge { .. }) => {
+                    self.fail(
+                        &format!(
+                            "one tool call's arguments exceed the {MAX_TOOL_ARGUMENTS_BYTES} byte limit"
+                        ),
+                        events,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.fail(
+                        &format!("could not serialize Ollama tool arguments: {error}"),
+                        events,
+                    );
+                    return;
+                }
+            },
+            Some(_) => {
+                self.fail(
+                    "Ollama tool call arguments are neither a JSON string nor an object",
+                    events,
+                );
+                return;
+            }
+        };
+        self.extend_tool_call(index, &arguments, events);
+        if self.phase == Phase::Streaming {
+            self.close_tool_call(index);
         }
     }
 
@@ -781,12 +1072,26 @@ impl StreamParser {
         if self.phase != Phase::Streaming {
             return;
         }
-        if self.provider == Provider::Anthropic && !self.pending_tools.is_empty() {
-            self.fail(
-                "Anthropic message ended before a tool_use block was closed",
-                events,
-            );
-            return;
+        if self.provider == Provider::Anthropic {
+            if self
+                .anthropic_blocks
+                .values()
+                .any(|state| state.open && state.kind == AnthropicBlockKind::ToolUse)
+                || !self.pending_tools.is_empty()
+            {
+                self.fail(
+                    "Anthropic message ended before a tool_use block was closed",
+                    events,
+                );
+                return;
+            }
+            if self.anthropic_blocks.values().any(|state| state.open) {
+                self.fail(
+                    "Anthropic message ended before a content block was closed",
+                    events,
+                );
+                return;
+            }
         }
         if self.provider == Provider::OpenAiCompatible {
             self.finish_open_tool_calls();
@@ -812,6 +1117,7 @@ impl StreamParser {
         self.phase = Phase::Finished;
         self.line = Vec::new();
         self.event_data = String::new();
+        self.anthropic_blocks.clear();
     }
 
     fn fail(&mut self, message: &str, events: &mut Vec<StreamEvent>) {
@@ -827,6 +1133,7 @@ impl StreamParser {
         // failed, must not become a reviewable command.
         self.pending_tools = Vec::new();
         self.completed_tools = Vec::new();
+        self.anthropic_blocks.clear();
     }
 }
 
@@ -1476,6 +1783,10 @@ mod tests {
                         "delta": {"type": "text_delta", "text": "ond"}}),
             ),
             sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 2}),
+            ),
+            sse(
                 "message_delta",
                 &json!({"type": "message_delta",
                         "delta": {"stop_reason": "max_tokens"},
@@ -1611,6 +1922,41 @@ mod tests {
         .concat()
     }
 
+    /// Ollama appends complete tool-call objects to successive NDJSON chunks;
+    /// its object-valued arguments never use OpenAI-style string fragments.
+    fn ollama_tool_chunks(done_reason: &str) -> [String; 3] {
+        [
+            ndjson_line(&json!({
+                "model": "m",
+                "message": {"role": "assistant", "content": "Checking locally."},
+                "done": false,
+            })),
+            ndjson_line(&json!({
+                "model": "m",
+                "message": {"role": "assistant", "content": "", "tool_calls": [{
+                    "function": {
+                        "index": 0,
+                        "name": "run",
+                        "arguments": {"command": "pwd"},
+                    },
+                }]},
+                "done": false,
+            })),
+            ndjson_line(&json!({
+                "model": "m",
+                "message": {"role": "assistant", "content": ""},
+                "done": true,
+                "done_reason": done_reason,
+                "prompt_eval_count": 5,
+                "eval_count": 7,
+            })),
+        ]
+    }
+
+    fn ollama_tool_body(done_reason: &str) -> String {
+        ollama_tool_chunks(done_reason).concat()
+    }
+
     fn expected_run_call(id: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -1653,6 +1999,258 @@ mod tests {
             split.extend(parser.finish());
             assert_eq!(split, events, "{provider:?}");
         }
+    }
+
+    #[test]
+    fn ollama_complete_tool_calls_match_non_streaming_and_byte_chunking() {
+        use crate::tools::{parse_tool_response, ToolResponse};
+
+        let non_streaming = json!({
+            "model": "m",
+            "message": {
+                "role": "assistant",
+                "content": "Checking locally.",
+                "tool_calls": [{
+                    "function": {
+                        "index": 0,
+                        "name": "run",
+                        "arguments": {"command": "pwd"},
+                    },
+                }],
+            },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 5,
+            "eval_count": 7,
+        });
+        let parsed = parse_tool_response(Provider::Ollama, &non_streaming).unwrap();
+        let body = ollama_tool_body("stop");
+        let events = run(Provider::Ollama, &body);
+        let folded = fold(&events);
+        let streamed = ToolResponse {
+            text: folded.text,
+            calls: folded.calls,
+            reached_token_limit: folded.reached_token_limit,
+            usage: folded.usage,
+        };
+        assert_eq!(streamed, parsed);
+        assert_eq!(
+            streamed.to_action().unwrap(),
+            crate::session::ParsedAction::Run {
+                thought: Some("Checking locally.".into()),
+                command: "pwd".into(),
+            }
+        );
+
+        let mut parser = StreamParser::new(Provider::Ollama);
+        let mut byte_events = Vec::new();
+        for byte in body.as_bytes() {
+            byte_events.extend(parser.push(std::slice::from_ref(byte)));
+        }
+        byte_events.extend(parser.finish());
+        assert_eq!(byte_events, events);
+    }
+
+    #[test]
+    fn ollama_tool_calls_append_across_chunks_and_publish_only_at_done() {
+        let first = ndjson_line(&json!({
+            "message": {"content": "", "tool_calls": [{
+                "function": {
+                    "index": 0,
+                    "name": "run",
+                    "arguments": {"command": "pwd"},
+                },
+            }]},
+            "done": false,
+        }));
+        let second = ndjson_line(&json!({
+            "message": {"content": "", "tool_calls": [{
+                "function": {
+                    "name": "say",
+                    "arguments": {"message": "ready"},
+                },
+            }]},
+            "done": false,
+        }));
+        let done = ndjson_line(&json!({
+            "message": {"content": ""},
+            "done": true,
+            "done_reason": "stop",
+        }));
+
+        let mut parser = StreamParser::new(Provider::Ollama);
+        assert_eq!(parser.push(first.as_bytes()), vec![]);
+        assert_eq!(parser.push(second.as_bytes()), vec![]);
+        let events = parser.push(done.as_bytes());
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: String::new(),
+                    name: "run".into(),
+                    arguments: "{\"command\":\"pwd\"}".into(),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: String::new(),
+                    name: "say".into(),
+                    arguments: "{\"message\":\"ready\"}".into(),
+                }),
+                StreamEvent::Done,
+            ]
+        );
+        assert_eq!(parser.finish(), vec![]);
+        let calls = events
+            .into_iter()
+            .filter_map(|event| match event {
+                StreamEvent::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            crate::tools::ToolResponse::new("", calls).to_action(),
+            Err(crate::session::ParseError::MultipleToolCalls(2))
+        );
+    }
+
+    #[test]
+    fn ollama_tool_call_failures_never_publish_private_calls() {
+        let valid = ndjson_line(&json!({
+            "message": {"content": "", "tool_calls": [{
+                "function": {"name": "run", "arguments": {"command": "true"}},
+            }]},
+            "done": false,
+        }));
+        let malformed = [
+            ("tool_calls object", json!({})),
+            ("non-object entry", json!([42])),
+            ("missing function", json!([{}])),
+            ("non-object function", json!([{"function": "run"}])),
+            (
+                "invalid index",
+                json!([{"function": {"index": -1, "name": "run", "arguments": {}}}]),
+            ),
+            (
+                "missing name",
+                json!([{"function": {"arguments": {"command": "true"}}}]),
+            ),
+            (
+                "non-object arguments",
+                json!([{"function": {"name": "run", "arguments": []}}]),
+            ),
+        ];
+
+        for (case, tool_calls) in malformed {
+            let bad = ndjson_line(&json!({
+                "message": {"content": "", "tool_calls": tool_calls},
+                "done": false,
+            }));
+            let events = run(Provider::Ollama, &[valid.as_str(), bad.as_str()].concat());
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Protocol(_))),
+                "{case}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)),
+                "{case}: {events:?}"
+            );
+        }
+
+        let token_limited = [
+            valid.as_str(),
+            &ndjson_line(&json!({
+                "message": {"content": ""},
+                "done": true,
+                "done_reason": "length",
+            })),
+        ]
+        .concat();
+        let events = run(Provider::Ollama, &token_limited);
+        assert_eq!(events.first(), Some(&StreamEvent::ReachedTokenLimit));
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("truncated"))
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+
+        let events = run(Provider::Ollama, &valid);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("truncated"))
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+    }
+
+    #[test]
+    fn ollama_tool_call_bounds_fail_closed_response_wide() {
+        let overlong_name = ndjson_line(&json!({
+            "message": {"tool_calls": [{"function": {
+                "name": "n".repeat(MAX_TOOL_NAME_BYTES + 1),
+                "arguments": {},
+            }}]},
+            "done": false,
+        }));
+        let events = run(Provider::Ollama, &overlong_name);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Protocol(message)] if message.contains("name"))
+        );
+
+        // The decoded object fits inside one stream frame, but escaping its
+        // NUL bytes would exceed the bounded argument serializer's 64-KiB
+        // output budget.
+        let oversized_object = ndjson_line(&json!({
+            "message": {"tool_calls": [{"function": {
+                "name": "say",
+                "arguments": {"message": "\u{0}".repeat(MAX_TOOL_ARGUMENTS_BYTES / 2)},
+            }}]},
+            "done": false,
+        }));
+        let events = run(Provider::Ollama, &oversized_object);
+        assert!(
+            matches!(events.as_slice(), [StreamEvent::Protocol(message)] if message.contains("byte limit"))
+        );
+
+        let mut too_many = String::new();
+        for index in 0..=MAX_STREAM_TOOL_CALLS {
+            too_many.push_str(&ndjson_line(&json!({
+                "message": {"tool_calls": [{"function": {
+                    "index": index,
+                    "name": "run",
+                    "arguments": {"command": "true"},
+                }}]},
+                "done": false,
+            })));
+        }
+        let events = run(Provider::Ollama, &too_many);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("more than"))
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+
+        let payload = "x".repeat(MAX_TOOL_ARGUMENTS_BYTES * 3 / 4);
+        let mut cumulative = String::new();
+        for index in 0..6 {
+            cumulative.push_str(&ndjson_line(&json!({
+                "message": {"tool_calls": [{"function": {
+                    "index": index,
+                    "name": "say",
+                    "arguments": {"message": payload},
+                }}]},
+                "done": false,
+            })));
+        }
+        let events = run(Provider::Ollama, &cumulative);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("streamed tool arguments"))
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
     }
 
     #[test]
@@ -1904,6 +2502,138 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_tool_id_validation_matches_non_streaming() {
+        use crate::tools::parse_tool_response;
+
+        let malformed = json!({
+            "content": [{"type": "tool_use", "id": 7, "name": "run",
+                         "input": {"command": "true"}}],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::Anthropic, &malformed),
+            Err(ProviderError::MalformedResponse(message))
+                if message == "tool call id is not a string"
+        ));
+        let malformed_stream = sse(
+            "content_block_start",
+            &json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "tool_use", "id": 7,
+                                      "name": "run", "input": {}}}),
+        );
+        assert_eq!(
+            run(Provider::Anthropic, &malformed_stream),
+            vec![StreamEvent::Protocol("tool call id is not a string".into())]
+        );
+
+        // Missing and null IDs are accepted as empty by both parsers.
+        for (stream_block, non_stream_block) in [
+            (
+                json!({"type": "tool_use", "name": "run", "input": {}}),
+                json!({"type": "tool_use", "name": "run",
+                       "input": {"command": "true"}}),
+            ),
+            (
+                json!({"type": "tool_use", "id": null, "name": "run", "input": {}}),
+                json!({"type": "tool_use", "id": null, "name": "run",
+                       "input": {"command": "true"}}),
+            ),
+        ] {
+            let stream = [
+                sse(
+                    "content_block_start",
+                    &json!({"type": "content_block_start", "index": 0,
+                            "content_block": stream_block}),
+                ),
+                sse(
+                    "content_block_delta",
+                    &json!({"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": "{\"command\":\"true\"}"}}),
+                ),
+                sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": 0}),
+                ),
+                sse("message_stop", &json!({"type": "message_stop"})),
+            ]
+            .concat();
+            let streamed = fold(&run(Provider::Anthropic, &stream));
+            let parsed =
+                parse_tool_response(Provider::Anthropic, &json!({"content": [non_stream_block]}))
+                    .unwrap();
+            assert_eq!(streamed.calls, parsed.calls);
+            assert!(streamed.done);
+            assert_eq!(streamed.protocol, None);
+        }
+    }
+
+    #[test]
+    fn anthropic_tool_start_requires_the_empty_input_placeholder() {
+        use crate::tools::parse_tool_response;
+
+        // A scalar input is malformed in the completed response too.
+        let malformed = json!({
+            "content": [{"type": "tool_use", "id": "toolu_1", "name": "run",
+                         "input": 7}],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::Anthropic, &malformed),
+            Err(ProviderError::MalformedResponse(message))
+                if message == "tool_use input is not a JSON object"
+        ));
+
+        // On the stream wire, Anthropic requires exactly `{}` at block start;
+        // the complete input must be assembled only from later deltas.
+        for (case, block) in [
+            (
+                "non-object",
+                json!({"type": "tool_use", "id": "toolu_1", "name": "run", "input": 7}),
+            ),
+            (
+                "missing",
+                json!({"type": "tool_use", "id": "toolu_1", "name": "run"}),
+            ),
+            (
+                "null",
+                json!({"type": "tool_use", "id": "toolu_1", "name": "run", "input": null}),
+            ),
+            (
+                "nonempty",
+                json!({"type": "tool_use", "id": "toolu_1", "name": "run",
+                       "input": {"command": "ignored"}}),
+            ),
+        ] {
+            let stream = [
+                sse(
+                    "content_block_start",
+                    &json!({"type": "content_block_start", "index": 0,
+                            "content_block": block}),
+                ),
+                // A later valid fragment must not rescue the malformed start.
+                sse(
+                    "content_block_delta",
+                    &json!({"type": "content_block_delta", "index": 0,
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": "{\"command\":\"true\"}"}}),
+                ),
+                sse(
+                    "content_block_stop",
+                    &json!({"type": "content_block_stop", "index": 0}),
+                ),
+                sse("message_stop", &json!({"type": "message_stop"})),
+            ]
+            .concat();
+            assert_eq!(
+                run(Provider::Anthropic, &stream),
+                vec![StreamEvent::Protocol(
+                    "tool_use block input is not an empty object".into()
+                )],
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn malformed_tool_frames_fail_closed() {
         // Anthropic: a tool_use block with no name.
         let body = sse(
@@ -1992,6 +2722,185 @@ mod tests {
             vec![StreamEvent::Protocol(
                 "delta tool_calls is not an array".into()
             )]
+        );
+    }
+
+    #[test]
+    fn anthropic_block_kind_confusion_never_publishes_a_tool_call() {
+        // Regression: a second text start used to reuse the open tool index;
+        // its stop then closed and published the first block as a valid call.
+        let body = [
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 1,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 1,
+                        "delta": {"type": "input_json_delta",
+                                  "partial_json": "{\"command\":\"echo ok\"}"}}),
+            ),
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 1,
+                        "content_block": {"type": "text", "text": ""}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 1}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
+
+        let events = run(Provider::Anthropic, &body);
+        assert_eq!(
+            events,
+            vec![StreamEvent::Protocol(
+                "Anthropic stream reused a content-block index".into()
+            )]
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+    }
+
+    #[test]
+    fn anthropic_content_block_lifecycle_mismatches_fail_closed() {
+        let text_start = |index| {
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": index,
+                        "content_block": {"type": "text", "text": ""}}),
+            )
+        };
+        let tool_start = |index| {
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": index,
+                        "content_block": {"type": "tool_use", "id": "toolu_1",
+                                          "name": "run", "input": {}}}),
+            )
+        };
+        let stop = |index| {
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": index}),
+            )
+        };
+        let text_delta = |index| {
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": "late"}}),
+            )
+        };
+        let input_delta = |index| {
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+            )
+        };
+
+        let cases = [
+            (
+                "delta before start",
+                text_delta(7),
+                "references an unopened block",
+            ),
+            (
+                "delta after stop",
+                [text_start(7), stop(7), text_delta(7)].concat(),
+                "after its block closed",
+            ),
+            (
+                "text delta on tool block",
+                [tool_start(7), text_delta(7)].concat(),
+                "does not match the open tool_use block",
+            ),
+            (
+                "tool delta on text block",
+                [text_start(7), input_delta(7)].concat(),
+                "does not match the open text block",
+            ),
+            ("stop before start", stop(7), "references an unopened block"),
+            (
+                "repeated stop",
+                [text_start(7), stop(7), stop(7)].concat(),
+                "repeated for a closed block",
+            ),
+            (
+                "duplicate open start",
+                [text_start(7), text_start(7)].concat(),
+                "reused a content-block index",
+            ),
+            (
+                "start after closed index",
+                [text_start(7), stop(7), tool_start(7)].concat(),
+                "reused a content-block index",
+            ),
+            (
+                "message stop with open text block",
+                [
+                    text_start(7),
+                    sse("message_stop", &json!({"type": "message_stop"})),
+                ]
+                .concat(),
+                "before a content block was closed",
+            ),
+        ];
+
+        for (case, body, expected) in cases {
+            let events = run(Provider::Anthropic, &body);
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains(expected)),
+                "{case}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)),
+                "{case}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_unknown_block_and_delta_kinds_remain_index_bounded() {
+        let body = [
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 3,
+                        "content_block": {"type": "future_block"}}),
+            ),
+            sse(
+                "content_block_delta",
+                &json!({"type": "content_block_delta", "index": 3,
+                        "delta": {"type": "future_delta", "data": "ignored"}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 3}),
+            ),
+            sse(
+                "content_block_start",
+                &json!({"type": "content_block_start", "index": 4,
+                        "content_block": {"type": "text", "text": "ok"}}),
+            ),
+            sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": 4}),
+            ),
+            sse("message_stop", &json!({"type": "message_stop"})),
+        ]
+        .concat();
+
+        assert_eq!(
+            run(Provider::Anthropic, &body),
+            vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done]
         );
     }
 

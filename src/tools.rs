@@ -35,11 +35,10 @@
 //!
 //! # Provider support
 //!
-//! Anthropic and OpenAI-compatible endpoints get provider-correct schemas.
-//! Ollama's `/api/chat` has no standard tool-calling in the protocol this
-//! crate targets, so native mode returns
-//! [`ProviderError::InvalidConfiguration`] there rather than emitting a
-//! request that would silently degrade to prose.
+//! Anthropic, OpenAI-compatible, and Ollama `/api/chat` endpoints get their
+//! provider-correct tool schema. Anthropic and OpenAI-compatible APIs expose a
+//! request field that requires a tool call; Ollama does not, so jagent still
+//! enforces exactly one call while ingesting the completed response.
 
 use crate::provider::{
     decode_response_value, Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES,
@@ -68,9 +67,8 @@ pub const MAX_TOOL_ID_BYTES: usize = 256;
 /// closed. The protocol accepts exactly one; this only bounds parsing memory.
 pub const MAX_STREAM_TOOL_CALLS: usize = 8;
 
-const NATIVE_TOOLS_UNSUPPORTED: &str =
-    "Ollama's /api/chat endpoint has no standard tool-calling in the protocol this crate \
-     targets; use AgentProtocol::Text for Ollama";
+const OLLAMA_TOOL_CHOICE_UNSUPPORTED: &str =
+    "Ollama's /api/chat tool protocol does not expose a tool_choice request field";
 
 /// Which wire encoding the agent loop uses to carry actions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -80,8 +78,7 @@ pub enum AgentProtocol {
     /// this mode are byte-identical to [`crate::provider::build_chat_request`].
     #[default]
     Text,
-    /// The provider's native tool-calling carries the action. Unsupported on
-    /// Ollama, which fails with [`ProviderError::InvalidConfiguration`].
+    /// The provider's native tool-calling carries the action.
     NativeTools,
 }
 
@@ -95,8 +92,9 @@ pub struct ToolCall {
     /// [`AGENT_TOOL_NAMES`] fails closed at [`ToolResponse::to_action`].
     pub name: String,
     /// Raw JSON object text carrying the arguments, exactly as delivered
-    /// (Anthropic re-serializes its `input` object; OpenAI passes its
-    /// `arguments` string through; streaming concatenates the fragments).
+    /// (Anthropic and Ollama re-serialize their argument objects; OpenAI
+    /// passes its `arguments` string through; streaming concatenates provider
+    /// fragments where applicable).
     /// An empty string means "no arguments" and is treated as `{}`.
     pub arguments: String,
 }
@@ -168,14 +166,9 @@ fn with_preamble(action: ParsedAction, text: &str) -> ParsedAction {
 
 /// The provider-shaped `tools` array advertising `run`, `say`, and `done`.
 ///
-/// Anthropic emits `{name, description, input_schema}`; OpenAI-compatible
-/// emits `{type: "function", function: {name, description, parameters}}`.
+/// Anthropic emits `{name, description, input_schema}`; OpenAI-compatible and
+/// Ollama emit `{type: "function", function: {name, description, parameters}}`.
 pub fn agent_tools(provider: Provider) -> Result<Value, ProviderError> {
-    if provider == Provider::Ollama {
-        return Err(ProviderError::InvalidConfiguration(
-            NATIVE_TOOLS_UNSUPPORTED.into(),
-        ));
-    }
     Ok(Value::Array(
         tool_specs()
             .iter()
@@ -207,7 +200,7 @@ pub fn agent_tool_choice(provider: Provider) -> Result<Value, ProviderError> {
         Provider::Anthropic => Ok(json!({"type": "any", "disable_parallel_tool_use": true})),
         Provider::OpenAiCompatible => Ok(Value::String("required".into())),
         Provider::Ollama => Err(ProviderError::InvalidConfiguration(
-            NATIVE_TOOLS_UNSUPPORTED.into(),
+            OLLAMA_TOOL_CHOICE_UNSUPPORTED.into(),
         )),
     }
 }
@@ -217,14 +210,19 @@ pub fn agent_tool_choice(provider: Provider) -> Result<Value, ProviderError> {
 pub(crate) fn agent_body_fields(
     provider: Provider,
 ) -> Result<Vec<(&'static str, Value)>, ProviderError> {
-    let mut fields = vec![
-        ("tools", agent_tools(provider)?),
-        ("tool_choice", agent_tool_choice(provider)?),
-    ];
-    if provider == Provider::OpenAiCompatible {
-        // Servers that do not implement this ignore it; those that do stop
-        // emitting the multi-call replies the protocol has to reject.
-        fields.push(("parallel_tool_calls", json!(false)));
+    let mut fields = vec![("tools", agent_tools(provider)?)];
+    match provider {
+        Provider::Anthropic | Provider::OpenAiCompatible => {
+            fields.push(("tool_choice", agent_tool_choice(provider)?));
+            if provider == Provider::OpenAiCompatible {
+                // Servers that do not implement this ignore it; those that do
+                // stop emitting multi-call replies the protocol must reject.
+                fields.push(("parallel_tool_calls", json!(false)));
+            }
+        }
+        // Ollama accepts OpenAI-shaped tools but has no tool-choice field.
+        // Exact-one-call remains enforced by ToolResponse::to_action.
+        Provider::Ollama => {}
     }
     Ok(fields)
 }
@@ -313,11 +311,7 @@ pub fn parse_tool_response(
     let (text, calls) = match provider {
         Provider::Anthropic => anthropic_parts(response)?,
         Provider::OpenAiCompatible => openai_parts(response)?,
-        Provider::Ollama => {
-            return Err(ProviderError::InvalidConfiguration(
-                NATIVE_TOOLS_UNSUPPORTED.into(),
-            ))
-        }
+        Provider::Ollama => ollama_parts(response)?,
     };
     if text.len() > MAX_MODEL_TEXT_BYTES {
         return Err(ProviderError::ResponseTooLarge {
@@ -358,7 +352,7 @@ fn anthropic_parts(response: &Value) -> Result<(String, Vec<ToolCall>), Provider
                     }
                 };
                 calls.push(ToolCall {
-                    id: bounded_id(part.get("id")),
+                    id: bounded_id(part.get("id"))?,
                     name: bounded_name(part.get("name"))?,
                     arguments,
                 });
@@ -376,8 +370,28 @@ fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderErr
         Some(content) => crate::provider::content_text(content)?.unwrap_or_default(),
         None => String::new(),
     };
+    let calls = function_calls(message.and_then(|message| message.get("tool_calls")))?;
+    Ok((text, calls))
+}
+
+fn ollama_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderError> {
+    let message = response.get("message");
+    let text = match message.and_then(|message| message.get("content")) {
+        Some(Value::String(text)) => text.to_string(),
+        Some(Value::Null) | None => String::new(),
+        Some(_) => return Err(malformed("message content is not a string")),
+    };
+    let calls = function_calls(message.and_then(|message| message.get("tool_calls")))?;
+    Ok((text, calls))
+}
+
+/// OpenAI-compatible and Ollama responses share the same function-call
+/// envelope. Ollama normally sends `arguments` as an object while OpenAI sends
+/// a JSON string; compatible servers exist on both sides, so accept either and
+/// feed both through the identical bounded strict action parser.
+fn function_calls(value: Option<&Value>) -> Result<Vec<ToolCall>, ProviderError> {
     let mut calls = Vec::new();
-    match message.and_then(|message| message.get("tool_calls")) {
+    match value {
         None | Some(Value::Null) => {}
         Some(Value::Array(entries)) => {
             for entry in entries {
@@ -399,7 +413,7 @@ fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderErr
                     }
                 };
                 calls.push(ToolCall {
-                    id: bounded_id(entry.get("id")),
+                    id: bounded_id(entry.get("id"))?,
                     name: bounded_name(function.get("name"))?,
                     arguments,
                 });
@@ -407,7 +421,7 @@ fn openai_parts(response: &Value) -> Result<(String, Vec<ToolCall>), ProviderErr
         }
         Some(_) => return Err(malformed("tool_calls is not an array")),
     }
-    Ok((text, calls))
+    Ok(calls)
 }
 
 fn malformed(detail: &str) -> ProviderError {
@@ -435,7 +449,7 @@ fn bounded_tool_arguments(arguments: &str) -> Result<String, ProviderError> {
 /// Serialize provider-native argument objects through a bounded writer. Using
 /// `Value::to_string()` and checking afterwards would transiently allocate the
 /// entire attacker-controlled object, including JSON escaping expansion.
-fn serialize_tool_arguments(arguments: &Value) -> Result<String, ProviderError> {
+pub(crate) fn serialize_tool_arguments(arguments: &Value) -> Result<String, ProviderError> {
     let mut writer = BoundedJsonWriter::new(MAX_TOOL_ARGUMENTS_BYTES);
     if let Err(error) = serde_json::to_writer(&mut writer, arguments) {
         if writer.exceeded {
@@ -482,11 +496,20 @@ impl Write for BoundedJsonWriter {
     }
 }
 
-fn bounded_id(value: Option<&Value>) -> String {
-    value
-        .and_then(Value::as_str)
-        .map(|id| elide_middle(id, MAX_TOOL_ID_BYTES))
-        .unwrap_or_default()
+fn bounded_id(value: Option<&Value>) -> Result<String, ProviderError> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    let id = value
+        .as_str()
+        .ok_or_else(|| malformed("tool call id is not a string"))?;
+    if id.len() > MAX_TOOL_ID_BYTES {
+        return Err(malformed("tool call id exceeds its byte limit"));
+    }
+    Ok(id.to_string())
 }
 
 fn bounded_name(value: Option<&Value>) -> Result<String, ProviderError> {
@@ -583,12 +606,7 @@ mod tests {
             Provider::Ollama,
         ] {
             let config = config(provider);
-            let protocols: &[AgentProtocol] = if provider == Provider::Ollama {
-                &[AgentProtocol::Text]
-            } else {
-                &[AgentProtocol::Text, AgentProtocol::NativeTools]
-            };
-            for &protocol in protocols {
+            for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
                 let built = build_agent_chat_request_with_report(
                     &config,
                     Some("sys"),
@@ -635,7 +653,11 @@ mod tests {
 
     #[test]
     fn native_mode_only_adds_tool_fields() {
-        for provider in [Provider::Anthropic, Provider::OpenAiCompatible] {
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
             let config = config(provider);
             let text = build_chat_request(&config, Some("sys"), &history()).unwrap();
             let native = build_agent_chat_request(
@@ -652,7 +674,11 @@ mod tests {
             let text_body: Value = serde_json::from_str(&text.body).unwrap();
             let object = native_body.as_object_mut().unwrap();
             assert!(object.remove("tools").is_some(), "{provider:?}");
-            assert!(object.remove("tool_choice").is_some(), "{provider:?}");
+            if provider == Provider::Ollama {
+                assert!(object.get("tool_choice").is_none(), "{provider:?}");
+            } else {
+                assert!(object.remove("tool_choice").is_some(), "{provider:?}");
+            }
             object.remove("parallel_tool_calls");
             assert_eq!(native_body, text_body, "{provider:?}");
         }
@@ -723,63 +749,53 @@ mod tests {
     }
 
     #[test]
-    fn ollama_native_mode_fails_with_a_clear_configuration_error() {
-        for build in [
+    fn ollama_native_mode_uses_function_tools_without_tool_choice() {
+        for request in [
             build_agent_chat_request(
                 &config(Provider::Ollama),
                 Some("sys"),
                 &history(),
                 AgentProtocol::NativeTools,
-            ),
+            )
+            .unwrap(),
             build_agent_chat_request_streaming(
                 &config(Provider::Ollama),
                 Some("sys"),
                 &history(),
                 AgentProtocol::NativeTools,
-            ),
+            )
+            .unwrap(),
         ] {
-            match build {
-                Err(ProviderError::InvalidConfiguration(message)) => {
-                    assert!(message.contains("Ollama"), "{message}");
-                    assert!(message.contains("AgentProtocol::Text"), "{message}");
-                }
-                other => panic!("expected InvalidConfiguration, got {other:?}"),
-            }
+            let body: Value = serde_json::from_str(&request.body).unwrap();
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(3));
+            assert_eq!(body["tools"][0]["type"], "function");
+            assert_eq!(body["tools"][0]["function"]["name"], "run");
+            assert!(body.get("tool_choice").is_none());
+            assert!(body.get("parallel_tool_calls").is_none());
         }
+        assert!(agent_tools(Provider::Ollama).is_ok());
         assert!(matches!(
-            agent_tools(Provider::Ollama),
-            Err(ProviderError::InvalidConfiguration(_))
+            agent_tool_choice(Provider::Ollama),
+            Err(ProviderError::InvalidConfiguration(message))
+                if message.contains("tool_choice")
         ));
-        assert!(matches!(
-            parse_tool_response(Provider::Ollama, &json!({"message": {"content": "hi"}})),
-            Err(ProviderError::InvalidConfiguration(_))
-        ));
-        // Text mode on Ollama keeps working.
-        assert!(build_agent_chat_request(
+
+        let reported = build_agent_chat_request_with_report(
             &config(Provider::Ollama),
             Some("sys"),
             &history(),
-            AgentProtocol::Text
+            AgentProtocol::NativeTools,
         )
-        .is_ok());
-        assert!(matches!(
-            build_agent_chat_request_with_report(
-                &config(Provider::Ollama),
-                Some("sys"),
-                &history(),
-                AgentProtocol::NativeTools
-            ),
-            Err(ProviderError::InvalidConfiguration(_))
-        ));
-        assert!(matches!(
-            build_agent_chat_request_streaming_with_report(
-                &config(Provider::Ollama),
-                Some("sys"),
-                &history(),
-                AgentProtocol::NativeTools
-            ),
-            Err(ProviderError::InvalidConfiguration(_))
-        ));
+        .unwrap();
+        assert_eq!(reported.omitted_history_turns, 0);
+        let streaming = build_agent_chat_request_streaming_with_report(
+            &config(Provider::Ollama),
+            Some("sys"),
+            &history(),
+            AgentProtocol::NativeTools,
+        )
+        .unwrap();
+        assert_eq!(streaming.omitted_history_turns, 0);
     }
 
     fn anthropic_reply(blocks: Value) -> Value {
@@ -913,6 +929,45 @@ mod tests {
                 .unwrap(),
             ParsedAction::Run {
                 thought: None,
+                command: "pwd".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ollama_tool_calls_become_the_same_parsed_action() {
+        let reply = json!({
+            "message": {
+                "role": "assistant",
+                "content": "Checking locally.",
+                "tool_calls": [{
+                    "function": {
+                        "index": 0,
+                        "name": "run",
+                        "arguments": {"command": "pwd"},
+                    },
+                }],
+            },
+            "done": true,
+            "done_reason": "stop",
+            "prompt_eval_count": 5,
+            "eval_count": 7,
+        });
+        let parsed = parse_tool_response(Provider::Ollama, &reply).unwrap();
+        assert_eq!(parsed.text, "Checking locally.");
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].id, "");
+        assert_eq!(
+            parsed.usage,
+            Some(Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(7),
+            })
+        );
+        assert_eq!(
+            parsed.to_action().unwrap(),
+            ParsedAction::Run {
+                thought: Some("Checking locally.".into()),
                 command: "pwd".into(),
             }
         );
@@ -1097,6 +1152,20 @@ mod tests {
             Err(ProviderError::MalformedResponse(message))
                 if message.contains("more than")
         ));
+
+        for id in [json!(7), json!("x".repeat(MAX_TOOL_ID_BYTES + 1))] {
+            let reply = openai_reply(json!({
+                "tool_calls": [{
+                    "id": id,
+                    "function": {"name": "run", "arguments": {"command": "pwd"}},
+                }],
+            }));
+            assert!(matches!(
+                parse_tool_response(Provider::OpenAiCompatible, &reply),
+                Err(ProviderError::MalformedResponse(message))
+                    if message.contains("tool call id")
+            ));
+        }
 
         let half = "x".repeat(MAX_MODEL_TEXT_BYTES / 2);
         let reply = anthropic_reply(json!([
