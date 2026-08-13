@@ -4,9 +4,10 @@
 //! history, and prompts before they serialize a provider request.
 //! Goal is to stop "I pasted my .env" / "I ran `aws sts get-session-token`"
 //! accidents — not to be a general DLP. Patterns are conservative: we only
-//! match shapes whose false-positive rate is essentially zero (AWS access
-//! key ids, GitHub PATs, Slack tokens, JWTs, PEM block headers, credentialed
-//! URLs, and explicit bearer headers). Generic
+//! match shapes whose false-positive rate is essentially zero (major provider
+//! API-token prefixes, AWS credentials, GitHub/GitLab PATs, Slack tokens,
+//! JWTs, private-key blocks, credentialed URLs, and explicit authorization
+//! headers). Generic
 //! "looks like a hex string" detection would gut routine command output
 //! (git SHAs, hashes) so we deliberately avoid it.
 //!
@@ -33,10 +34,16 @@ fn patterns() -> &'static [SecretPattern] {
     CELL.get_or_init(|| {
         let pats: &[(&str, &str)] = &[
             // PEM private key block (any flavor): RSA, EC, OPENSSH, plain
-            // PRIVATE KEY. Span includes body so the whole secret is gone.
+            // PRIVATE KEY. The EOF alternative is intentional: terminal and
+            // provider budgets frequently truncate output in the middle of a
+            // key, which must not turn redaction off for the leaked prefix.
             (
                 "[REDACTED:private-key]",
-                r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+                r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
+            ),
+            (
+                "[REDACTED:private-key]",
+                r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?(?:-----END PGP PRIVATE KEY BLOCK-----|\z)",
             ),
             // AWS access key ids (long-lived + STS). Format is fixed.
             (
@@ -48,16 +55,16 @@ fn patterns() -> &'static [SecretPattern] {
             // is too generic for command/build output.
             (
                 "AWS_SECRET_ACCESS_KEY=[REDACTED:aws-secret-key]",
-                r#"(?i)\bAWS_SECRET_ACCESS_KEY[ \t]*[=:][ \t]*[\"']?[A-Za-z0-9/+=]{40}[\"']?"#,
+                r#"(?i)["']?\bAWS_SECRET_ACCESS_KEY\b["']?[ \t]*[=:][ \t]*["']?[A-Za-z0-9/+=]{40}["']?"#,
             ),
             // GitHub fine-grained PAT (long form).
             ("[REDACTED:github-pat]", r"\bgithub_pat_[A-Za-z0-9_]{82}\b"),
             // GitHub classic tokens: ghp_, gho_, ghu_, ghs_, ghr_.
             ("[REDACTED:github-token]", r"\bgh[opusr]_[A-Za-z0-9]{36,}\b"),
-            // Slack bot / user / app / refresh tokens.
+            // Slack bot / user / enterprise / app / refresh tokens.
             (
                 "[REDACTED:slack-token]",
-                r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b",
+                r"\b(?:xox[abprse]-[A-Za-z0-9-]{10,}|xapp-[A-Za-z0-9-]{10,})\b",
             ),
             // JWT (header.payload.signature). Loose but the three-segment
             // base64url structure with `eyJ` header prefix is distinctive.
@@ -75,6 +82,54 @@ fn patterns() -> &'static [SecretPattern] {
             (
                 "[REDACTED:openai-key]",
                 r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{20,}\b",
+            ),
+            // Other widely used provider formats with stable, distinctive
+            // prefixes. These stay format-specific so ordinary hashes and
+            // identifiers remain untouched.
+            (
+                "[REDACTED:gitlab-token]",
+                r"\bglpat-[A-Za-z0-9_\-]{20,}\b",
+            ),
+            (
+                "[REDACTED:huggingface-token]",
+                r"\bhf_[A-Za-z0-9]{30,}\b",
+            ),
+            ("[REDACTED:npm-token]", r"\bnpm_[A-Za-z0-9]{36,}\b"),
+            (
+                "[REDACTED:google-api-key]",
+                r"\bAIza[A-Za-z0-9_\-]{35}\b",
+            ),
+            (
+                "[REDACTED:stripe-key]",
+                r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b",
+            ),
+            (
+                "[REDACTED:sendgrid-key]",
+                r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}\b",
+            ),
+            (
+                "[REDACTED:pypi-token]",
+                r"\bpypi-AgEIcHlwaS5vcmcC[A-Za-z0-9_\-]{20,}\b",
+            ),
+            // Signed and OAuth URLs are bearer credentials even without URL
+            // userinfo. Retain the parameter name and all non-secret query
+            // context while removing only well-known credential values. This
+            // precedes the generic setting rule so URL framing wins.
+            (
+                "${prefix}[REDACTED:url-query-secret]",
+                r"(?i)(?P<prefix>[?&#](?:access_token|refresh_token|auth_token|api_key|apikey|token|signature|sig|x-amz-signature|x-goog-signature)=)[A-Za-z0-9._~+/%=\-]{8,}",
+            ),
+            // Explicit well-known secret settings catch new provider token
+            // formats without treating every long opaque string as a secret.
+            // Canonicalizing the assignment also avoids retaining unmatched
+            // quote characters from JSON, YAML, or shell syntax.
+            (
+                "${name}=[REDACTED:credential]",
+                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN)\b)["']?[ \t]*[=:][ \t]*["']?[A-Za-z0-9._~+/=\-]{16,}["']?"#,
+            ),
+            (
+                "${name}=[REDACTED:credential]",
+                r#"(?i)["']?(?P<name>\b(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN)\b)["']?[ \t]*[=:][ \t]*["']?[A-Za-z0-9._~+/=\-]{8,}["']?"#,
             ),
             // A password embedded in URI userinfo. Preserve the scheme and
             // username as useful context, but remove everything between the
@@ -98,6 +153,16 @@ fn patterns() -> &'static [SecretPattern] {
             (
                 "${scheme} [REDACTED:basic-credentials]",
                 r"(?i)(?P<scheme>\bbasic)[ \t]+[A-Za-z0-9+/]{12,}={0,2}",
+            ),
+            // Less standardized authorization schemes are only recognized
+            // behind an explicit header name to avoid redacting prose.
+            (
+                "${prefix}[REDACTED:authorization-credential]",
+                r"(?i)(?P<prefix>\bauthorization[ \t]*:[ \t]*(?:token|api[-_]?key)[ \t]+)[A-Za-z0-9._~+/=\-]{16,}",
+            ),
+            (
+                "${prefix}[REDACTED:api-key]",
+                r"(?i)(?P<prefix>\b(?:x-api-key|api-key)[ \t]*:[ \t]*)[A-Za-z0-9._~+/=\-]{16,}",
             ),
         ];
         pats.iter()
@@ -217,6 +282,18 @@ mod tests {
     }
 
     #[test]
+    fn redacts_truncated_private_key_blocks_through_eof() {
+        let pem =
+            "before\n-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nstill-secret";
+        let out = redact_secrets(pem);
+        assert_eq!(out, "before\n[REDACTED:private-key]");
+        assert!(!out.contains("MIIEvQ"));
+
+        let pgp = "-----BEGIN PGP PRIVATE KEY BLOCK-----\nxcLYBGV...truncated";
+        assert_eq!(redact_secrets(pgp), "[REDACTED:private-key]");
+    }
+
+    #[test]
     fn redacts_anthropic_key() {
         let s = "ANTHROPIC_API_KEY=sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGGHHHH";
         let out = redact_secrets(s);
@@ -258,6 +335,102 @@ mod tests {
         let out = redact_secrets(&format!("Authorization: Basic {encoded}"));
         assert_eq!(out, "Authorization: Basic [REDACTED:basic-credentials]");
         assert!(!out.contains(encoded));
+    }
+
+    #[test]
+    fn redacts_provider_specific_tokens_without_eating_common_ids() {
+        let cases = [
+            (
+                format!("GITLAB_TOKEN=glpat-{}", "a".repeat(24)),
+                "[REDACTED:gitlab-token]",
+            ),
+            (
+                format!("HF_TOKEN=hf_{}", "A".repeat(34)),
+                "[REDACTED:huggingface-token]",
+            ),
+            (
+                format!("NPM_TOKEN=npm_{}", "b".repeat(36)),
+                "[REDACTED:npm-token]",
+            ),
+            (
+                format!("GOOGLE_API_KEY=AIza{}", "C".repeat(35)),
+                "[REDACTED:google-api-key]",
+            ),
+            (
+                format!("STRIPE_SECRET_KEY=sk_live_{}", "d".repeat(24)),
+                "[REDACTED:stripe-key]",
+            ),
+            (
+                format!("SENDGRID_API_KEY=SG.{}.{}", "E".repeat(22), "f".repeat(43)),
+                "[REDACTED:sendgrid-key]",
+            ),
+            (
+                format!("SLACK_APP_TOKEN=xapp-1-{}", "A".repeat(30)),
+                "[REDACTED:slack-token]",
+            ),
+        ];
+        for (input, marker) in cases {
+            let out = redact_secrets(&input);
+            assert!(out.contains(marker), "{input:?} became {out:?}");
+        }
+
+        let safe = "package hf_transformers npm_install google id AIzashort";
+        assert_eq!(redact_secrets(safe), safe);
+    }
+
+    #[test]
+    fn redacts_quoted_settings_and_explicit_api_key_headers() {
+        let aws = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+        let out = redact_secrets(&format!(r#"{{"AWS_SECRET_ACCESS_KEY": "{aws}"}}"#));
+        assert!(out.contains("[REDACTED:aws-secret-key]"), "got {out}");
+        assert!(!out.contains(aws));
+
+        let opaque = "opaque.new-provider-secret_1234567890";
+        let out = redact_secrets(&format!(r#"{{"OPENAI_API_KEY": "{opaque}"}}"#));
+        assert!(
+            out.contains("OPENAI_API_KEY=[REDACTED:credential]"),
+            "got {out}"
+        );
+        assert!(!out.contains(opaque));
+
+        for input in [
+            "Authorization: Token abcdefghijklmnopqrstuvwxyz012345",
+            "X-API-Key: abcdefghijklmnopqrstuvwxyz012345",
+        ] {
+            let out = redact_secrets(input);
+            assert!(out.contains("[REDACTED:"), "got {out}");
+            assert!(!out.contains("abcdefghijklmnop"));
+        }
+    }
+
+    #[test]
+    fn redacts_secret_labeled_settings_and_signed_url_parameters() {
+        for input in [
+            "DB_PASSWORD=correct-horse-battery-staple",
+            r#"{"SERVICE_CLIENT_SECRET":"opaque_secret_value_123"}"#,
+            "refresh_token: abcdefghijklmnopqrstuvwxyz",
+        ] {
+            let out = redact_secrets(input);
+            assert!(out.contains("[REDACTED:credential]"), "got {out}");
+        }
+
+        let url = "https://storage.example/object?version=3&X-Amz-Signature=abcdef0123456789abcdef0123456789&download=1";
+        assert_eq!(
+            redact_secrets(url),
+            "https://storage.example/object?version=3&X-Amz-Signature=[REDACTED:url-query-secret]&download=1"
+        );
+        let fragment = "https://app.example/#access_token=opaque-token-value-123456&state=ok";
+        assert!(redact_secrets(fragment).contains("#access_token=[REDACTED:url-query-secret]"));
+    }
+
+    #[test]
+    fn redaction_is_idempotent() {
+        let input =
+            "Authorization: Bearer opaque-token-value-123456 https://x.test/?sig=abcdef0123456789";
+        let once = redact_secrets(input);
+        let twice = redact_secrets(&once);
+        assert_eq!(twice, once);
+        assert!(matches!(redact_secrets_cow(&once), Cow::Borrowed(_)));
     }
 
     #[test]

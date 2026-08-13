@@ -364,8 +364,9 @@ fn validate_base_url(base_url: &str) -> Result<(), ProviderError> {
     let invalid = || {
         ProviderError::InvalidConfiguration(format!(
             "base URL must be an absolute HTTPS URL of at most {MAX_BASE_URL_BYTES} bytes with \
-             no surrounding whitespace, credentials, query, fragment, backslash, control, or \
-             visually ambiguous characters (plain HTTP is accepted only for a loopback endpoint)"
+             an ASCII DNS name or canonical IP literal and no surrounding whitespace, \
+             credentials, query, fragment, backslash, control, or visually ambiguous characters \
+             (plain HTTP is accepted only for a loopback endpoint)"
         ))
     };
     if base_url.is_empty()
@@ -379,7 +380,10 @@ fn validate_base_url(base_url: &str) -> Result<(), ProviderError> {
     }
     let (scheme, rest) = base_url.split_once("://").ok_or_else(invalid)?;
     let authority = rest.split('/').next().unwrap_or_default();
-    if authority.contains('@') || authority_host(authority).is_none() {
+    let Some(host) = authority_host(authority) else {
+        return Err(invalid());
+    };
+    if authority.contains('@') || !is_valid_url_host(host) {
         return Err(invalid());
     }
     match scheme {
@@ -387,6 +391,63 @@ fn validate_base_url(base_url: &str) -> Result<(), ProviderError> {
         "http" if is_loopback_authority(authority) => Ok(()),
         _ => Err(invalid()),
     }
+}
+
+/// Accept a canonical IP literal or an ASCII DNS hostname.
+///
+/// URL parsers disagree in particularly dangerous ways around percent-encoded
+/// hosts, Unicode/IDNA input, empty labels, and legacy numeric IPv4 spellings.
+/// Requiring callers to supply an already-ASCII hostname (punycode for an IDN)
+/// keeps the authority the validator reviews identical to the authority a
+/// transport resolves. Canonical IPv4 and bracketed IPv6 literals remain
+/// available for local endpoints.
+fn is_valid_url_host(host: &str) -> bool {
+    if host.parse::<std::net::Ipv4Addr>().is_ok() || host.parse::<std::net::Ipv6Addr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 || !host.is_ascii() {
+        return false;
+    }
+
+    let mut labels = host.split('.').peekable();
+    while let Some(label) = labels.next() {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return false;
+        }
+
+        // WHATWG-style URL parsers treat a host whose final label is a
+        // decimal/octal/hex number as an IPv4 address, including spellings
+        // such as 2130706433 and 0x7f000001. `Ipv4Addr` above accepts only the
+        // canonical dotted form; reject every other numeric-final spelling so
+        // a transport cannot resolve a different host than this validator saw.
+        if labels.peek().is_none() && is_url_ipv4_number(label) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_url_ipv4_number(label: &str) -> bool {
+    if let Some(hex) = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    {
+        return !hex.is_empty() && hex.bytes().all(|byte| byte.is_ascii_hexdigit());
+    }
+    label.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// True for `localhost`, an IPv4 loopback literal, or a bracketed IPv6
@@ -849,8 +910,9 @@ pub struct Usage {
 pub struct ChatResponse {
     /// Assistant text exactly as extracted — no advisory notes appended.
     pub text: String,
-    /// The provider stopped at the output-token limit; the integration should
-    /// present the text as partial rather than complete.
+    /// The provider stopped at a generation bound (its output-token limit or,
+    /// where explicitly reported, its model context-window limit); the
+    /// integration should present the text as partial rather than complete.
     pub reached_token_limit: bool,
     pub usage: Option<Usage>,
 }
@@ -882,8 +944,8 @@ pub fn parse_chat_response_full_bytes(
 }
 
 /// Extract the assistant text from one non-streaming chat response.
-/// A reached token limit is surfaced as a visible trailing note, never as an
-/// error, so partial answers stay reviewable.
+/// A provider-reported generation bound is surfaced as a visible trailing
+/// note, never as an error, so partial answers stay reviewable.
 ///
 /// `response` is already decoded. This API is only for trusted or
 /// already-bounded caller-owned values: the caller's transport must have
@@ -899,8 +961,8 @@ fn chat_response_text(parsed: ChatResponse) -> String {
     let mut text = parsed.text;
     if parsed.reached_token_limit {
         text.push_str(
-            "\n\n[Response reached the configured output limit. Ask to continue or \
-             increase max_tokens.]",
+            "\n\n[Response reached a provider generation limit and may be incomplete. \
+             Ask to continue or adjust the model/token limits.]",
         );
     }
     text
@@ -971,12 +1033,347 @@ pub(crate) fn decode_response_value(body: &[u8]) -> Result<Value, ProviderError>
         .map_err(|error| ProviderError::MalformedResponse(error.to_string()))
 }
 
-/// Did the provider stop at the output-token limit? Shared by the text and
-/// native-tool ingestion paths so both report the same condition.
+/// Validate the completion envelope used by the high-level Agent path.
+///
+/// The lower-level chat extractors intentionally retain their historical
+/// tolerance for sparse OpenAI-compatible and older Ollama fixtures. Turning
+/// model output into an Agent action needs a stronger contract: exactly one
+/// completed choice/message, an unambiguous completion reason, and no
+/// provider-declared filtering or pause. Otherwise partial or mismatched text
+/// could happen to look like a complete `run` action.
+pub(crate) fn validate_agent_response_envelope(
+    provider: Provider,
+    response: &Value,
+) -> Result<(), ProviderError> {
+    let object = response
+        .as_object()
+        .ok_or_else(|| malformed_response("top-level response is not a JSON object"))?;
+    reject_provider_error_field(object)?;
+
+    match provider {
+        Provider::Anthropic => {
+            let content = object
+                .get("content")
+                .and_then(Value::as_array)
+                .ok_or_else(|| malformed_response("Anthropic response has no content array"))?;
+            let mut has_tool_use = false;
+            for block in content {
+                let block = block.as_object().ok_or_else(|| {
+                    malformed_response("Anthropic content block is not an object")
+                })?;
+                let kind = block.get("type").and_then(Value::as_str).ok_or_else(|| {
+                    malformed_response("Anthropic content block has no string type")
+                })?;
+                has_tool_use |= kind == "tool_use";
+                if kind == "text" && !block.get("text").is_some_and(Value::is_string) {
+                    return Err(malformed_response(
+                        "Anthropic text block has no string text",
+                    ));
+                }
+            }
+
+            match object.get("stop_reason").and_then(Value::as_str) {
+                Some("end_turn" | "stop_sequence") if !has_tool_use => Ok(()),
+                Some("end_turn" | "stop_sequence") => Err(malformed_response(
+                    "Anthropic response contains tool_use with a non-tool stop_reason",
+                )),
+                Some("max_tokens" | "model_context_window_exceeded") => Ok(()),
+                Some("tool_use") if has_tool_use => Ok(()),
+                Some("tool_use") => Err(malformed_response(
+                    "Anthropic tool_use stop has no tool_use content block",
+                )),
+                Some("pause_turn") => Err(malformed_response(
+                    "Anthropic response paused before the turn completed",
+                )),
+                Some("refusal") => Err(malformed_response(
+                    "Anthropic response ended with a model refusal",
+                )),
+                Some(_) => Err(malformed_response(
+                    "Anthropic response has an unknown stop_reason",
+                )),
+                None => Err(malformed_response(
+                    "Anthropic response has no string stop_reason",
+                )),
+            }
+        }
+        Provider::OpenAiCompatible => {
+            let choices = object
+                .get("choices")
+                .and_then(Value::as_array)
+                .ok_or_else(|| malformed_response("OpenAI response has no choices array"))?;
+            if choices.len() != 1 {
+                return Err(malformed_response(
+                    "OpenAI response must contain exactly one choice",
+                ));
+            }
+            let choice = choices[0]
+                .as_object()
+                .ok_or_else(|| malformed_response("OpenAI choice is not an object"))?;
+            if let Some(index) = choice.get("index") {
+                if index.as_u64() != Some(0) {
+                    return Err(malformed_response(
+                        "OpenAI response choice index is not zero",
+                    ));
+                }
+            }
+            let message = choice
+                .get("message")
+                .and_then(Value::as_object)
+                .ok_or_else(|| malformed_response("OpenAI choice has no message object"))?;
+            let has_tool_calls = match message.get("tool_calls") {
+                None | Some(Value::Null) => false,
+                Some(Value::Array(calls)) => !calls.is_empty(),
+                Some(_) => {
+                    return Err(malformed_response(
+                        "OpenAI message tool_calls is not an array",
+                    ))
+                }
+            };
+            if message.get("refusal").is_some_and(|refusal| match refusal {
+                Value::String(text) => !text.is_empty(),
+                Value::Null => false,
+                _ => true,
+            }) {
+                return Err(malformed_response(
+                    "OpenAI response contains a model refusal",
+                ));
+            }
+            match choice.get("finish_reason").and_then(Value::as_str) {
+                Some("stop") if !has_tool_calls => Ok(()),
+                Some("stop") => Err(malformed_response(
+                    "OpenAI response contains tool calls with stop finish_reason",
+                )),
+                Some("length") => Ok(()),
+                Some("tool_calls") if has_tool_calls => Ok(()),
+                Some("tool_calls") => Err(malformed_response(
+                    "OpenAI tool_calls finish has no non-empty tool_calls array",
+                )),
+                Some("function_call") => Err(malformed_response(
+                    "OpenAI legacy function_call responses are unsupported by the Agent protocol",
+                )),
+                Some("content_filter") => Err(malformed_response(
+                    "OpenAI response was stopped by content filtering",
+                )),
+                Some(_) => Err(malformed_response(
+                    "OpenAI response has an unknown finish_reason",
+                )),
+                None => Err(malformed_response(
+                    "OpenAI response has no string finish_reason",
+                )),
+            }
+        }
+        Provider::Ollama => {
+            object
+                .get("message")
+                .and_then(Value::as_object)
+                .ok_or_else(|| malformed_response("Ollama response has no message object"))?;
+            match object.get("done") {
+                Some(Value::Bool(true)) => {}
+                Some(Value::Bool(false)) => {
+                    return Err(malformed_response("Ollama response is not marked complete"))
+                }
+                _ => {
+                    return Err(malformed_response(
+                        "Ollama response has no boolean done field",
+                    ))
+                }
+            }
+            match object.get("done_reason") {
+                None => Ok(()),
+                Some(Value::String(reason)) if matches!(reason.as_str(), "stop" | "length") => {
+                    Ok(())
+                }
+                Some(Value::String(_)) => Err(malformed_response(
+                    "Ollama response has an unknown done_reason",
+                )),
+                Some(_) => Err(malformed_response(
+                    "Ollama response has a non-string done_reason",
+                )),
+            }
+        }
+    }
+}
+
+/// Reject an explicitly incomplete, filtered, refused, or unknown completion
+/// status without requiring the complete high-level Agent envelope.
+///
+/// Native-tool parsing predates [`crate::response::AgentResponse`] and its
+/// low-level `Value` API intentionally accepts sparse compatibility fixtures.
+/// Missing completion metadata therefore stays compatible here, but metadata
+/// that is present must never authorize a potentially partial tool action.
+pub(crate) fn validate_tool_response_completion(
+    provider: Provider,
+    response: &Value,
+) -> Result<(), ProviderError> {
+    if let Some(object) = response.as_object() {
+        reject_provider_error_field(object)?;
+    }
+    match provider {
+        Provider::Anthropic => {
+            let has_tool_use = response
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                });
+            match response.get("stop_reason") {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(reason))
+                    if matches!(reason.as_str(), "end_turn" | "stop_sequence") && !has_tool_use =>
+                {
+                    Ok(())
+                }
+                Some(Value::String(reason))
+                    if matches!(reason.as_str(), "end_turn" | "stop_sequence") =>
+                {
+                    Err(malformed_response(
+                        "Anthropic response contains tool_use with a non-tool stop_reason",
+                    ))
+                }
+                Some(Value::String(reason))
+                    if matches!(
+                        reason.as_str(),
+                        "max_tokens" | "model_context_window_exceeded"
+                    ) =>
+                {
+                    Ok(())
+                }
+                // A sparse low-level fixture may carry `tool_use` without a
+                // call. That still resolves to `NoToolCall`, never an action;
+                // retain compatibility while rejecting the dangerous inverse
+                // (a real call paired with a non-tool completion reason).
+                Some(Value::String(reason)) if reason == "tool_use" => Ok(()),
+                Some(Value::String(reason))
+                    if matches!(reason.as_str(), "pause_turn" | "refusal") =>
+                {
+                    Err(malformed_response(
+                        "Anthropic response did not complete normally",
+                    ))
+                }
+                Some(Value::String(_)) => Err(malformed_response(
+                    "Anthropic response has an unknown stop_reason",
+                )),
+                Some(_) => Err(malformed_response(
+                    "Anthropic response has a non-string stop_reason",
+                )),
+            }
+        }
+        Provider::OpenAiCompatible => {
+            if let Some(Value::Array(choices)) = response.get("choices") {
+                if choices.len() > 1 {
+                    return Err(malformed_response(
+                        "OpenAI tool response contains more than one choice",
+                    ));
+                }
+                if let Some(choice) = choices.first().and_then(Value::as_object) {
+                    if choice
+                        .get("index")
+                        .is_some_and(|index| !index.is_null() && index.as_u64() != Some(0))
+                    {
+                        return Err(malformed_response(
+                            "OpenAI tool response choice index is not zero",
+                        ));
+                    }
+                }
+            }
+            if response
+                .pointer("/choices/0/message/refusal")
+                .is_some_and(|refusal| match refusal {
+                    Value::String(text) => !text.is_empty(),
+                    Value::Null => false,
+                    _ => true,
+                })
+            {
+                return Err(malformed_response(
+                    "OpenAI response contains a model refusal",
+                ));
+            }
+            let has_tool_calls = response
+                .pointer("/choices/0/message/tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| !calls.is_empty());
+            match response.pointer("/choices/0/finish_reason") {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(reason)) if reason == "stop" && !has_tool_calls => Ok(()),
+                Some(Value::String(reason)) if reason == "stop" => Err(malformed_response(
+                    "OpenAI response contains tool calls with stop finish_reason",
+                )),
+                Some(Value::String(reason)) if reason == "length" => Ok(()),
+                // Missing calls remain a harmless `NoToolCall` on this sparse
+                // compatibility API; the strict Agent envelope rejects them.
+                Some(Value::String(reason)) if reason == "tool_calls" => Ok(()),
+                Some(Value::String(reason)) if reason == "function_call" && has_tool_calls => {
+                    Err(malformed_response(
+                        "OpenAI tool calls conflict with legacy function_call completion",
+                    ))
+                }
+                Some(Value::String(reason)) if reason == "function_call" => Ok(()),
+                Some(Value::String(reason)) if reason == "content_filter" => Err(
+                    malformed_response("OpenAI response was stopped by content filtering"),
+                ),
+                Some(Value::String(_)) => Err(malformed_response(
+                    "OpenAI response has an unknown finish_reason",
+                )),
+                Some(_) => Err(malformed_response(
+                    "OpenAI response has a non-string finish_reason",
+                )),
+            }
+        }
+        Provider::Ollama => {
+            match response.get("done") {
+                None | Some(Value::Null) | Some(Value::Bool(true)) => {}
+                Some(Value::Bool(false)) => {
+                    return Err(malformed_response("Ollama response is not marked complete"))
+                }
+                Some(_) => {
+                    return Err(malformed_response(
+                        "Ollama response has a non-boolean done field",
+                    ))
+                }
+            }
+            match response.get("done_reason") {
+                None | Some(Value::Null) => Ok(()),
+                Some(Value::String(reason)) if matches!(reason.as_str(), "stop" | "length") => {
+                    Ok(())
+                }
+                Some(Value::String(_)) => Err(malformed_response(
+                    "Ollama response has an unknown done_reason",
+                )),
+                Some(_) => Err(malformed_response(
+                    "Ollama response has a non-string done_reason",
+                )),
+            }
+        }
+    }
+}
+
+fn reject_provider_error_field(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(), ProviderError> {
+    if object.get("error").is_some_and(|error| !error.is_null()) {
+        return Err(malformed_response(
+            "provider returned an error instead of a completion",
+        ));
+    }
+    Ok(())
+}
+
+fn malformed_response(detail: &'static str) -> ProviderError {
+    ProviderError::MalformedResponse(detail.to_string())
+}
+
+/// Did the provider stop at a generation bound that can truncate the reply?
+/// Shared by the text and native-tool ingestion paths so both report the same
+/// condition.
 pub(crate) fn reached_token_limit(provider: Provider, response: &Value) -> bool {
     match provider {
         Provider::Anthropic => {
-            response.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+            matches!(
+                response.get("stop_reason").and_then(Value::as_str),
+                Some("max_tokens" | "model_context_window_exceeded")
+            )
         }
         Provider::OpenAiCompatible => {
             response
@@ -1316,6 +1713,17 @@ mod tests {
             "https://example.com/v1?api-key=secret",
             "https://example.com/v1#fragment",
             "https://example.com\\v1",
+            "https://%65xample.com",
+            "https://example..com",
+            "https://-example.com",
+            "https://example-.com",
+            "https://exa_mple.com",
+            "https://.",
+            "https://2130706433",
+            "https://0x7f000001",
+            "https://127.1",
+            "https://999.1.1.1",
+            "https://例子.example",
             "https://exam\u{200b}ple.com",
             "https://example.com/\u{202e}v1",
             "https://example.com/v 1",
@@ -1333,6 +1741,17 @@ mod tests {
         let mut long = config(Provider::OpenAiCompatible);
         long.base_url = format!("https://example.com/{}", "x".repeat(MAX_BASE_URL_BYTES));
         assert!(long.validate().is_err());
+
+        for valid in [
+            "https://api-1.example/v1",
+            "https://xn--bcher-kva.example/v1",
+            "https://127.0.0.1/v1",
+            "https://[2001:db8::1]/v1",
+        ] {
+            let mut endpoint = config(Provider::OpenAiCompatible);
+            endpoint.base_url = valid.into();
+            assert!(endpoint.validate().is_ok(), "{valid:?} must be accepted");
+        }
 
         for hostile in [
             "gpt\u{202e}4o",
@@ -1653,7 +2072,7 @@ mod tests {
         });
         let text = parse_chat_response(Provider::Anthropic, &truncated).unwrap();
         assert!(text.starts_with("partial"));
-        assert!(text.contains("output limit"));
+        assert!(text.contains("generation limit"));
 
         let empty = serde_json::json!({"content": []});
         assert!(matches!(

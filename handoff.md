@@ -1,15 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-08-10
-Release target: 0.7.0
+Updated: 2026-08-13
+Baseline: 0.7.0
+Release target: Unreleased
 
-Version 0.7 adds an integration-first path over the hardened 0.6 primitives.
+The 0.7 baseline adds an integration-first path over the hardened 0.6 primitives.
 The low-level provider, tool, stream, and session APIs remain available, while
 new integrations can bind request preparation, response decoding, and session
 ingestion to one `AgentProtocol` and receive machine-readable history
 transformation reports.
 
-## 0.7 release surface
+## Current 0.7 surface
 
 ### Recommended agent loop
 
@@ -22,13 +23,19 @@ transformation reports.
   the provider, protocol, and delivery mode used to build the wire request.
 - `PreparedAgentRequest::parse_response` performs one bounded JSON decode and
   selects `ChatResponse` or `ToolResponse` according to the bound protocol.
-  Text mode rejects native calls instead of discarding them.
+  It requires one complete, protocol-consistent provider envelope; Text mode
+  rejects native calls instead of discarding them. The low-level native-tool
+  parser retains sparse-fixture compatibility but rejects explicit failures,
+  ambiguous choices, and completion metadata inconsistent with a present
+  call; the legacy low-level chat parser remains a tolerant text extractor.
 - `AgentSession::accept_agent_response` is the paired high-level ingestion
   point. Token-limited output and protocol mismatches never become actions.
 - `PreparedAgentRequest::response_stream` creates the correctly paired
   `AgentStream`, which transparently returns low-level `StreamEvent`s while
   folding a response internally. Conversion succeeds only after `Done`;
-  protocol error, premature EOF, and Text-mode tool calls fail closed.
+  refusal/filter/error states, unknown completion, premature EOF, and Text-mode
+  tool calls fail closed. `protocol()` and `is_complete()` expose diagnostics;
+  `into_response` remains authoritative.
 - Delivery mismatch is rejected: non-streaming requests use `parse_response`,
   while streaming requests use `response_stream`.
 - Anthropic, OpenAI-compatible Chat Completions, and Ollama `/api/chat` all
@@ -39,6 +46,11 @@ The executable `examples/quickstart.rs` exercises the complete path without
 network or process I/O. It uses an OpenAI-compatible loopback endpoint, proves
 default redaction and report accounting, decodes a local response fixture,
 and explicitly walks proposal, approval, and observation transitions.
+
+`examples/streaming.rs` covers the complementary NativeTools streaming path.
+It feeds a local OpenAI-compatible SSE fixture across arbitrary byte
+boundaries, completes the prepared accumulator, and demonstrates that a raw
+tool event is not approval.
 
 ### Session review lifecycle
 
@@ -61,13 +73,19 @@ and explicitly walks proposal, approval, and observation transitions.
 - `HistoryReport` and `PreparedHistory` expose input, sent, omitted, changed,
   elided, and retained-text-byte counts.
 - `redact_secrets_cow` borrows clean input; `redact_secrets` remains the owned
-  compatibility wrapper.
+  compatibility wrapper. Detection covers established provider/package token
+  formats, named secrets and headers, private-key blocks, and signed/OAuth URL
+  parameters without treating every opaque identifier as a secret.
 - `HttpRequest::Debug` reports body length instead of logging AI-bound user
   context. Credential headers remain redacted.
 - Plain HTTP is accepted for syntactic loopback endpoints for every provider,
   enabling local OpenAI-compatible servers and proxies. Remote endpoints still
-  require HTTPS; URL whitespace, invalid ports, credentials, query, fragment,
+  require HTTPS and an ASCII DNS name or canonical IP literal; URL whitespace,
+  invalid ports, credentials, query, fragment, encoded/ambiguous hosts,
   backslash, control, and ambiguous display characters are rejected.
+- Block and environment context budgets are enforced after JSON encoding,
+  local output elision is disclosed, and untrusted values cannot close their
+  raw prompt envelope.
 
 ## Compatibility contract
 
@@ -124,26 +142,44 @@ Do not process a raw streamed `ToolCall` as authorization. Fold the complete
 stream, ingest the resulting `AgentResponse`, display the resulting proposal,
 and require explicit approval.
 
+## Development and release contract
+
+- `Cargo.toml` declares Rust 1.86 as the MSRV; `rust-toolchain.toml` keeps local
+  development on current stable with rustfmt and Clippy.
+- CI checks stable formatting, linting, rustdoc warnings, tests, executable
+  examples, the packaged crate, and a dedicated Rust 1.86 build/test lane.
+- Third-party GitHub Actions are pinned to full commit SHAs and Dependabot
+  watches both Cargo and workflow dependencies.
+- The generic transport/review lifecycle is documented in
+  `docs/integration-guide.md`; historical consumer-specific notes remain in
+  `docs/jterm4-migration.md`.
+
 ## Release checklist
 
-Before tagging 0.7.0:
+Before tagging the next release:
 
-1. Ensure the root package entry in `Cargo.lock` is also `0.7.0`.
+1. Set the intended package version and ensure the root entry in `Cargo.lock`
+   matches it. Move user-visible entries out of `Unreleased` only as part of
+   that release change.
 2. Run the no-I/O example and the locked stable-toolchain gates.
-3. Verify the packaged crate contains README, changelog, both license files,
-   migration notes, and the quickstart example.
+3. Run the Rust 1.86 check/test lane.
+4. Verify the packaged crate contains README, changelog, contribution and
+   security policies, both license files, both guides, and both examples.
 
 ```text
 cargo fmt --all -- --check
 cargo run --locked --example quickstart
+cargo run --locked --example streaming
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo test --locked --all-features --doc
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo doc --locked --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo +1.86.0 check --locked --all-targets --all-features
+cargo +1.86.0 test --locked --all-targets --all-features --no-fail-fast
 cargo package --locked --allow-dirty
 ```
 
-The quickstart intentionally sends nothing. A successful run proves request
-construction, secure-default reporting, bounded local response parsing, and
-the explicit review transitions only.
+The examples intentionally send and execute nothing. Successful runs prove
+request construction, secure-default reporting, bounded local response
+parsing, and explicit review transitions only.

@@ -1,5 +1,9 @@
 # jagent
 
+[![CI](https://github.com/beamiter/jagent/actions/workflows/ci.yml/badge.svg)](https://github.com/beamiter/jagent/actions/workflows/ci.yml)
+![MSRV](https://img.shields.io/badge/MSRV-1.86-dea584.svg)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 `jagent` is a review-first, sans-IO Rust core for terminal AI agents. It owns
 the bounded session state machine, provider wire formats, protocol parsing,
 request preparation, streaming accumulation, and command-review invariants.
@@ -9,6 +13,27 @@ Your integration owns HTTP, process execution, durable storage, and UI.
 [forge](https://github.com/beamiter/forge) use it directly.
 [jterm_core](https://github.com/beamiter/jterm_core) carries the shared
 integration used by anvil, ember, forge, and frost.
+
+| Capability | Contract |
+|---|---|
+| Providers | Anthropic Messages, OpenAI-compatible Chat Completions, and Ollama `/api/chat` |
+| Action protocols | Strict JSON-in-text and provider-native tools |
+| Delivery | Bounded complete-response decoding and incremental SSE/NDJSON streaming |
+| Execution | Never performed by this crate; every command becomes a proposal requiring explicit approval |
+| Runtime coupling | None: no HTTP client, async runtime, process, PTY, storage, or UI dependency |
+| Rust baseline | Rust 1.86 (edition 2021) |
+
+Documentation:
+
+- [Integration guide](docs/integration-guide.md) — transport, streaming,
+  review, failure, and persistence ownership.
+- [Quickstart example](examples/quickstart.rs) — a complete non-streaming Text
+  turn with a local response fixture.
+- [Streaming example](examples/streaming.rs) — chunked native-tool streaming
+  through the same review state machine.
+- [Migration notes](docs/jterm4-migration.md) — compatibility guidance for
+  `jterm_core` and existing terminal consumers.
+- [Changelog](CHANGELOG.md) — release history and compatibility notes.
 
 ## Quick start
 
@@ -166,7 +191,16 @@ fails closed. A streamed `ToolCall` event is not execution authorization;
 integrations should act only on the proposal produced after successful
 response conversion and session ingestion. `parse_response` rejects a request
 prepared for streaming, and `response_stream` rejects one prepared for a
-complete response body.
+complete response body. `AgentStream::protocol` reports the bound protocol and
+`is_complete` reports whether the low-level `Done` marker was observed;
+`into_response` remains the authoritative final validation step.
+
+Run the no-I/O native-tools companion to exercise arbitrary chunk boundaries,
+stream completion, response conversion, and proposal approval:
+
+```text
+cargo run --example streaming
+```
 
 ## Native tools
 
@@ -198,10 +232,13 @@ calls fail closed.
    `ApprovedCommand`; the caller must deliberately hand it to an executor.
 2. Malformed model replies fail closed. Parse failure never becomes a command
    proposal.
-3. Transcripts, observations, request history, response envelopes, streamed
-   frames, model text, and tool arguments are byte-bounded.
+3. Transcripts, observations, request history, encoded prompt contexts,
+   response envelopes, streamed frames, model text, and tool arguments are
+   byte-bounded.
 4. Terminal output and environment metadata travel as explicitly untrusted
-   user-role data, never as system instructions.
+   user-role data, never as system instructions. Context budgets are enforced
+   after JSON encoding, and untrusted values cannot spell their raw enclosing
+   closing tag.
 5. Every proposal requires explicit approval. `is_auto_approvable` remains as
    a compatibility hook and always returns `false`.
 6. Snapshot restore revalidates transcript bounds, command shape, active
@@ -243,7 +280,9 @@ stages:
 - `provider::parse_chat_response*_bytes` and
   `tools::parse_tool_response_bytes` remain bounded byte entry points.
   Their `serde_json::Value` counterparts are only for trusted or already
-  transport-bounded values.
+  transport-bounded values. These lower-level parsers preserve compatibility
+  with sparse legacy fixtures; high-level `AgentResponse` decoding requires a
+  complete, unambiguous provider envelope before action parsing.
 - `session::accept_model_reply` and `accept_model_tool_reply` remain available
   when an integration deliberately manages protocol pairing itself.
 - `StreamParser` remains the raw event parser for integrations that need to
@@ -282,15 +321,23 @@ are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 The repository follows the terminal-family Rust toolchain convention:
 `rust-toolchain.toml` selects stable with the minimal profile plus rustfmt and
-Clippy. The release gate is:
+Clippy. The crate's declared MSRV is Rust 1.86, which CI checks separately.
+The full local release gate is:
 
 ```text
+cargo fmt --all -- --check
+cargo run --locked --example quickstart
+cargo run --locked --example streaming
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo test --locked --all-features --doc
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo doc --locked --all-features --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
+cargo package --locked --allow-dirty
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for compatibility and test expectations.
+Potential vulnerabilities should be reported through [SECURITY.md](SECURITY.md).
 
 ## License
 

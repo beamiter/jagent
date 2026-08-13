@@ -2,12 +2,32 @@
 name = "jagent"
 version = "0.7.0"
 edition = "2021"
+rust-version = "1.86"
 description = "Review-first terminal AI agent core: bounded sessions, provider protocols, streaming, and safety (sans-IO)"
 readme = "README.md"
 repository = "https://github.com/beamiter/jagent"
+homepage = "https://github.com/beamiter/jagent"
+documentation = "https://docs.rs/jagent"
 keywords = ["terminal", "shell", "agent", "ai", "llm"]
 categories = ["command-line-utilities"]
 license = "MIT OR Apache-2.0"
+include = [
+    "/src/**",
+    "/examples/**",
+    "/docs/**",
+    "/CHANGELOG.md",
+    "/CONTRIBUTING.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+    "/README.md",
+    "/SECURITY.md",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [dependencies]
 regex = "1"

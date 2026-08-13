@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added a runnable no-I/O NativeTools streaming example and a production
+  integration guide covering transport, response decoding, review, failure,
+  cancellation, and persistence boundaries.
+- Added contributor and private security-reporting guidance.
+- Added a dedicated Rust 1.86 CI lane, packaged-crate verification, executable
+  example checks, pull-request dependency review, and weekly Cargo and GitHub
+  Actions update checks.
+- Added `AgentResponse::protocol`, `AgentStream::protocol`, and
+  `AgentStream::is_complete` for integration diagnostics, plus an error source
+  from `SessionError::Protocol` to its underlying `ParseError`.
+
+### Changed
+
+- Declared Rust 1.86 as the crate MSRV, added docs.rs and repository metadata,
+  forbade unsafe Rust, and restricted published package contents to the public
+  source, examples, guides, policies, changelog, and licenses.
+- Pinned every third-party CI action to a full commit SHA and made CI
+  credentials read-only and non-persistent.
+- Provider generation-limit reporting now includes Anthropic context-window
+  exhaustion as incomplete output, including the high-level action guard and
+  streaming event path.
+- Selected-block and environment contexts are now budgeted after JSON encoding;
+  local output elision is reported and untrusted closing-tag prefixes are
+  escaped so values cannot terminate their prompt envelope.
+- High-confidence redaction now covers more provider/package tokens, truncated
+  private-key blocks, named secret settings and headers, and signed/OAuth URL
+  parameters while remaining idempotent.
+- Dangerous-command warnings now recognize shell boundaries, substitutions,
+  wrappers, top-level targets, destructive Git/infrastructure/service/storage
+  operations, and review-smuggling control or invisible characters.
+
+### Fixed
+
+- Corrected migration guidance to distinguish the high-level request path's
+  default secret redaction from the low-level builders' explicit preparation
+  policy.
+- Streaming SSE/NDJSON framing now accepts CRLF delimiters split across
+  transport chunks, bare-CR record endings, and an initial SSE UTF-8 BOM.
+- Ollama error payloads are surfaced as structured provider failures instead
+  of falling through to unrelated response-shape errors.
+- Base URL validation now requires an ASCII DNS hostname or canonical IP
+  literal and rejects ambiguous numeric, encoded, empty-label, and otherwise
+  transport-dependent host spellings.
+
+### Compatibility
+
+- High-level `AgentResponse` decoding now requires one complete,
+  protocol-consistent provider envelope before action parsing. The low-level
+  native-tool parser retains harmless sparse-fixture compatibility while
+  rejecting explicit failures, ambiguous choices, and completion metadata
+  inconsistent with a present call; the legacy low-level chat parser remains
+  a tolerant text extractor.
+
+### Security
+
+- High-level response handling now fails closed before action conversion on
+  provider refusals, content filtering, context truncation, unknown completion
+  reasons, multiple choices, legacy `function_call` deltas, malformed choices,
+  and invalid tool-call types.
+- The high-level Anthropic/OpenAI `AgentStream` now requires a supported
+  completion reason before the final marker (the low-level `StreamParser`
+  event contract remains compatible), and non-streaming OpenAI/Ollama replies
+  reject explicitly non-function tool-call types.
+- Anthropic/OpenAI completion reasons must agree with whether a tool payload is
+  present, so tool-shaped endings cannot promote valid-looking text and
+  ordinary endings cannot authorize contradictory tool calls.
+
 ## [0.7.0] - 2026-08-10
 
 ### Added

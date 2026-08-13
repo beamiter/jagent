@@ -8,11 +8,13 @@
 //!
 //! [`AgentStream`] folds the existing low-level [`StreamEvent`] values into an
 //! [`AgentResponse`] without changing which events are returned to the caller.
-//! A folded response is available only after [`StreamEvent::Done`]. Protocol
-//! errors, truncated streams, and native tool calls in text mode fail closed.
+//! A folded response is available only after [`StreamEvent::Done`] with valid
+//! provider completion metadata. Protocol errors, truncated streams, and
+//! native tool calls in text mode fail closed.
 
 use crate::provider::{
-    decode_response_value, parse_chat_response_full, ChatResponse, Provider, ProviderError, Usage,
+    decode_response_value, parse_chat_response_full, validate_agent_response_envelope,
+    ChatResponse, Provider, ProviderError, Usage,
 };
 use crate::session::{parse_action, ParseError, ParsedAction};
 use crate::stream::{StreamEvent, StreamParser};
@@ -23,6 +25,8 @@ const TEXT_RESPONSE_CONTAINED_TOOL_CALLS: &str =
     "text protocol response contained native tool calls";
 const TEXT_STREAM_CONTAINED_TOOL_CALL: &str = "text protocol stream contained a native tool call";
 const STREAM_NOT_COMPLETE: &str = "stream did not reach a completion event";
+const STREAM_MISSING_COMPLETION_REASON: &str =
+    "stream reached its final marker without a supported completion reason";
 
 /// One complete agent response in the wire protocol selected for its request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +62,7 @@ impl AgentResponse {
         protocol: AgentProtocol,
         value: &Value,
     ) -> Result<Self, ProviderError> {
+        validate_agent_response_envelope(provider, value)?;
         match protocol {
             AgentProtocol::Text => {
                 ensure_text_response_has_no_tool_calls(provider, value)?;
@@ -72,8 +77,8 @@ impl AgentResponse {
     /// Resolve this response to the single action consumed by an
     /// [`crate::session::AgentSession`].
     ///
-    /// A text response stopped at the provider token limit is never parsed as
-    /// an action, even when its partial text happens to be valid JSON.
+    /// A text response stopped at a provider generation bound is never parsed
+    /// as an action, even when its partial text happens to be valid JSON.
     pub fn to_action(&self) -> Result<ParsedAction, ParseError> {
         match self {
             Self::Text(response) => {
@@ -94,7 +99,8 @@ impl AgentResponse {
         }
     }
 
-    /// Whether the provider stopped at its configured output-token limit.
+    /// Whether the provider stopped at a generation bound that may have
+    /// truncated the reply (an output-token or reported context-window limit).
     pub fn reached_token_limit(&self) -> bool {
         match self {
             Self::Text(response) => response.reached_token_limit,
@@ -107,6 +113,14 @@ impl AgentResponse {
         match self {
             Self::Text(response) => response.usage,
             Self::NativeTools(response) => response.usage,
+        }
+    }
+
+    /// Wire protocol this response was decoded with.
+    pub fn protocol(&self) -> AgentProtocol {
+        match self {
+            Self::Text(_) => AgentProtocol::Text,
+            Self::NativeTools(_) => AgentProtocol::NativeTools,
         }
     }
 }
@@ -144,6 +158,18 @@ impl AgentStream {
         }
     }
 
+    /// Wire protocol selected for this accumulator.
+    pub fn protocol(&self) -> AgentProtocol {
+        self.protocol
+    }
+
+    /// Whether the low-level parser emitted [`StreamEvent::Done`]. A stream
+    /// with that marker can still have a high-level protocol mismatch;
+    /// [`Self::into_response`] remains the authoritative validation step.
+    pub fn is_complete(&self) -> bool {
+        self.done
+    }
+
     /// Feed the next raw response-body chunk and return the underlying parser
     /// events unchanged.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
@@ -163,8 +189,9 @@ impl AgentStream {
     /// high-level response.
     ///
     /// A low-level protocol error, a stream that has not emitted
-    /// [`StreamEvent::Done`], or a tool call observed in text mode is returned
-    /// as [`ProviderError::MalformedResponse`].
+    /// [`StreamEvent::Done`], missing provider completion metadata, or a tool
+    /// call observed in text mode is returned as
+    /// [`ProviderError::MalformedResponse`].
     pub fn into_response(self) -> Result<AgentResponse, ProviderError> {
         if let Some(message) = self.failure {
             return Err(ProviderError::MalformedResponse(message));
@@ -201,7 +228,12 @@ impl AgentStream {
                     }
                 }
                 StreamEvent::Usage(usage) => self.usage = Some(*usage),
-                StreamEvent::Done => self.done = true,
+                StreamEvent::Done => {
+                    self.done = true;
+                    if !self.parser.has_explicit_completion_reason() && self.failure.is_none() {
+                        self.failure = Some(STREAM_MISSING_COMPLETION_REASON.to_string());
+                    }
+                }
                 StreamEvent::Protocol(message) => {
                     if self.failure.is_none() {
                         self.failure = Some(message.clone());
@@ -295,6 +327,7 @@ mod tests {
         );
         assert!(!response.reached_token_limit());
         assert_eq!(response.usage(), Some(usage(7, 9)));
+        assert_eq!(response.protocol(), AgentProtocol::Text);
         assert!(matches!(response, AgentResponse::Text(_)));
     }
 
@@ -313,6 +346,22 @@ mod tests {
 
         assert!(response.reached_token_limit());
         assert_eq!(response.usage(), Some(usage(2, 3)));
+        assert_eq!(response.to_action(), Err(ParseError::TruncatedResponse));
+    }
+
+    #[test]
+    fn anthropic_context_window_limit_is_truncated_too() {
+        let value = json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"action\":\"run\",\"command\":\"rm -rf important\"}",
+            }],
+            "stop_reason": "model_context_window_exceeded",
+        });
+        let response =
+            AgentResponse::parse_value(Provider::Anthropic, AgentProtocol::Text, &value).unwrap();
+
+        assert!(response.reached_token_limit());
         assert_eq!(response.to_action(), Err(ParseError::TruncatedResponse));
     }
 
@@ -340,6 +389,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(response, AgentResponse::NativeTools(_)));
+        assert_eq!(response.protocol(), AgentProtocol::NativeTools);
         assert_eq!(response.text(), "Inspecting first.");
         assert_eq!(response.usage(), Some(usage(11, 13)));
         assert_eq!(
@@ -361,6 +411,7 @@ mod tests {
                         {"type": "text", "text": "prose"},
                         {"type": "tool_use", "name": "run", "input": {"command": "pwd"}},
                     ],
+                    "stop_reason": "tool_use",
                 }),
             ),
             (
@@ -369,7 +420,7 @@ mod tests {
                     "choices": [{"message": {
                         "content": "prose",
                         "tool_calls": [{"function": {"name": "run", "arguments": "{}"}}],
-                    }}],
+                    }, "finish_reason": "tool_calls"}],
                 }),
             ),
             (
@@ -379,6 +430,8 @@ mod tests {
                         "content": "prose",
                         "tool_calls": [{"function": {"name": "run", "arguments": {}}}],
                     },
+                    "done": true,
+                    "done_reason": "stop",
                 }),
             ),
         ];
@@ -410,6 +463,187 @@ mod tests {
             response.to_action(),
             Ok(ParsedAction::Done { .. })
         ));
+    }
+
+    #[test]
+    fn non_streaming_agent_envelopes_fail_closed_before_action_parsing() {
+        let valid_looking_action = "{\"action\":\"run\",\"command\":\"rm -rf important\"}";
+        let malformed = [
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {"content": valid_looking_action},
+                        "finish_reason": "content_filter",
+                    }],
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "error": {"message": "request failed"},
+                    "choices": [{
+                        "index": 0,
+                        "message": {"content": valid_looking_action},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "content": valid_looking_action,
+                            "refusal": "I cannot complete this request",
+                        },
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "content": null,
+                            "function_call": {"name": "run", "arguments": "{}"},
+                        },
+                        "finish_reason": "function_call",
+                    }],
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 1,
+                        "message": {"content": valid_looking_action},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [
+                        {"message": {"content": valid_looking_action}, "finish_reason": "stop"},
+                        {"message": {"content": valid_looking_action}, "finish_reason": "stop"},
+                    ],
+                }),
+            ),
+            (
+                Provider::Anthropic,
+                json!({
+                    "content": [{"type": "text", "text": valid_looking_action}],
+                    "stop_reason": "pause_turn",
+                }),
+            ),
+            (
+                Provider::Anthropic,
+                json!({
+                    "content": [{"type": "text", "text": valid_looking_action}],
+                    "stop_reason": "tool_use",
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {"content": valid_looking_action},
+                        "finish_reason": "tool_calls",
+                    }],
+                }),
+            ),
+            (
+                Provider::Ollama,
+                json!({
+                    "message": {"content": valid_looking_action},
+                    "done": false,
+                }),
+            ),
+            (
+                Provider::Ollama,
+                json!({
+                    "error": "request failed",
+                    "message": {"content": valid_looking_action},
+                    "done": true,
+                    "done_reason": "stop",
+                }),
+            ),
+        ];
+
+        for (provider, value) in malformed {
+            assert!(matches!(
+                AgentResponse::parse_value(provider, AgentProtocol::Text, &value),
+                Err(ProviderError::MalformedResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn native_completion_reason_must_match_the_tool_payload() {
+        let fixtures = [
+            (
+                Provider::Anthropic,
+                json!({
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "run",
+                        "input": {"command": "pwd"},
+                    }],
+                    "stop_reason": "end_turn",
+                }),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {"content": null, "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "run", "arguments": "{\"command\":\"pwd\"}"},
+                        }]},
+                        "finish_reason": "stop",
+                    }],
+                }),
+            ),
+        ];
+
+        for (provider, value) in fixtures {
+            assert!(matches!(
+                AgentResponse::parse_value(provider, AgentProtocol::NativeTools, &value),
+                Err(ProviderError::MalformedResponse(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn non_streaming_agent_envelopes_require_completion_metadata() {
+        let fixtures = [
+            (
+                Provider::Anthropic,
+                json!({"content": [{"type": "text", "text": "hello"}]}),
+            ),
+            (
+                Provider::OpenAiCompatible,
+                json!({"choices": [{"message": {"content": "hello"}}]}),
+            ),
+            (Provider::Ollama, json!({"message": {"content": "hello"}})),
+        ];
+
+        for (provider, value) in fixtures {
+            assert!(matches!(
+                AgentResponse::parse_value(provider, AgentProtocol::Text, &value),
+                Err(ProviderError::MalformedResponse(_))
+            ));
+        }
     }
 
     fn text_stream_body(finish_reason: &str) -> String {
@@ -458,11 +692,14 @@ mod tests {
         expected.extend(direct.push(chunks[1]));
 
         let mut stream = AgentStream::new(Provider::OpenAiCompatible, AgentProtocol::Text);
+        assert_eq!(stream.protocol(), AgentProtocol::Text);
+        assert!(!stream.is_complete());
         let mut actual = Vec::new();
         actual.extend(stream.push(chunks[0]));
         actual.extend(stream.push(chunks[1]));
         assert_eq!(actual, expected);
         assert!(actual.contains(&StreamEvent::Done));
+        assert!(stream.is_complete());
 
         let response = stream.into_response().unwrap();
         assert_eq!(response.usage(), Some(usage(17, 19)));
@@ -546,6 +783,45 @@ mod tests {
             unfinished.into_response(),
             Err(ProviderError::MalformedResponse(message)) if message == STREAM_NOT_COMPLETE
         ));
+    }
+
+    #[test]
+    fn high_level_stream_requires_provider_completion_metadata() {
+        let fixtures = [
+            (
+                Provider::OpenAiCompatible,
+                concat!(
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},",
+                    "\"finish_reason\":null}]}\n\n",
+                    "data: [DONE]\n\n",
+                ),
+            ),
+            (
+                Provider::Anthropic,
+                concat!(
+                    "event: content_block_start\n",
+                    "data: {\"type\":\"content_block_start\",\"index\":0,",
+                    "\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n",
+                    "event: content_block_stop\n",
+                    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                    "event: message_stop\n",
+                    "data: {\"type\":\"message_stop\"}\n\n",
+                ),
+            ),
+        ];
+
+        for (provider, body) in fixtures {
+            let mut stream = AgentStream::new(provider, AgentProtocol::Text);
+            let events = stream.push(body.as_bytes());
+            // Preserve the established low-level event stream for compatible
+            // parsers while refusing to promote it through the Agent API.
+            assert!(events.contains(&StreamEvent::Done), "{provider:?}");
+            assert!(matches!(
+                stream.into_response(),
+                Err(ProviderError::MalformedResponse(message))
+                    if message == STREAM_MISSING_COMPLETION_REASON
+            ));
+        }
     }
 
     #[test]

@@ -163,9 +163,9 @@ pub enum ParseError {
     /// Native tool mode: the reply carried more than one tool call. The state
     /// machine advances one action per turn; choosing one would be a guess.
     MultipleToolCalls(usize),
-    /// The provider reported that generation stopped at its output-token
-    /// limit. Even syntactically complete-looking tool arguments are treated
-    /// as partial and cannot become an action.
+    /// The provider reported that generation stopped at a token or context
+    /// bound. Even syntactically complete-looking output is treated as
+    /// partial and cannot become an action.
     TruncatedResponse,
 }
 
@@ -193,7 +193,7 @@ impl std::fmt::Display for ParseError {
             Self::TruncatedResponse => {
                 write!(
                     f,
-                    "reply reached the provider output limit and may be truncated"
+                    "reply reached a provider generation limit and may be truncated"
                 )
             }
         }
@@ -432,7 +432,14 @@ impl std::fmt::Display for SessionError {
     }
 }
 
-impl std::error::Error for SessionError {}
+impl std::error::Error for SessionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Protocol(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelOutcome {
@@ -694,8 +701,9 @@ impl AgentSession {
     /// replies through [`crate::response::AgentResponse::to_action`] and then
     /// uses the same state transition path as [`Self::accept_model_reply`] and
     /// [`Self::accept_model_tool_reply`]. In particular, a provider-reported
-    /// token limit fails with [`ParseError::TruncatedResponse`] before even a
-    /// syntactically complete-looking command can become a proposal.
+    /// generation bound fails with
+    /// [`ParseError::TruncatedResponse`] before even a syntactically
+    /// complete-looking command can become a proposal.
     pub fn accept_agent_response(
         &mut self,
         response: &crate::response::AgentResponse,

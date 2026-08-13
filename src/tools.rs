@@ -308,6 +308,7 @@ pub fn parse_tool_response(
     provider: Provider,
     response: &Value,
 ) -> Result<ToolResponse, ProviderError> {
+    crate::provider::validate_tool_response_completion(provider, response)?;
     let (text, calls) = match provider {
         Provider::Anthropic => anthropic_parts(response)?,
         Provider::OpenAiCompatible => openai_parts(response)?,
@@ -396,6 +397,11 @@ fn function_calls(value: Option<&Value>) -> Result<Vec<ToolCall>, ProviderError>
         Some(Value::Array(entries)) => {
             for entry in entries {
                 ensure_tool_call_capacity(&calls)?;
+                match entry.get("type") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(kind)) if kind == "function" => {}
+                    Some(_) => return Err(malformed("tool call type is not 'function'")),
+                }
                 let function = entry
                     .get("function")
                     .ok_or_else(|| malformed("tool_calls entry has no function object"))?;
@@ -1211,5 +1217,129 @@ mod tests {
         let parsed = parse_tool_response(Provider::Anthropic, &json!({"content": []})).unwrap();
         assert_eq!(parsed.text, "");
         assert_eq!(parsed.to_action(), Err(ParseError::NoToolCall));
+    }
+
+    #[test]
+    fn native_tool_parser_rejects_incomplete_or_filtered_envelopes() {
+        let unsafe_call = json!({
+            "id": "call_unsafe",
+            "function": {
+                "name": "run",
+                "arguments": "{\"command\":\"rm -rf important\"}",
+            },
+        });
+        let filtered = json!({
+            "choices": [{
+                "message": {"content": null, "tool_calls": [unsafe_call]},
+                "finish_reason": "content_filter",
+            }],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &filtered),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let refused = json!({
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "refusal": "cannot comply",
+                    "tool_calls": [unsafe_call],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &refused),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let stopped_with_call = json!({
+            "choices": [{
+                "index": 0,
+                "message": {"content": null, "tool_calls": [unsafe_call]},
+                "finish_reason": "stop",
+            }],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &stopped_with_call),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let ambiguous_choices = json!({
+            "choices": [
+                {"index": 0, "message": {"tool_calls": [unsafe_call]}},
+                {"index": 1, "message": {"tool_calls": [unsafe_call]}},
+            ],
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::OpenAiCompatible, &ambiguous_choices),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let anthropic_mismatch = json!({
+            "content": [{
+                "type": "tool_use",
+                "name": "run",
+                "input": {"command": "rm -rf important"},
+            }],
+            "stop_reason": "end_turn",
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::Anthropic, &anthropic_mismatch),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let unfinished = json!({
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "function": {"name": "run", "arguments": {"command": "pwd"}},
+                }],
+            },
+            "done": false,
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::Ollama, &unfinished),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        let provider_error = json!({
+            "error": "request failed",
+            "message": {
+                "content": "",
+                "tool_calls": [{
+                    "function": {"name": "run", "arguments": {"command": "pwd"}},
+                }],
+            },
+            "done": true,
+        });
+        assert!(matches!(
+            parse_tool_response(Provider::Ollama, &provider_error),
+            Err(ProviderError::MalformedResponse(_))
+        ));
+
+        for provider in [Provider::OpenAiCompatible, Provider::Ollama] {
+            let wrong_type = match provider {
+                Provider::OpenAiCompatible => json!({
+                    "choices": [{"message": {"tool_calls": [{
+                        "type": "custom",
+                        "function": {"name": "run", "arguments": "{}"},
+                    }]}}],
+                }),
+                Provider::Ollama => json!({
+                    "message": {"tool_calls": [{
+                        "type": "custom",
+                        "function": {"name": "run", "arguments": {}},
+                    }]},
+                }),
+                Provider::Anthropic => unreachable!(),
+            };
+            assert!(matches!(
+                parse_tool_response(provider, &wrong_type),
+                Err(ProviderError::MalformedResponse(message))
+                    if message == "tool call type is not 'function'"
+            ));
+        }
     }
 }

@@ -37,12 +37,13 @@
 //! private until the enclosing response succeeds, so a later error cannot
 //! leave an actionable call behind.
 //!
-//! UTF-8 handling: input is buffered as bytes and split only at `\n`, so a
-//! multi-byte sequence split across pushes is reassembled before decoding. A
-//! *complete* frame that still fails UTF-8 validation is rejected as
-//! malformed rather than decoded lossily — every supported wire format is
-//! JSON, which is valid UTF-8 by definition, so lossy replacement characters
-//! could only ever corrupt model text.
+//! UTF-8 and line handling: input is buffered as bytes and split on LF, CRLF,
+//! or bare CR without splitting a multi-byte character. CRLF may itself span
+//! two pushes, and SSE's optional initial UTF-8 BOM is accepted. A *complete*
+//! frame that still fails UTF-8 validation is rejected as malformed rather
+//! than decoded lossily — every supported wire format is JSON, which is valid
+//! UTF-8 by definition, so replacement characters could only corrupt model
+//! text.
 
 use crate::provider::{Provider, ProviderError, Usage, MAX_MODEL_TEXT_BYTES};
 use crate::text::elide_middle;
@@ -82,11 +83,13 @@ pub enum StreamEvent {
     /// [`crate::provider::parse_chat_response_full`] would extract from the
     /// equivalent non-streaming response.
     TextDelta(String),
-    /// The provider stopped at the output-token limit — Anthropic
-    /// `stop_reason` `"max_tokens"`, OpenAI `finish_reason` `"length"`,
-    /// Ollama `done_reason` `"length"` — the same condition
-    /// [`crate::provider::ChatResponse::reached_token_limit`] reports.
-    /// Emitted at most once per stream.
+    /// The provider stopped before a complete response because it exhausted a
+    /// generation bound — Anthropic `stop_reason` `"max_tokens"` or
+    /// `"model_context_window_exceeded"`, OpenAI `finish_reason` `"length"`,
+    /// or Ollama `done_reason` `"length"`. Emitted at most once per stream.
+    /// Despite the compatibility name, the Anthropic context-window case is
+    /// included because it is equally unsafe to promote its partial JSON to
+    /// an agent action.
     ReachedTokenLimit,
     /// A native tool call from a response that finished successfully.
     /// Anthropic's `tool_use` block must first reach `content_block_stop`, and
@@ -177,6 +180,14 @@ pub struct StreamParser {
     phase: Phase,
     /// Bytes of the current, not-yet-newline-terminated line.
     line: Vec<u8>,
+    /// A `\r` line ending has already been consumed. The following `\n`, if
+    /// any, belongs to the same CRLF delimiter and must not create a second
+    /// empty line. Keeping this bit across [`Self::push`] calls makes CRLF
+    /// splitting independent of transport chunk boundaries.
+    pending_cr: bool,
+    /// The SSE standard permits one UTF-8 BOM at the very beginning of the
+    /// event stream. It is stripped from the first line only.
+    first_line: bool,
     /// SSE only: accumulated `data:` payload of the event being assembled.
     event_data: String,
     event_has_data: bool,
@@ -227,6 +238,8 @@ impl StreamParser {
             provider,
             phase: Phase::Streaming,
             line: Vec::new(),
+            pending_cr: false,
+            first_line: true,
             event_data: String::new(),
             event_has_data: false,
             raw_response_bytes: 0,
@@ -241,6 +254,22 @@ impl StreamParser {
             pending_tools: Vec::new(),
             completed_tools: Vec::new(),
             delivered_tool_bytes: 0,
+        }
+    }
+
+    /// Whether a provider that reports completion reasons separately from its
+    /// final stream marker has supplied one we recognized.
+    ///
+    /// Kept crate-private so the high-level [`crate::response::AgentStream`]
+    /// can apply the same strict completion-envelope policy as non-streaming
+    /// [`crate::response::AgentResponse`] without changing the low-level event
+    /// stream's compatibility behavior. Ollama's `done: true` is itself the
+    /// completion status and its `done_reason` remains optional for compatible
+    /// local servers.
+    pub(crate) fn has_explicit_completion_reason(&self) -> bool {
+        match self.provider {
+            Provider::Anthropic | Provider::OpenAiCompatible => self.saw_message_end,
+            Provider::Ollama => true,
         }
     }
 
@@ -262,16 +291,33 @@ impl StreamParser {
                 break;
             }
             self.raw_response_bytes += 1;
-            if byte == b'\n' {
-                let line = std::mem::take(&mut self.line);
-                self.handle_line(&line, &mut events);
-            } else {
-                self.line.push(byte);
-                if self.line.len() > MAX_MODEL_TEXT_BYTES {
-                    self.fail(
-                        &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
-                        &mut events,
-                    );
+            if self.pending_cr {
+                self.pending_cr = false;
+                if byte == b'\n' {
+                    // The preceding CR already flushed this line. This LF is
+                    // the second half of the same CRLF delimiter, including
+                    // when the pair was split across transport chunks.
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => {
+                    let line = std::mem::take(&mut self.line);
+                    self.handle_line(&line, &mut events);
+                    self.pending_cr = self.phase == Phase::Streaming;
+                }
+                b'\n' => {
+                    let line = std::mem::take(&mut self.line);
+                    self.handle_line(&line, &mut events);
+                }
+                _ => {
+                    self.line.push(byte);
+                    if self.line.len() > MAX_MODEL_TEXT_BYTES {
+                        self.fail(
+                            &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
+                            &mut events,
+                        );
+                    }
                 }
             }
         }
@@ -288,6 +334,8 @@ impl StreamParser {
         if self.phase != Phase::Streaming {
             return events;
         }
+        // A trailing CR already terminated and flushed its line in `push`.
+        self.pending_cr = false;
         if !self.line.is_empty() {
             let line = std::mem::take(&mut self.line);
             self.handle_line(&line, &mut events);
@@ -313,7 +361,16 @@ impl StreamParser {
     }
 
     fn handle_line(&mut self, line: &[u8], events: &mut Vec<StreamEvent>) {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let line = if self.first_line {
+            self.first_line = false;
+            if self.provider != Provider::Ollama {
+                line.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(line)
+            } else {
+                line
+            }
+        } else {
+            line
+        };
         let Ok(line) = std::str::from_utf8(line) else {
             self.fail("stream frame is not valid UTF-8", events);
             return;
@@ -446,15 +503,17 @@ impl StreamParser {
                     return;
                 }
                 if block_kind == AnthropicBlockKind::Text {
+                    let Some(text) = block.get("text").and_then(Value::as_str) else {
+                        self.fail("text content block carries no string text", events);
+                        return;
+                    };
                     if self.saw_text_block {
                         // parse_chat_response_full joins multiple text blocks
                         // with "\n"; mirror it so accumulation matches.
                         self.deliver_text("\n", events);
                     }
                     self.saw_text_block = true;
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        self.deliver_text(text, events);
-                    }
+                    self.deliver_text(text, events);
                 }
             }
             "content_block_delta" => {
@@ -515,8 +574,41 @@ impl StreamParser {
                     frame.pointer("/delta/stop_reason").and_then(Value::as_str)
                 {
                     self.saw_message_end = true;
-                    if stop_reason == "max_tokens" {
-                        self.emit_token_limit(events);
+                    let has_tool_calls =
+                        !self.pending_tools.is_empty() || !self.completed_tools.is_empty();
+                    match stop_reason {
+                        "max_tokens" | "model_context_window_exceeded" => {
+                            self.emit_token_limit(events)
+                        }
+                        "end_turn" | "stop_sequence" if !has_tool_calls => {}
+                        "end_turn" | "stop_sequence" => {
+                            self.fail(
+                                "Anthropic stream contains tool_use with a non-tool stop reason",
+                                events,
+                            );
+                        }
+                        "tool_use" if has_tool_calls => {}
+                        "tool_use" => {
+                            self.fail("Anthropic tool_use stop has no completed tool call", events);
+                        }
+                        "pause_turn" => {
+                            self.fail(
+                                "Anthropic paused its server-side tool turn before completion",
+                                events,
+                            );
+                        }
+                        "refusal" => {
+                            self.fail("Anthropic refused the response", events);
+                        }
+                        other => {
+                            self.fail(
+                                &format!(
+                                    "unsupported Anthropic stop reason '{}'",
+                                    elide_middle(other, MAX_ERROR_DETAIL_BYTES)
+                                ),
+                                events,
+                            );
+                        }
                     }
                 }
             }
@@ -645,7 +737,7 @@ impl StreamParser {
             self.fail("stream frame is not a JSON object", events);
             return;
         }
-        if let Some(error) = frame.get("error") {
+        if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
             let detail = error
                 .get("message")
                 .and_then(Value::as_str)
@@ -659,6 +751,70 @@ impl StreamParser {
                 events,
             );
             return;
+        }
+        let choice = match frame.get("choices") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(choices)) if choices.is_empty() => None,
+            Some(Value::Array(choices)) if choices.len() == 1 => {
+                let Some(choice) = choices[0].as_object() else {
+                    self.fail("OpenAI-compatible choice is not an object", events);
+                    return;
+                };
+                if choice
+                    .get("index")
+                    .is_some_and(|index| index.as_u64() != Some(0))
+                {
+                    self.fail(
+                        "OpenAI-compatible choice index is not the requested choice zero",
+                        events,
+                    );
+                    return;
+                }
+                match choice.get("delta") {
+                    None | Some(Value::Null) | Some(Value::Object(_)) => {}
+                    Some(_) => {
+                        self.fail("OpenAI-compatible choice delta is not an object", events);
+                        return;
+                    }
+                }
+                Some(choice)
+            }
+            Some(Value::Array(_)) => {
+                self.fail(
+                    "OpenAI-compatible stream returned more than one choice",
+                    events,
+                );
+                return;
+            }
+            Some(_) => {
+                self.fail("OpenAI-compatible choices field is not an array", events);
+                return;
+            }
+        };
+        if choice
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("function_call"))
+            .is_some_and(|call| !call.is_null())
+        {
+            self.fail(
+                "legacy OpenAI-compatible function_call streaming is unsupported",
+                events,
+            );
+            return;
+        }
+        match choice
+            .and_then(|choice| choice.get("delta"))
+            .and_then(|delta| delta.get("refusal"))
+        {
+            Some(Value::String(refusal)) if !refusal.is_empty() => {
+                self.fail("OpenAI-compatible provider refused the response", events);
+                return;
+            }
+            Some(Value::String(_) | Value::Null) | None => {}
+            Some(_) => {
+                self.fail("OpenAI-compatible refusal delta is not a string", events);
+                return;
+            }
         }
         if self.saw_message_end
             && frame
@@ -698,13 +854,53 @@ impl StreamParser {
             }
         }
         self.merge_usage(frame.get("usage"), "prompt_tokens", "completion_tokens");
-        if let Some(finish_reason) = frame
-            .pointer("/choices/0/finish_reason")
-            .and_then(Value::as_str)
-        {
-            self.saw_message_end = true;
-            if finish_reason == "length" {
-                self.emit_token_limit(events);
+        match choice.and_then(|choice| choice.get("finish_reason")) {
+            Some(Value::String(finish_reason)) => {
+                self.saw_message_end = true;
+                let has_tool_calls =
+                    !self.pending_tools.is_empty() || !self.completed_tools.is_empty();
+                match finish_reason.as_str() {
+                    "stop" if !has_tool_calls => {}
+                    "stop" => {
+                        self.fail(
+                            "OpenAI-compatible stream contains tool calls with stop finish reason",
+                            events,
+                        );
+                    }
+                    "tool_calls" if has_tool_calls => {}
+                    "tool_calls" => {
+                        self.fail(
+                            "OpenAI-compatible tool_calls finish has no tool call",
+                            events,
+                        );
+                    }
+                    "length" => self.emit_token_limit(events),
+                    "content_filter" => {
+                        self.fail(
+                            "OpenAI-compatible provider filtered the response before completion",
+                            events,
+                        );
+                    }
+                    "function_call" => {
+                        self.fail(
+                            "legacy OpenAI-compatible function_call streaming is unsupported",
+                            events,
+                        );
+                    }
+                    other => {
+                        self.fail(
+                            &format!(
+                                "unsupported OpenAI-compatible finish reason '{}'",
+                                elide_middle(other, MAX_ERROR_DETAIL_BYTES)
+                            ),
+                            events,
+                        );
+                    }
+                }
+            }
+            Some(Value::Null) | None => {}
+            Some(_) => {
+                self.fail("OpenAI-compatible finish_reason is not a string", events);
             }
         }
     }
@@ -724,11 +920,15 @@ impl StreamParser {
             self.fail("stream frame is not a JSON object", events);
             return;
         }
-        if let Some(error) = frame.get("error").and_then(Value::as_str) {
+        if let Some(error) = frame.get("error").filter(|error| !error.is_null()) {
+            let detail = error
+                .as_str()
+                .or_else(|| error.get("message").and_then(Value::as_str))
+                .unwrap_or("unspecified");
             self.fail(
                 &format!(
                     "provider error: {}",
-                    elide_middle(error, MAX_ERROR_DETAIL_BYTES)
+                    elide_middle(detail, MAX_ERROR_DETAIL_BYTES)
                 ),
                 events,
             );
@@ -758,8 +958,24 @@ impl StreamParser {
             }
         }
         if frame.get("done").and_then(Value::as_bool) == Some(true) {
-            if frame.get("done_reason").and_then(Value::as_str) == Some("length") {
-                self.emit_token_limit(events);
+            match frame.get("done_reason") {
+                Some(Value::String(reason)) if reason == "stop" => {}
+                Some(Value::String(reason)) if reason == "length" => self.emit_token_limit(events),
+                Some(Value::String(reason)) => {
+                    self.fail(
+                        &format!(
+                            "unsupported Ollama done reason '{}'",
+                            elide_middle(reason, MAX_ERROR_DETAIL_BYTES)
+                        ),
+                        events,
+                    );
+                    return;
+                }
+                Some(Value::Null) | None => {}
+                Some(_) => {
+                    self.fail("Ollama done_reason is not a string", events);
+                    return;
+                }
             }
             self.merge_usage(Some(&frame), "prompt_eval_count", "eval_count");
             self.complete(events);
@@ -777,6 +993,14 @@ impl StreamParser {
             self.fail("Ollama tool_calls entry is not an object", events);
             return;
         };
+        match entry.get("type") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(kind)) if kind == "function" => {}
+            Some(_) => {
+                self.fail("Ollama tool call type is not 'function'", events);
+                return;
+            }
+        }
         let Some(function) = entry.get("function").and_then(Value::as_object) else {
             self.fail("Ollama tool_calls entry has no function object", events);
             return;
@@ -870,6 +1094,14 @@ impl StreamParser {
     /// the opening fragment but are appended defensively, and `arguments`
     /// fragments concatenate into the raw JSON object text.
     fn accumulate_openai_tool_call(&mut self, entry: &Value, events: &mut Vec<StreamEvent>) {
+        match entry.get("type") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(kind)) if kind == "function" => {}
+            Some(_) => {
+                self.fail("streamed tool call type is not 'function'", events);
+                return;
+            }
+        }
         let Some(index) = entry.get("index").and_then(Value::as_u64) else {
             self.fail("tool call carries no valid index", events);
             return;
@@ -1116,6 +1348,7 @@ impl StreamParser {
         events.push(StreamEvent::Done);
         self.phase = Phase::Finished;
         self.line = Vec::new();
+        self.pending_cr = false;
         self.event_data = String::new();
         self.anthropic_blocks.clear();
     }
@@ -1127,6 +1360,7 @@ impl StreamParser {
         events.push(StreamEvent::Protocol(message.to_string()));
         self.phase = Phase::Failed;
         self.line = Vec::new();
+        self.pending_cr = false;
         self.event_data = String::new();
         // A half-accumulated call is never emitted: an incomplete argument
         // fragment, or a fully accumulated call from a response that later
@@ -1386,7 +1620,45 @@ mod tests {
     fn crlf_line_endings_are_tolerated() {
         for provider in ALL_PROVIDERS {
             let body = happy_body(provider).replace('\n', "\r\n");
-            assert_eq!(run(provider, &body), run(provider, &happy_body(provider)));
+            let expected = run(provider, &happy_body(provider));
+            assert_eq!(run(provider, &body), expected, "{provider:?}");
+
+            // Exercise the state retained specifically between CR and LF.
+            let mut parser = StreamParser::new(provider);
+            let mut events = Vec::new();
+            for byte in body.as_bytes() {
+                events.extend(parser.push(std::slice::from_ref(byte)));
+            }
+            events.extend(parser.finish());
+            assert_eq!(events, expected, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn bare_cr_line_endings_are_tolerated() {
+        for provider in ALL_PROVIDERS {
+            let body = happy_body(provider).replace('\n', "\r");
+            assert_eq!(
+                run(provider, &body),
+                run(provider, &happy_body(provider)),
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sse_initial_utf8_bom_is_tolerated_even_across_chunks() {
+        for provider in [Provider::Anthropic, Provider::OpenAiCompatible] {
+            let body = format!("\u{feff}{}", happy_body(provider));
+            let expected = run(provider, &happy_body(provider));
+
+            let mut parser = StreamParser::new(provider);
+            let mut events = Vec::new();
+            for byte in body.as_bytes() {
+                events.extend(parser.push(std::slice::from_ref(byte)));
+            }
+            events.extend(parser.finish());
+            assert_eq!(events, expected, "{provider:?}");
         }
     }
 
@@ -1568,6 +1840,184 @@ mod tests {
                 "provider error: quota exceeded".into()
             )]
         );
+
+        // Ollama proxies sometimes retain the HTTP API's structured error
+        // envelope even on an NDJSON transport.
+        let events = run(
+            Provider::Ollama,
+            &ndjson_line(&json!({"error": {"message": "runner unavailable"}})),
+        );
+        assert_eq!(
+            events,
+            vec![StreamEvent::Protocol(
+                "provider error: runner unavailable".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn incomplete_or_refused_stop_reasons_never_complete_an_action() {
+        let context_limited = run(
+            Provider::Anthropic,
+            &anthropic_body("model_context_window_exceeded"),
+        );
+        assert!(context_limited.contains(&StreamEvent::ReachedTokenLimit));
+        assert!(context_limited.contains(&StreamEvent::Done));
+
+        for (reason, expected) in [
+            ("tool_use", "no completed tool call"),
+            ("pause_turn", "paused"),
+            ("refusal", "refused"),
+            ("future_reason", "unsupported"),
+        ] {
+            let events = run(Provider::Anthropic, &anthropic_body(reason));
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains(expected)),
+                "{reason}: {events:?}"
+            );
+            assert!(!events.contains(&StreamEvent::Done), "{reason}");
+        }
+
+        for (reason, expected) in [
+            ("tool_calls", "no tool call"),
+            ("content_filter", "filtered"),
+            ("function_call", "legacy"),
+            ("future_reason", "unsupported"),
+        ] {
+            let events = run(Provider::OpenAiCompatible, &openai_body(reason));
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains(expected)),
+                "{reason}: {events:?}"
+            );
+            assert!(!events.contains(&StreamEvent::Done), "{reason}");
+        }
+
+        let events = run(Provider::Ollama, &ollama_body("future_reason"));
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("unsupported")),
+            "{events:?}"
+        );
+        assert!(!events.contains(&StreamEvent::Done));
+
+        let mismatched_tool = [
+            openai_line(&json!({"choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "run", "arguments": "{\"command\":\"pwd\"}"},
+                }]},
+                "finish_reason": "stop",
+            }]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        let events = run(Provider::OpenAiCompatible, &mismatched_tool);
+        assert!(
+            matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains("with stop finish reason")),
+            "{events:?}"
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)));
+    }
+
+    #[test]
+    fn openai_choice_and_refusal_shapes_fail_closed() {
+        let malformed = [
+            (
+                "multiple choices",
+                json!({"choices": [
+                    {"index": 0, "delta": {"content": "first"}},
+                    {"index": 1, "delta": {"content": "second"}},
+                ]}),
+                "more than one choice",
+            ),
+            (
+                "nonzero choice",
+                json!({"choices": [{"index": 1, "delta": {"content": "wrong"}}]}),
+                "choice index",
+            ),
+            (
+                "null choice index",
+                json!({"choices": [{"index": null, "delta": {"content": "wrong"}}]}),
+                "choice index",
+            ),
+            (
+                "scalar delta",
+                json!({"choices": [{"index": 0, "delta": "wrong"}]}),
+                "delta is not an object",
+            ),
+            (
+                "refusal delta",
+                json!({"choices": [{"index": 0, "delta": {"refusal": "denied"}}]}),
+                "refused",
+            ),
+            (
+                "legacy function call",
+                json!({"choices": [{"index": 0, "delta": {
+                    "function_call": {"name": "run", "arguments": "{}"}
+                }}]}),
+                "legacy",
+            ),
+            (
+                "unknown tool type",
+                json!({"choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "type": "custom", "function": {
+                        "name": "run", "arguments": "{}"
+                    }
+                }]}}]}),
+                "type",
+            ),
+        ];
+        for (case, frame, expected) in malformed {
+            let events = run(Provider::OpenAiCompatible, &openai_line(&frame));
+            assert!(
+                matches!(events.last(), Some(StreamEvent::Protocol(message)) if message.contains(expected)),
+                "{case}: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, StreamEvent::ToolCall(_) | StreamEvent::Done)),
+                "{case}"
+            );
+        }
+
+        // An explicit null error is not an error envelope and is common in
+        // proxy-normalized response shapes.
+        let body = [
+            openai_line(&json!({"error": null, "choices": [{
+                "index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"
+            }]})),
+            "data: [DONE]\n\n".to_string(),
+        ]
+        .concat();
+        assert_eq!(
+            run(Provider::OpenAiCompatible, &body),
+            vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done]
+        );
+    }
+
+    #[test]
+    fn anthropic_text_block_start_requires_string_text() {
+        for content_block in [json!({"type": "text"}), json!({"type": "text", "text": 7})] {
+            let body = sse(
+                "content_block_start",
+                &json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": content_block,
+                }),
+            );
+            assert_eq!(
+                run(Provider::Anthropic, &body),
+                vec![StreamEvent::Protocol(
+                    "text content block carries no string text".into()
+                )]
+            );
+        }
     }
 
     #[test]
