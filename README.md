@@ -226,6 +226,40 @@ omitting the undocumented `tool_choice` field. Exactly one tool call is
 required; zero, multiple, malformed, token-limited, or protocol-mismatched
 calls fail closed.
 
+## Capability discovery
+
+Split integrations can exchange one bounded, non-sensitive capability token
+before choosing a wire protocol. `agent_capabilities(provider)` reports the
+matrix jagent actually checks during `prepare_agent_request`; `negotiate`
+selects the first mutually supported protocol from the caller's preference
+order and never guesses a fallback:
+
+```rust
+use jagent::{
+    agent_capabilities, AgentCapabilities, AgentDelivery, AgentProtocol,
+    Provider,
+};
+
+let local = agent_capabilities(Provider::Ollama);
+let wire = local.to_wire(); // safe for an env var or IPC capability field
+let peer = AgentCapabilities::from_wire(&wire)?;
+let protocol = local
+    .negotiate_with(
+        peer,
+        &[AgentProtocol::NativeTools, AgentProtocol::Text],
+        AgentDelivery::Complete,
+    )
+    .ok_or("no mutually supported Agent protocol")?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Version 1 tokens can represent protocol and delivery subsets, for example
+`jagent-agent/1;protocols=text;delivery=complete`. Names, duplicates, empty
+sets, unknown fields/versions, whitespace, and values over 256 bytes are
+rejected. Tokens contain no endpoint, credential, model, transcript, or
+terminal context. Capability agreement selects only an encoding; it never
+authorizes a tool call or command.
+
 ## Safety invariants
 
 1. Generated commands are never executed by this crate. Approval returns an
@@ -256,6 +290,7 @@ alias, function, or helper will do.
 | Module | Responsibility |
 |---|---|
 | `agent` | `AgentRequestSpec` and `prepare_agent_request`: protocol-matched prompt/schema, secure history preparation, streaming selection, and a history preparation report. |
+| `capabilities` | Versioned protocol/delivery discovery, bounded wire tokens, and deterministic preference negotiation. |
 | `response` | `AgentResponse` and `AgentStream`: protocol-aware bounded decoding, response metadata, action conversion, and streaming accumulation. |
 | `session` | Pure proposal/review/observation state machine, bounded transcript, turn budget, cancellation, and validated snapshots. |
 | `prompt` | Fixed system prompts plus untrusted user-role environment and selected-block framing. |

@@ -71,7 +71,7 @@ const OLLAMA_TOOL_CHOICE_UNSUPPORTED: &str =
     "Ollama's /api/chat tool protocol does not expose a tool_choice request field";
 
 /// Which wire encoding the agent loop uses to carry actions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum AgentProtocol {
     /// Today's JSON-in-text protocol: the model replies with exactly one JSON
     /// object, parsed by [`crate::session::parse_action`]. Requests built in
@@ -80,6 +80,16 @@ pub enum AgentProtocol {
     Text,
     /// The provider's native tool-calling carries the action.
     NativeTools,
+}
+
+impl AgentProtocol {
+    /// Stable ASCII name used by capability discovery and diagnostics.
+    pub const fn as_wire_name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::NativeTools => "native-tools",
+        }
+    }
 }
 
 /// One tool call extracted from a model reply, in provider-neutral form.

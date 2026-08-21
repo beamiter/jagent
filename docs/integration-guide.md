@@ -56,6 +56,29 @@ closing instruction, built-in system prompt, provider schema, and response
 decoder. `PreparedAgentRequest` retains the provider, protocol, and delivery
 mode so the integration does not have to reconstruct those choices later.
 
+## Discover and negotiate capabilities
+
+When the transport/UI and executor/shell are separate processes, exchange a
+capability token before selecting `AgentProtocol`. The token is bounded ASCII
+and contains only a schema version plus supported protocol and delivery names;
+it is safe to carry in an environment variable or IPC metadata field and must
+not be confused with user context.
+
+1. Obtain provider support with `agent_capabilities(provider)`.
+2. Serialize with `to_wire` and decode the peer with
+   `AgentCapabilities::from_wire`.
+3. Call `local.negotiate_with(peer, preferences, delivery)` with the local
+   preference order and required `AgentDelivery`.
+4. If it returns `None`, report the incompatibility. Do not silently switch
+   protocols after a request has been prepared.
+
+`prepare_agent_request` independently checks the same capability table before
+building provider bytes, so discovery cannot drift from enforcement. Version
+1 tokens may advertise subsets (such as text plus complete delivery only),
+while malformed, duplicate, empty, unknown-version, or overlong tokens fail
+closed. Capability agreement does not change the review contract: native tool
+calls remain proposals until the session returns an `ApprovedCommand`.
+
 ## Prepare a turn
 
 1. Call `AgentSession::submit_user`.

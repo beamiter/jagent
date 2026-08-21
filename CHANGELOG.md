@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added versioned `AgentCapabilities` discovery for protocol/delivery
+  negotiation across split terminal and shell integrations. Its bounded ASCII
+  token supports capability subsets, strict parsing, and preference-ordered
+  negotiation; `prepare_agent_request` consults the same provider capability
+  table before constructing a request.
+
 - Added a runnable no-I/O NativeTools streaming example and a production
   integration guide covering transport, response decoding, review, failure,
   cancellation, and persistence boundaries.

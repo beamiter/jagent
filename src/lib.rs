@@ -9,6 +9,8 @@
 //! - [`agent`] — the recommended request path. It binds one action protocol
 //!   to the matching prompt, provider schema, delivery mode, history policy,
 //!   and response decoder.
+//! - [`capabilities`] — versioned protocol/delivery discovery and deterministic
+//!   preference negotiation for terminal/shell or other split integrations.
 //! - [`response`] — protocol-aware non-streaming response decoding and a
 //!   streaming accumulator that both produce the same high-level response.
 //! - [`session`] — the pure agent state machine. The model may only *propose*
@@ -55,6 +57,7 @@
 //!    bind an approval action to the pending command the caller displayed.
 
 pub mod agent;
+pub mod capabilities;
 pub mod prompt;
 pub mod provider;
 pub mod redact;
@@ -67,6 +70,10 @@ pub mod tools;
 
 pub use agent::{
     prepare_agent_request, AgentRequestReport, AgentRequestSpec, PreparedAgentRequest,
+};
+pub use capabilities::{
+    agent_capabilities, AgentCapabilities, AgentDelivery, CapabilityError,
+    AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
 };
 pub use prompt::{
     agent_user_prompt, build_agent_system_prompt, build_agent_tool_system_prompt, BlockContext,

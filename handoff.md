@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-13
+Updated: 2026-08-21
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -11,6 +11,18 @@ ingestion to one `AgentProtocol` and receive machine-readable history
 transformation reports.
 
 ## Current 0.7 surface
+
+### Capability discovery
+
+- `agent_capabilities(provider)` returns the same provider protocol/delivery
+  matrix that `prepare_agent_request` now checks before request construction.
+- `AgentCapabilities::{to_wire,from_wire}` provides a strict, versioned,
+  256-byte ASCII contract for environment or IPC discovery. Version 1 can
+  encode subsets, but requires canonical field/list order and rejects unknown,
+  duplicate, empty, overlong, or future-version values.
+- `negotiate_with(peer, preferred, delivery)` selects only the first mutually
+  supported protocol; it never invents a fallback. Capability agreement
+  changes encoding only and cannot authorize a command.
 
 ### Recommended agent loop
 

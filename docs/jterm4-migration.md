@@ -16,6 +16,7 @@ prompt tags or extraction state.
 
 | Concern | Owner | Integration notes |
 |---|---|---|
+| Protocol/delivery capability discovery | `jagent::capabilities` | Exchange the bounded versioned token across a terminal/shell boundary, negotiate explicitly, and let request preparation re-check provider support. |
 | Protocol-matched request preparation and response decoding | `jagent::agent`, `jagent::response` | `prepare_agent_request` binds prompt, schema, history policy, delivery mode, and decoder to one `AgentProtocol`. This is the recommended 0.7 path. |
 | Agent state, proposal review, snapshots, and text-protocol parsing | `jagent::session` | Approval produces an `ApprovedCommand`; execution remains a caller action. |
 | Native tool schemas and response parsing | `jagent::tools` | Text and native-tool protocols converge on the same `ParsedAction` values. |
@@ -30,21 +31,24 @@ prompt tags or extraction state.
 Move one complete request/response path at a time so protocol choices cannot
 drift between layers:
 
-1. Keep a single `AgentProtocol` for the turn and use it with
+1. For split processes, intersect `agent_capabilities(provider)` with the
+   peer's `AgentCapabilities::from_wire` value and negotiate the required
+   `AgentDelivery`. Fail clearly when no protocol matches.
+2. Keep the selected `AgentProtocol` for the full turn and use it with
    `AgentSession::build_user_prompt_with`.
-2. Construct untrusted user-role context with `agent_user_prompt`, then call
+3. Construct untrusted user-role context with `agent_user_prompt`, then call
    `prepare_agent_request(config, AgentRequestSpec::new(history, protocol))`.
-3. Surface the returned history report. Redaction is enabled by default;
+4. Surface the returned history report. Redaction is enabled by default;
    disabling it with `AgentRequestSpec::redact_secrets(false)` is an explicit
    integration policy decision.
-4. Perform the returned request with the consumer's bounded HTTP transport.
-5. Decode a complete response with `prepared.parse_response`, or create the
+5. Perform the returned request with the consumer's bounded HTTP transport.
+6. Decode a complete response with `prepared.parse_response`, or create the
    streaming accumulator with `prepared.response_stream`, feed every chunk,
    call `finish` at EOF, and then call `into_response`.
-6. Pass the completed `AgentResponse` to
+7. Pass the completed `AgentResponse` to
    `AgentSession::accept_agent_response`. Never interpret a raw streamed
    `ToolCall` as an approval or execution token.
-7. Preserve the existing review UI boundary: display the exact proposal and
+8. Preserve the existing review UI boundary: display the exact proposal and
    execute only the `ApprovedCommand` returned for its ID.
 
 This high-level route is additive. Consumers may retain low-level provider or

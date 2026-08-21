@@ -8,6 +8,7 @@
 //! of that contract a single operation and reports every history
 //! transformation it performs.
 
+use crate::capabilities::{agent_capabilities, AgentCapabilities, AgentDelivery};
 use crate::prompt::{build_agent_system_prompt, build_agent_tool_system_prompt};
 use crate::provider::{
     bound_history_cow_with_report, bound_history_with_report,
@@ -146,6 +147,13 @@ impl PreparedAgentRequest {
         self.streaming
     }
 
+    /// Protocol and delivery combinations implemented for this request's
+    /// provider. Integrations can intersect this with a shell/terminal peer's
+    /// decoded capability token before selecting a protocol.
+    pub const fn capabilities(&self) -> AgentCapabilities {
+        agent_capabilities(self.provider)
+    }
+
     /// Parse a complete non-streaming response with the provider and protocol
     /// already bound to this request.
     ///
@@ -181,6 +189,20 @@ pub fn prepare_agent_request(
     config: &ChatConfig,
     spec: AgentRequestSpec<'_>,
 ) -> Result<PreparedAgentRequest, ProviderError> {
+    let delivery = if spec.streaming {
+        AgentDelivery::Streaming
+    } else {
+        AgentDelivery::Complete
+    };
+    if !agent_capabilities(config.provider).supports(spec.protocol, delivery) {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "{} does not support the {} agent protocol with {} delivery",
+            config.provider.display_name(),
+            spec.protocol.as_wire_name(),
+            delivery.as_wire_name(),
+        )));
+    }
+
     let prepared_history = if spec.redact_secrets {
         bound_history_cow_with_report(spec.history, redact_secrets_cow)
     } else {
@@ -362,6 +384,35 @@ mod tests {
         .unwrap();
         let body: Value = serde_json::from_str(&absent.request.body).unwrap();
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn provider_protocol_delivery_matrix_is_checked_by_preparation() {
+        let history = [user("inspect")];
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
+                for streaming in [false, true] {
+                    let prepared = prepare_agent_request(
+                        &config(provider),
+                        AgentRequestSpec::new(&history, protocol).streaming(streaming),
+                    )
+                    .unwrap();
+                    let delivery = if streaming {
+                        AgentDelivery::Streaming
+                    } else {
+                        AgentDelivery::Complete
+                    };
+                    assert!(prepared.capabilities().supports(protocol, delivery));
+                    assert_eq!(prepared.protocol(), protocol);
+                    assert_eq!(prepared.is_streaming(), streaming);
+                    assert_eq!(prepared.response_stream().is_ok(), streaming);
+                }
+            }
+        }
     }
 
     #[test]
