@@ -48,7 +48,7 @@ AgentSession::accept_agent_response
                                       integration-owned executor
                                                │
                                                ▼
-                                  observe / observe_execution_failure
+                                         observe_execution
 ```
 
 Keep one `AgentProtocol` value for the full turn. It determines the session's
@@ -60,24 +60,32 @@ mode so the integration does not have to reconstruct those choices later.
 
 When the transport/UI and executor/shell are separate processes, exchange a
 capability token before selecting `AgentProtocol`. The token is bounded ASCII
-and contains only a schema version plus supported protocol and delivery names;
+and contains only a schema version plus supported protocol/delivery modes;
 it is safe to carry in an environment variable or IPC metadata field and must
 not be confused with user context.
 
-1. Obtain provider support with `agent_capabilities(provider)`.
-2. Serialize with `to_wire` and decode the peer with
+1. For first contact, advertise `agent_capabilities(provider)`. It deliberately
+   emits version 1 so pre-v2 0.7 peers can decode it.
+2. Decode the peer with
    `AgentCapabilities::from_wire`.
-3. Call `local.negotiate_with(peer, preferences, delivery)` with the local
+3. Use `agent_capabilities_for_peer(provider, peer)` when replying, or the
+   explicit `agent_capabilities_v2(provider)` only when peer support is already
+   known out of band.
+4. Call `local.negotiate_with(peer, preferences, delivery)` with the local
    preference order and required `AgentDelivery`.
-4. If it returns `None`, report the incompatibility. Do not silently switch
+5. If it returns `None`, report the incompatibility. Do not silently switch
    protocols after a request has been prepared.
 
 `prepare_agent_request` independently checks the same capability table before
 building provider bytes, so discovery cannot drift from enforcement. Version
-1 tokens may advertise subsets (such as text plus complete delivery only),
-while malformed, duplicate, empty, unknown-version, or overlong tokens fail
-closed. Capability agreement does not change the review contract: native tool
-calls remain proposals until the session returns an `ApprovedCommand`.
+2 advertises exact pairs and therefore does not infer unsupported crossed
+combinations. Strict version-1 tokens remain accepted with their original
+Cartesian-product semantics, and remain the default outbound form during a
+rolling upgrade. A non-Cartesian provider matrix is safely reduced to a
+representable v1 subset rather than overclaimed. Malformed, duplicate,
+non-canonical, empty, unknown-version, or overlong tokens fail closed.
+Capability agreement does not change the review contract: native tool calls
+remain proposals until the session returns an `ApprovedCommand`.
 
 ## Prepare a turn
 
@@ -184,8 +192,10 @@ optional `danger` warning to the user.
   does not authorize execution.
 
 Only an `ApprovedCommand` should cross into the executor. Keep its
-`proposal_id` attached to the result and record either `observe` with the real
-exit status, or `observe_execution_failure` when no normal exit status exists.
+`proposal_id` attached to a `CommandExecutionOutcome`, using `Exited` only for
+a real status and `Failed` for setup, timeout, or cancellation paths, then pass
+it to `observe_execution`. The older `observe` and
+`observe_execution_failure` entry points remain source-compatible shorthands.
 Warnings from `is_dangerous` are review hints, never authorization or proof of
 safety. They recognize common destructive shell, Git, service,
 infrastructure, storage, wrapper, and review-smuggling forms, but intentionally

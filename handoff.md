@@ -15,11 +15,18 @@ transformation reports.
 ### Capability discovery
 
 - `agent_capabilities(provider)` returns the same provider protocol/delivery
-  matrix that `prepare_agent_request` now checks before request construction.
+  matrix that `prepare_agent_request` checks, but deliberately emits v1 for
+  safe first contact with older 0.7 peers. `agent_capabilities_for_peer`
+  mirrors a decoded peer's schema version; `agent_capabilities_v2` is the
+  explicit out-of-band opt-in.
 - `AgentCapabilities::{to_wire,from_wire}` provides a strict, versioned,
-  256-byte ASCII contract for environment or IPC discovery. Version 1 can
-  encode subsets, but requires canonical field/list order and rejects unknown,
-  duplicate, empty, overlong, or future-version values.
+  256-byte ASCII contract for environment or IPC discovery. The opt-in
+  version 2 form uses `modes` as exact protocol/delivery pairs rather than a
+  Cartesian product. Strict version-1 tokens remain readable and are the
+  default outbound form during rolling upgrades. Its downgrade selects only a
+  Cartesian subset of the exact matrix and can never overclaim a crossed mode;
+  both versions reject unknown, duplicate, non-canonical, empty, overlong, or
+  future-version values.
 - `negotiate_with(peer, preferred, delivery)` selects only the first mutually
   supported protocol; it never invents a fallback. Capability agreement
   changes encoding only and cannot authorize a command.
@@ -70,9 +77,11 @@ tool event is not approval.
   review UI should currently display.
 - `reject_with_feedback` validates feedback atomically and records it as the
   next untrusted user turn.
-- `observe_execution_failure` records failed start, timeout, or cancellation
-  without inventing an exit code; diagnostic/partial output is sampled under
-  the observation budget.
+- `CommandExecutionOutcome` and `observe_execution` form the preferred typed
+  executor-to-session handoff: `Exited` requires a real status, while `Failed`
+  records failed start, timeout, or cancellation without inventing one.
+  Diagnostic/partial output is sampled under the observation budget; the two
+  older observation methods remain compatible.
 - `transcript_truncated()` exposes whether in-memory compaction removed older
   activity. In-place approval, edit, rejection, and manual-review mutations
   recompact before a snapshot can be captured.

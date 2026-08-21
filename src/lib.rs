@@ -72,8 +72,9 @@ pub use agent::{
     prepare_agent_request, AgentRequestReport, AgentRequestSpec, PreparedAgentRequest,
 };
 pub use capabilities::{
-    agent_capabilities, AgentCapabilities, AgentDelivery, CapabilityError,
-    AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
+    agent_capabilities, agent_capabilities_for_peer, agent_capabilities_v2, AgentCapabilities,
+    AgentDelivery, CapabilityError, AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_V2_WIRE,
+    AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
 };
 pub use prompt::{
     agent_user_prompt, build_agent_system_prompt, build_agent_tool_system_prompt, BlockContext,
@@ -88,8 +89,9 @@ pub use response::{AgentResponse, AgentStream};
 pub use safety::{is_auto_approvable, is_dangerous};
 pub use session::{
     AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
-    CommandExecutionFailure, ModelOutcome, ParseError, PendingProposal, ProposalId, ProposalStatus,
-    SessionError, Turn, MAX_ACTION_JSON_BYTES, MAX_AGENT_SNAPSHOT_JSON_BYTES, MAX_SESSION_TURNS,
+    CommandExecutionFailure, CommandExecutionOutcome, ModelOutcome, ParseError, PendingProposal,
+    ProposalId, ProposalStatus, SessionError, Turn, MAX_ACTION_JSON_BYTES,
+    MAX_AGENT_SNAPSHOT_JSON_BYTES, MAX_SESSION_TURNS,
 };
 pub use stream::{StreamEvent, StreamParser};
 pub use tools::{AgentProtocol, ToolCall, ToolResponse};

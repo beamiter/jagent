@@ -229,20 +229,26 @@ calls fail closed.
 ## Capability discovery
 
 Split integrations can exchange one bounded, non-sensitive capability token
-before choosing a wire protocol. `agent_capabilities(provider)` reports the
-matrix jagent actually checks during `prepare_agent_request`; `negotiate`
-selects the first mutually supported protocol from the caller's preference
-order and never guesses a fallback:
+before choosing a wire protocol. `agent_capabilities(provider)` emits the
+version-1 compatibility form that existing 0.7 peers understand. After a peer
+token has been decoded, `agent_capabilities_for_peer` emits the same provider
+matrix in that peer's schema version. `negotiate` selects the first mutually
+supported protocol from the caller's preference order and never guesses a
+fallback:
 
 ```rust
 use jagent::{
-    agent_capabilities, AgentCapabilities, AgentDelivery, AgentProtocol,
-    Provider,
+    agent_capabilities, agent_capabilities_for_peer, AgentCapabilities,
+    AgentDelivery, AgentProtocol, Provider,
 };
 
-let local = agent_capabilities(Provider::Ollama);
-let wire = local.to_wire(); // safe for an env var or IPC capability field
-let peer = AgentCapabilities::from_wire(&wire)?;
+let first_contact = agent_capabilities(Provider::Ollama);
+assert_eq!(first_contact.version(), 1); // safe for an unprobed 0.7 peer
+let peer = AgentCapabilities::from_wire(
+    "jagent-agent/2;modes=text+complete,native-tools+streaming",
+)?;
+let local = agent_capabilities_for_peer(Provider::Ollama, peer);
+assert_eq!(local.version(), peer.version());
 let protocol = local
     .negotiate_with(
         peer,
@@ -253,12 +259,19 @@ let protocol = local
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Version 1 tokens can represent protocol and delivery subsets, for example
-`jagent-agent/1;protocols=text;delivery=complete`. Names, duplicates, empty
-sets, unknown fields/versions, whitespace, and values over 256 bytes are
-rejected. Tokens contain no endpoint, credential, model, transcript, or
-terminal context. Capability agreement selects only an encoding; it never
-authorizes a tool call or command.
+Version 2 tokens list exact protocol/delivery pairs, so a peer can advertise
+`jagent-agent/2;modes=text+complete,native-tools+streaming` without falsely
+claiming either crossed combination. Strict version-1 tokens such as
+`jagent-agent/1;protocols=text;delivery=complete` remain accepted and retain
+their historical Cartesian-product meaning. Names, duplicates, non-canonical
+ordering, empty sets, unknown fields/versions, whitespace, and values over 256
+bytes are rejected. Tokens contain no endpoint, credential, model, transcript,
+or terminal context. Capability agreement selects only an encoding; it never
+authorizes a tool call or command. Do not send the opt-in
+`agent_capabilities_v2` value to an unprobed peer: an older peer correctly
+rejects it as an unsupported version. If a future provider matrix is not a
+Cartesian product, compatibility-first v1 emission chooses a representable
+subset and may omit a usable mode; it never invents a crossed combination.
 
 ## Safety invariants
 

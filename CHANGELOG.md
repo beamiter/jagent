@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   token supports capability subsets, strict parsing, and preference-ordered
   negotiation; `prepare_agent_request` consults the same provider capability
   table before constructing a request.
+- Added exact protocol/delivery pairs in capability token version 2 while
+  retaining strict version-1 decoding and compatibility-first v1 emission.
+  Peer-version-aware and explicit v2 APIs prevent a new endpoint from sending
+  an unsupported-version token to an unprobed 0.7 peer. Added
+  `CommandExecutionOutcome` plus `observe_execution` so integrations cannot
+  turn setup failures into synthetic exit codes.
 
 - Added a runnable no-I/O NativeTools streaming example and a production
   integration guide covering transport, response decoding, review, failure,

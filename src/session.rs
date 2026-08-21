@@ -505,6 +505,66 @@ impl CommandExecutionFailure {
     }
 }
 
+/// Typed result of deliberately handling one [`ApprovedCommand`].
+///
+/// Integrations should carry this value from their process boundary into
+/// [`AgentSession::observe_execution`] instead of mapping setup, timeout, or
+/// cancellation failures onto a made-up exit code. The evidence string is
+/// still untrusted and is sampled only when the session ingests the outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandExecutionOutcome {
+    /// The command process produced a normal shell exit status.
+    Exited { exit_code: i32, output: String },
+    /// The integration could not obtain a normal exit status.
+    Failed {
+        failure: CommandExecutionFailure,
+        detail: String,
+    },
+}
+
+impl CommandExecutionOutcome {
+    /// Construct a normal command exit with its captured output.
+    pub fn exited(exit_code: i32, output: impl Into<String>) -> Self {
+        Self::Exited {
+            exit_code,
+            output: output.into(),
+        }
+    }
+
+    /// Construct an execution failure without inventing an exit status.
+    pub fn failed(failure: CommandExecutionFailure, detail: impl Into<String>) -> Self {
+        Self::Failed {
+            failure,
+            detail: detail.into(),
+        }
+    }
+
+    /// Normal exit status, or `None` when execution did not produce one.
+    pub const fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::Exited { exit_code, .. } => Some(*exit_code),
+            Self::Failed { .. } => None,
+        }
+    }
+
+    /// Failure category, or `None` after a normal exit.
+    pub const fn failure(&self) -> Option<CommandExecutionFailure> {
+        match self {
+            Self::Exited { .. } => None,
+            Self::Failed { failure, .. } => Some(*failure),
+        }
+    }
+
+    /// Captured command output or untrusted failure detail.
+    pub fn evidence(&self) -> &str {
+        match self {
+            Self::Exited { output, .. } => output,
+            Self::Failed { detail, .. } => detail,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
@@ -978,6 +1038,27 @@ impl AgentSession {
         });
         self.finish_observation();
         Ok(())
+    }
+
+    /// Record one typed execution outcome against the approved proposal.
+    ///
+    /// This is the preferred integration entry point because its enum makes
+    /// the presence or absence of a normal exit status explicit. The legacy
+    /// [`Self::observe`] and [`Self::observe_execution_failure`] methods remain
+    /// available for source compatibility and implement the same transitions.
+    pub fn observe_execution(
+        &mut self,
+        id: ProposalId,
+        outcome: CommandExecutionOutcome,
+    ) -> Result<(), SessionError> {
+        match outcome {
+            CommandExecutionOutcome::Exited { exit_code, output } => {
+                self.observe(id, exit_code, &output)
+            }
+            CommandExecutionOutcome::Failed { failure, detail } => {
+                self.observe_execution_failure(id, failure, &detail)
+            }
+        }
     }
 
     /// Record that an approved command produced no normal process exit status.
@@ -2771,9 +2852,11 @@ mod tests {
             let id = accept_run_proposal(&mut session, "long-running-command");
             let _approved = session.approve(id).unwrap();
 
-            session
-                .observe_execution_failure(id, failure, "partial output")
-                .unwrap();
+            let outcome = CommandExecutionOutcome::failed(failure, "partial output");
+            assert_eq!(outcome.exit_code(), None);
+            assert_eq!(outcome.failure(), Some(failure));
+            assert_eq!(outcome.evidence(), "partial output");
+            session.observe_execution(id, outcome).unwrap();
             assert_eq!(session.state(), AgentState::AwaitingModel);
             assert!(matches!(
                 session.transcript().last(),
@@ -2788,6 +2871,30 @@ mod tests {
             assert!(!prompt.contains("Output (exit="));
             assert_snapshot_roundtrips(&session);
         }
+    }
+
+    #[test]
+    fn typed_normal_exit_preserves_real_status_and_restores() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "false");
+        let _approved = session.approve(id).unwrap();
+
+        let outcome = CommandExecutionOutcome::exited(23, "checked output");
+        assert_eq!(outcome.exit_code(), Some(23));
+        assert_eq!(outcome.failure(), None);
+        assert_eq!(outcome.evidence(), "checked output");
+        session.observe_execution(id, outcome).unwrap();
+
+        assert!(matches!(
+            session.transcript().last(),
+            Some(Turn::Observation {
+                proposal_id,
+                exit_code: 23,
+                output_sample,
+            }) if *proposal_id == id && output_sample == "checked output"
+        ));
+        assert_snapshot_roundtrips(&session);
     }
 
     #[test]
@@ -2821,10 +2928,12 @@ mod tests {
         let stale = ProposalId(id.get() + 1);
 
         assert_eq!(
-            session.observe_execution_failure(
+            session.observe_execution(
                 stale,
-                CommandExecutionFailure::FailedToStart,
-                "not found",
+                CommandExecutionOutcome::failed(
+                    CommandExecutionFailure::FailedToStart,
+                    "not found",
+                ),
             ),
             Err(SessionError::StaleProposal {
                 expected: id,

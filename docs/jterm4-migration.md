@@ -16,9 +16,9 @@ prompt tags or extraction state.
 
 | Concern | Owner | Integration notes |
 |---|---|---|
-| Protocol/delivery capability discovery | `jagent::capabilities` | Exchange the bounded versioned token across a terminal/shell boundary, negotiate explicitly, and let request preparation re-check provider support. |
+| Protocol/delivery capability discovery | `jagent::capabilities` | Exchange the bounded versioned token across a terminal/shell boundary, negotiate exact v2 mode pairs (with strict v1 compatibility), and let request preparation re-check provider support. |
 | Protocol-matched request preparation and response decoding | `jagent::agent`, `jagent::response` | `prepare_agent_request` binds prompt, schema, history policy, delivery mode, and decoder to one `AgentProtocol`. This is the recommended 0.7 path. |
-| Agent state, proposal review, snapshots, and text-protocol parsing | `jagent::session` | Approval produces an `ApprovedCommand`; execution remains a caller action. |
+| Agent state, proposal review, snapshots, and text-protocol parsing | `jagent::session` | Approval produces an `ApprovedCommand`; execution remains a caller action and returns a typed `CommandExecutionOutcome`. |
 | Native tool schemas and response parsing | `jagent::tools` | Text and native-tool protocols converge on the same `ParsedAction` values. |
 | Low-level provider encoding and stream events | `jagent::provider`, `jagent::stream` | Compatibility surface for integrations that deliberately coordinate prompt, protocol, delivery, and parsing themselves. |
 | System prompts and untrusted user-role context | `jagent::prompt` | `BlockContext` and `EnvironmentMeta` are shared wire-facing shapes. |
@@ -31,9 +31,10 @@ prompt tags or extraction state.
 Move one complete request/response path at a time so protocol choices cannot
 drift between layers:
 
-1. For split processes, intersect `agent_capabilities(provider)` with the
-   peer's `AgentCapabilities::from_wire` value and negotiate the required
-   `AgentDelivery`. Fail clearly when no protocol matches.
+1. For split processes, make first contact with the compatibility-first
+   `agent_capabilities(provider)` v1 token. Decode the peer, reply with
+   `agent_capabilities_for_peer`, then intersect the two sets and negotiate the
+   required `AgentDelivery`. Fail clearly when no protocol matches.
 2. Keep the selected `AgentProtocol` for the full turn and use it with
    `AgentSession::build_user_prompt_with`.
 3. Construct untrusted user-role context with `agent_user_prompt`, then call

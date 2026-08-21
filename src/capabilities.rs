@@ -10,19 +10,28 @@
 use crate::{AgentProtocol, Provider};
 use std::fmt;
 
-/// Current capability-token schema version.
-pub const AGENT_CAPABILITIES_VERSION: u16 = 1;
-/// Canonical version-1 capability token emitted by all built-in providers.
+/// Latest supported capability-token schema version.
+pub const AGENT_CAPABILITIES_VERSION: u16 = 2;
+/// Canonical legacy capability token accepted for version-1 peers.
 pub const AGENT_CAPABILITIES_V1_WIRE: &str =
     "jagent-agent/1;protocols=text,native-tools;delivery=complete,streaming";
+/// Canonical opt-in version-2 capability token for all built-in providers.
+///
+/// Version 2 advertises exact protocol/delivery pairs instead of implying the
+/// Cartesian product of two independent sets.
+pub const AGENT_CAPABILITIES_V2_WIRE: &str = "jagent-agent/2;modes=text+complete,text+streaming,native-tools+complete,native-tools+streaming";
 /// Capability tokens are deliberately tiny; reject an effectively unbounded
 /// environment or IPC value before splitting it.
 pub const MAX_AGENT_CAPABILITIES_WIRE_BYTES: usize = 256;
 
-const PROTOCOL_TEXT: u8 = 1 << 0;
-const PROTOCOL_NATIVE_TOOLS: u8 = 1 << 1;
-const DELIVERY_COMPLETE: u8 = 1 << 0;
-const DELIVERY_STREAMING: u8 = 1 << 1;
+const MODE_TEXT_COMPLETE: u8 = 1 << 0;
+const MODE_TEXT_STREAMING: u8 = 1 << 1;
+const MODE_NATIVE_TOOLS_COMPLETE: u8 = 1 << 2;
+const MODE_NATIVE_TOOLS_STREAMING: u8 = 1 << 3;
+const ALL_MODES: u8 = MODE_TEXT_COMPLETE
+    | MODE_TEXT_STREAMING
+    | MODE_NATIVE_TOOLS_COMPLETE
+    | MODE_NATIVE_TOOLS_STREAMING;
 
 /// How one provider response body is delivered to the integration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -48,20 +57,57 @@ impl AgentDelivery {
 ///
 /// Fields stay private so later schema versions can grow without making
 /// callers construct internally inconsistent bitsets. Use
-/// [`agent_capabilities`] for a provider or [`Self::from_wire`] for a peer.
+/// [`agent_capabilities`] for compatibility-first provider discovery,
+/// [`agent_capabilities_for_peer`] for a reply, or [`Self::from_wire`] for a
+/// peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AgentCapabilities {
     version: u16,
-    protocols: u8,
-    delivery: u8,
+    modes: u8,
 }
 
 impl AgentCapabilities {
-    const V1_ALL: Self = Self {
+    const V2_ALL: Self = Self {
         version: AGENT_CAPABILITIES_VERSION,
-        protocols: PROTOCOL_TEXT | PROTOCOL_NATIVE_TOOLS,
-        delivery: DELIVERY_COMPLETE | DELIVERY_STREAMING,
+        modes: ALL_MODES,
     };
+
+    /// Convert an exact matrix to the largest compatibility-oriented v1
+    /// rectangle selected by a deterministic preference order. Every mode in
+    /// the resulting Cartesian product was present in `self`; downgrade may
+    /// omit a usable mode but can never advertise an unsupported crossing.
+    const fn safe_v1_downgrade(self) -> Self {
+        let modes = if self.modes & ALL_MODES == ALL_MODES {
+            ALL_MODES
+        } else if self.modes & (MODE_TEXT_COMPLETE | MODE_NATIVE_TOOLS_COMPLETE)
+            == (MODE_TEXT_COMPLETE | MODE_NATIVE_TOOLS_COMPLETE)
+        {
+            MODE_TEXT_COMPLETE | MODE_NATIVE_TOOLS_COMPLETE
+        } else if self.modes & (MODE_TEXT_COMPLETE | MODE_TEXT_STREAMING)
+            == (MODE_TEXT_COMPLETE | MODE_TEXT_STREAMING)
+        {
+            MODE_TEXT_COMPLETE | MODE_TEXT_STREAMING
+        } else if self.modes & (MODE_NATIVE_TOOLS_COMPLETE | MODE_NATIVE_TOOLS_STREAMING)
+            == (MODE_NATIVE_TOOLS_COMPLETE | MODE_NATIVE_TOOLS_STREAMING)
+        {
+            MODE_NATIVE_TOOLS_COMPLETE | MODE_NATIVE_TOOLS_STREAMING
+        } else if self.modes & (MODE_TEXT_STREAMING | MODE_NATIVE_TOOLS_STREAMING)
+            == (MODE_TEXT_STREAMING | MODE_NATIVE_TOOLS_STREAMING)
+        {
+            MODE_TEXT_STREAMING | MODE_NATIVE_TOOLS_STREAMING
+        } else if self.modes & MODE_TEXT_COMPLETE != 0 {
+            MODE_TEXT_COMPLETE
+        } else if self.modes & MODE_NATIVE_TOOLS_COMPLETE != 0 {
+            MODE_NATIVE_TOOLS_COMPLETE
+        } else if self.modes & MODE_TEXT_STREAMING != 0 {
+            MODE_TEXT_STREAMING
+        } else if self.modes & MODE_NATIVE_TOOLS_STREAMING != 0 {
+            MODE_NATIVE_TOOLS_STREAMING
+        } else {
+            panic!("provider Agent capability matrix must not be empty")
+        };
+        Self { version: 1, modes }
+    }
 
     /// Capability schema version carried by this value.
     pub const fn version(self) -> u16 {
@@ -71,15 +117,13 @@ impl AgentCapabilities {
     /// Whether the peer supports this exact action protocol and delivery
     /// combination.
     pub const fn supports(self, protocol: AgentProtocol, delivery: AgentDelivery) -> bool {
-        let protocol_bit = match protocol {
-            AgentProtocol::Text => PROTOCOL_TEXT,
-            AgentProtocol::NativeTools => PROTOCOL_NATIVE_TOOLS,
+        let mode = match (protocol, delivery) {
+            (AgentProtocol::Text, AgentDelivery::Complete) => MODE_TEXT_COMPLETE,
+            (AgentProtocol::Text, AgentDelivery::Streaming) => MODE_TEXT_STREAMING,
+            (AgentProtocol::NativeTools, AgentDelivery::Complete) => MODE_NATIVE_TOOLS_COMPLETE,
+            (AgentProtocol::NativeTools, AgentDelivery::Streaming) => MODE_NATIVE_TOOLS_STREAMING,
         };
-        let delivery_bit = match delivery {
-            AgentDelivery::Complete => DELIVERY_COMPLETE,
-            AgentDelivery::Streaming => DELIVERY_STREAMING,
-        };
-        self.protocols & protocol_bit != 0 && self.delivery & delivery_bit != 0
+        self.modes & mode != 0
     }
 
     /// Select the first supported protocol from the caller's preference
@@ -115,20 +159,46 @@ impl AgentCapabilities {
     /// IPC field. It contains capabilities only—never endpoint, credential,
     /// model, history, or terminal context.
     pub fn to_wire(self) -> String {
-        let protocols = match self.protocols {
-            PROTOCOL_TEXT => "text",
-            PROTOCOL_NATIVE_TOOLS => "native-tools",
-            _ => "text,native-tools",
-        };
-        let delivery = match self.delivery {
-            DELIVERY_COMPLETE => "complete",
-            DELIVERY_STREAMING => "streaming",
-            _ => "complete,streaming",
-        };
-        format!(
-            "jagent-agent/{};protocols={protocols};delivery={delivery}",
-            self.version
-        )
+        if self.version == 1 {
+            let protocols = match self.modes & (MODE_TEXT_COMPLETE | MODE_TEXT_STREAMING) != 0 {
+                true if self.modes & (MODE_NATIVE_TOOLS_COMPLETE | MODE_NATIVE_TOOLS_STREAMING)
+                    != 0 =>
+                {
+                    "text,native-tools"
+                }
+                true => "text",
+                false => "native-tools",
+            };
+            let delivery = match self.modes & (MODE_TEXT_COMPLETE | MODE_NATIVE_TOOLS_COMPLETE) != 0
+            {
+                true if self.modes & (MODE_TEXT_STREAMING | MODE_NATIVE_TOOLS_STREAMING) != 0 => {
+                    "complete,streaming"
+                }
+                true => "complete",
+                false => "streaming",
+            };
+            return format!(
+                "jagent-agent/{};protocols={protocols};delivery={delivery}",
+                self.version
+            );
+        }
+
+        let mut modes = String::new();
+        for (name, bit) in [
+            ("text+complete", MODE_TEXT_COMPLETE),
+            ("text+streaming", MODE_TEXT_STREAMING),
+            ("native-tools+complete", MODE_NATIVE_TOOLS_COMPLETE),
+            ("native-tools+streaming", MODE_NATIVE_TOOLS_STREAMING),
+        ] {
+            if self.modes & bit == 0 {
+                continue;
+            }
+            if !modes.is_empty() {
+                modes.push(',');
+            }
+            modes.push_str(name);
+        }
+        format!("jagent-agent/{};modes={modes}", self.version)
     }
 
     /// Parse a strict capability token.
@@ -154,40 +224,57 @@ impl AgentCapabilities {
         let version = version_text
             .parse::<u16>()
             .map_err(|_| CapabilityError::Malformed)?;
-        if version != AGENT_CAPABILITIES_VERSION {
-            return Err(CapabilityError::UnsupportedVersion(version));
+        match version {
+            1 => {
+                let protocol_field = fields
+                    .next()
+                    .and_then(|field| field.strip_prefix("protocols="))
+                    .ok_or(CapabilityError::Malformed)?;
+                let delivery_field = fields
+                    .next()
+                    .and_then(|field| field.strip_prefix("delivery="))
+                    .ok_or(CapabilityError::Malformed)?;
+                if fields.next().is_some() {
+                    return Err(CapabilityError::Malformed);
+                }
+                let protocols = parse_bits(protocol_field, &[("text", 1), ("native-tools", 2)])?;
+                let deliveries = parse_bits(delivery_field, &[("complete", 1), ("streaming", 2)])?;
+                let mut modes = 0;
+                if protocols & 1 != 0 && deliveries & 1 != 0 {
+                    modes |= MODE_TEXT_COMPLETE;
+                }
+                if protocols & 1 != 0 && deliveries & 2 != 0 {
+                    modes |= MODE_TEXT_STREAMING;
+                }
+                if protocols & 2 != 0 && deliveries & 1 != 0 {
+                    modes |= MODE_NATIVE_TOOLS_COMPLETE;
+                }
+                if protocols & 2 != 0 && deliveries & 2 != 0 {
+                    modes |= MODE_NATIVE_TOOLS_STREAMING;
+                }
+                Ok(Self { version, modes })
+            }
+            AGENT_CAPABILITIES_VERSION => {
+                let mode_field = fields
+                    .next()
+                    .and_then(|field| field.strip_prefix("modes="))
+                    .ok_or(CapabilityError::Malformed)?;
+                if fields.next().is_some() {
+                    return Err(CapabilityError::Malformed);
+                }
+                let modes = parse_bits(
+                    mode_field,
+                    &[
+                        ("text+complete", MODE_TEXT_COMPLETE),
+                        ("text+streaming", MODE_TEXT_STREAMING),
+                        ("native-tools+complete", MODE_NATIVE_TOOLS_COMPLETE),
+                        ("native-tools+streaming", MODE_NATIVE_TOOLS_STREAMING),
+                    ],
+                )?;
+                Ok(Self { version, modes })
+            }
+            _ => Err(CapabilityError::UnsupportedVersion(version)),
         }
-        let protocol_field = fields
-            .next()
-            .and_then(|field| field.strip_prefix("protocols="))
-            .ok_or(CapabilityError::Malformed)?;
-        let delivery_field = fields
-            .next()
-            .and_then(|field| field.strip_prefix("delivery="))
-            .ok_or(CapabilityError::Malformed)?;
-        if fields.next().is_some() {
-            return Err(CapabilityError::Malformed);
-        }
-
-        let protocols = parse_bits(
-            protocol_field,
-            &[
-                ("text", PROTOCOL_TEXT),
-                ("native-tools", PROTOCOL_NATIVE_TOOLS),
-            ],
-        )?;
-        let delivery = parse_bits(
-            delivery_field,
-            &[
-                ("complete", DELIVERY_COMPLETE),
-                ("streaming", DELIVERY_STREAMING),
-            ],
-        )?;
-        Ok(Self {
-            version,
-            protocols,
-            delivery,
-        })
     }
 }
 
@@ -212,16 +299,45 @@ fn parse_bits(value: &str, known: &[(&str, u8)]) -> Result<u8, CapabilityError> 
     Ok(bits)
 }
 
-/// Provider capabilities enforced by jagent's request and response codecs.
+/// Provider capabilities emitted for compatibility-first discovery.
 ///
 /// The explicit provider match is intentional. When a provider gains or loses
 /// a protocol or delivery form, compiler exhaustiveness makes this table and
-/// request preparation change together.
+/// request preparation change together. The default remains version 1 so a
+/// newly upgraded endpoint can still initiate discovery with a 0.7 peer that
+/// predates version 2. Use [`agent_capabilities_v2`] only after an integration
+/// has explicit evidence that its peer accepts version 2, or prefer
+/// [`agent_capabilities_for_peer`] after decoding the peer's token.
 pub const fn agent_capabilities(provider: Provider) -> AgentCapabilities {
+    agent_capabilities_v2(provider).safe_v1_downgrade()
+}
+
+/// Provider capabilities encoded with the exact-pair version-2 schema.
+///
+/// This is deliberately opt-in. Sending its wire value to an unprobed
+/// version-1 peer would make that peer reject discovery with
+/// [`CapabilityError::UnsupportedVersion`].
+pub const fn agent_capabilities_v2(provider: Provider) -> AgentCapabilities {
     match provider {
         Provider::Anthropic | Provider::OpenAiCompatible | Provider::Ollama => {
-            AgentCapabilities::V1_ALL
+            AgentCapabilities::V2_ALL
         }
+    }
+}
+
+/// Emit provider capabilities in a schema version the decoded peer accepts.
+///
+/// Since [`AgentCapabilities::from_wire`] only constructs supported versions,
+/// this cannot select an unknown schema. A version-1 peer receives the legacy
+/// Cartesian-product token; a version-2 peer receives exact mode pairs.
+pub const fn agent_capabilities_for_peer(
+    provider: Provider,
+    peer: AgentCapabilities,
+) -> AgentCapabilities {
+    match peer.version() {
+        1 => agent_capabilities(provider),
+        AGENT_CAPABILITIES_VERSION => agent_capabilities_v2(provider),
+        _ => agent_capabilities(provider),
     }
 }
 
@@ -255,17 +371,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_provider_advertises_the_matrix_its_codecs_implement() {
+    fn every_provider_advertises_a_v1_default_and_an_exact_v2_opt_in() {
         for provider in [
             Provider::Anthropic,
             Provider::OpenAiCompatible,
             Provider::Ollama,
         ] {
-            let capabilities = agent_capabilities(provider);
-            assert_eq!(capabilities.version(), AGENT_CAPABILITIES_VERSION);
+            let compatible = agent_capabilities(provider);
+            let exact = agent_capabilities_v2(provider);
+            assert_eq!(compatible.version(), 1);
+            assert_eq!(compatible.to_wire(), AGENT_CAPABILITIES_V1_WIRE);
+            assert_eq!(exact.version(), AGENT_CAPABILITIES_VERSION);
+            assert_eq!(exact.to_wire(), AGENT_CAPABILITIES_V2_WIRE);
             for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
                 for delivery in [AgentDelivery::Complete, AgentDelivery::Streaming] {
-                    assert!(capabilities.supports(protocol, delivery));
+                    assert!(exact.supports(protocol, delivery));
+                    if compatible.supports(protocol, delivery) {
+                        assert!(
+                            exact.supports(protocol, delivery),
+                            "v1 downgrade overclaimed {protocol:?}+{delivery:?} for {provider:?}"
+                        );
+                    }
                 }
             }
         }
@@ -306,12 +432,20 @@ mod tests {
 
     #[test]
     fn canonical_wire_round_trips_and_malformed_or_future_tokens_fail_closed() {
-        let capabilities = agent_capabilities(Provider::Anthropic);
+        let capabilities = agent_capabilities_v2(Provider::Anthropic);
         assert_eq!(
             AgentCapabilities::from_wire(&capabilities.to_wire()),
             Ok(capabilities)
         );
-        assert_eq!(capabilities.to_wire(), AGENT_CAPABILITIES_V1_WIRE);
+        assert_eq!(capabilities.to_wire(), AGENT_CAPABILITIES_V2_WIRE);
+        let legacy = AgentCapabilities::from_wire(AGENT_CAPABILITIES_V1_WIRE).unwrap();
+        assert_eq!(legacy.version(), 1);
+        assert_eq!(legacy.to_wire(), AGENT_CAPABILITIES_V1_WIRE);
+        for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
+            for delivery in [AgentDelivery::Complete, AgentDelivery::Streaming] {
+                assert!(legacy.supports(protocol, delivery));
+            }
+        }
         let text_only =
             AgentCapabilities::from_wire("jagent-agent/1;protocols=text;delivery=complete")
                 .unwrap();
@@ -336,6 +470,14 @@ mod tests {
             "jagent-agent/1;protocols=text;delivery=streaming,complete",
             "jagent-agent/1;protocols=future;delivery=complete",
             "jagent-agent/1;protocols=;delivery=complete",
+            "jagent-agent/2",
+            "jagent-agent/2;modes=",
+            "jagent-agent/2;protocols=text;delivery=complete",
+            "jagent-agent/2;modes=text+complete;text=native-tools+complete",
+            "jagent-agent/2;modes=text+complete,text+complete",
+            "jagent-agent/2;modes=native-tools+complete,text+complete",
+            "jagent-agent/2;modes=text+complete,future+complete",
+            "jagent-agent/2;modes=text+complete ",
         ] {
             assert_eq!(
                 AgentCapabilities::from_wire(malformed),
@@ -344,14 +486,149 @@ mod tests {
             );
         }
         assert_eq!(
-            AgentCapabilities::from_wire(
-                "jagent-agent/2;protocols=text,native-tools;delivery=complete,streaming"
-            ),
-            Err(CapabilityError::UnsupportedVersion(2))
+            AgentCapabilities::from_wire("jagent-agent/3;modes=text+complete"),
+            Err(CapabilityError::UnsupportedVersion(3))
         );
         assert_eq!(
             AgentCapabilities::from_wire(&"x".repeat(MAX_AGENT_CAPABILITIES_WIRE_BYTES + 1)),
             Err(CapabilityError::TooLarge)
         );
+    }
+
+    #[test]
+    fn version_two_preserves_exact_protocol_delivery_pairs() {
+        let split = AgentCapabilities::from_wire(
+            "jagent-agent/2;modes=text+complete,native-tools+streaming",
+        )
+        .unwrap();
+        assert_eq!(
+            split.to_wire(),
+            "jagent-agent/2;modes=text+complete,native-tools+streaming"
+        );
+        assert!(split.supports(AgentProtocol::Text, AgentDelivery::Complete));
+        assert!(!split.supports(AgentProtocol::Text, AgentDelivery::Streaming));
+        assert!(!split.supports(AgentProtocol::NativeTools, AgentDelivery::Complete));
+        assert!(split.supports(AgentProtocol::NativeTools, AgentDelivery::Streaming));
+
+        let local = agent_capabilities_v2(Provider::Ollama);
+        assert_eq!(
+            local.negotiate_with(
+                split,
+                &[AgentProtocol::NativeTools, AgentProtocol::Text],
+                AgentDelivery::Complete,
+            ),
+            Some(AgentProtocol::Text)
+        );
+        assert_eq!(
+            local.negotiate_with(
+                split,
+                &[AgentProtocol::Text, AgentProtocol::NativeTools],
+                AgentDelivery::Streaming,
+            ),
+            Some(AgentProtocol::NativeTools)
+        );
+    }
+
+    #[test]
+    fn v1_downgrade_never_invents_a_crossed_mode() {
+        let asymmetric = AgentCapabilities {
+            version: AGENT_CAPABILITIES_VERSION,
+            modes: MODE_TEXT_COMPLETE | MODE_NATIVE_TOOLS_STREAMING,
+        };
+        let downgraded = asymmetric.safe_v1_downgrade();
+        assert_eq!(
+            downgraded.to_wire(),
+            "jagent-agent/1;protocols=text;delivery=complete"
+        );
+        for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
+            for delivery in [AgentDelivery::Complete, AgentDelivery::Streaming] {
+                assert!(
+                    !downgraded.supports(protocol, delivery)
+                        || asymmetric.supports(protocol, delivery),
+                    "downgrade invented {protocol:?}+{delivery:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn version_one_compatibility_keeps_its_legacy_product_and_cannot_smuggle_v2() {
+        let legacy = AgentCapabilities::from_wire(
+            "jagent-agent/1;protocols=text,native-tools;delivery=complete",
+        )
+        .unwrap();
+        assert_eq!(legacy.version(), 1);
+        assert!(legacy.supports(AgentProtocol::Text, AgentDelivery::Complete));
+        assert!(legacy.supports(AgentProtocol::NativeTools, AgentDelivery::Complete));
+        assert!(!legacy.supports(AgentProtocol::Text, AgentDelivery::Streaming));
+        assert!(!legacy.supports(AgentProtocol::NativeTools, AgentDelivery::Streaming));
+        assert_eq!(
+            legacy.to_wire(),
+            "jagent-agent/1;protocols=text,native-tools;delivery=complete"
+        );
+
+        assert_eq!(
+            AgentCapabilities::from_wire(
+                "jagent-agent/1;modes=text+complete,native-tools+streaming"
+            ),
+            Err(CapabilityError::Malformed)
+        );
+        assert_eq!(
+            AgentCapabilities::from_wire(
+                "jagent-agent/2;protocols=text,native-tools;delivery=complete"
+            ),
+            Err(CapabilityError::Malformed)
+        );
+    }
+
+    fn decode_like_a_version_one_peer(value: &str) -> Result<AgentCapabilities, CapabilityError> {
+        if !value.starts_with("jagent-agent/1;") {
+            let version = value
+                .strip_prefix("jagent-agent/")
+                .and_then(|tail| tail.split(';').next())
+                .and_then(|version| version.parse().ok())
+                .unwrap_or(0);
+            return Err(CapabilityError::UnsupportedVersion(version));
+        }
+        AgentCapabilities::from_wire(value)
+    }
+
+    #[test]
+    fn rolling_upgrade_emission_is_old_peer_safe_and_peer_version_aware() {
+        for provider in [
+            Provider::Anthropic,
+            Provider::OpenAiCompatible,
+            Provider::Ollama,
+        ] {
+            let default = agent_capabilities(provider);
+            assert_eq!(
+                decode_like_a_version_one_peer(&default.to_wire()),
+                Ok(default),
+                "a new endpoint's first advertisement broke an old peer"
+            );
+
+            let exact = agent_capabilities_v2(provider);
+            assert_eq!(
+                decode_like_a_version_one_peer(&exact.to_wire()),
+                Err(CapabilityError::UnsupportedVersion(2))
+            );
+            assert_eq!(AgentCapabilities::from_wire(&exact.to_wire()), Ok(exact));
+
+            let old_peer =
+                AgentCapabilities::from_wire("jagent-agent/1;protocols=text;delivery=complete")
+                    .unwrap();
+            let new_peer = AgentCapabilities::from_wire(
+                "jagent-agent/2;modes=text+complete,native-tools+streaming",
+            )
+            .unwrap();
+            assert_eq!(
+                agent_capabilities_for_peer(provider, old_peer).to_wire(),
+                AGENT_CAPABILITIES_V1_WIRE
+            );
+            assert_eq!(
+                agent_capabilities_for_peer(provider, new_peer).to_wire(),
+                AGENT_CAPABILITIES_V2_WIRE
+            );
+        }
     }
 }

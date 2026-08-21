@@ -8,7 +8,10 @@
 //! of that contract a single operation and reports every history
 //! transformation it performs.
 
-use crate::capabilities::{agent_capabilities, AgentCapabilities, AgentDelivery};
+use crate::capabilities::{
+    agent_capabilities, agent_capabilities_for_peer, agent_capabilities_v2, AgentCapabilities,
+    AgentDelivery,
+};
 use crate::prompt::{build_agent_system_prompt, build_agent_tool_system_prompt};
 use crate::provider::{
     bound_history_cow_with_report, bound_history_with_report,
@@ -154,6 +157,12 @@ impl PreparedAgentRequest {
         agent_capabilities(self.provider)
     }
 
+    /// Provider capabilities encoded in the schema version accepted by a
+    /// successfully decoded peer token.
+    pub const fn capabilities_for_peer(&self, peer: AgentCapabilities) -> AgentCapabilities {
+        agent_capabilities_for_peer(self.provider, peer)
+    }
+
     /// Parse a complete non-streaming response with the provider and protocol
     /// already bound to this request.
     ///
@@ -194,7 +203,7 @@ pub fn prepare_agent_request(
     } else {
         AgentDelivery::Complete
     };
-    if !agent_capabilities(config.provider).supports(spec.protocol, delivery) {
+    if !agent_capabilities_v2(config.provider).supports(spec.protocol, delivery) {
         return Err(ProviderError::InvalidConfiguration(format!(
             "{} does not support the {} agent protocol with {} delivery",
             config.provider.display_name(),
@@ -407,6 +416,12 @@ mod tests {
                         AgentDelivery::Complete
                     };
                     assert!(prepared.capabilities().supports(protocol, delivery));
+                    assert_eq!(prepared.capabilities().version(), 1);
+                    let v2_peer = AgentCapabilities::from_wire(
+                        "jagent-agent/2;modes=text+complete,native-tools+streaming",
+                    )
+                    .unwrap();
+                    assert_eq!(prepared.capabilities_for_peer(v2_peer).version(), 2);
                     assert_eq!(prepared.protocol(), protocol);
                     assert_eq!(prepared.is_streaming(), streaming);
                     assert_eq!(prepared.response_stream().is_ok(), streaming);
