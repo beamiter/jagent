@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `HttpRequest::transport_metrics` and `validate_transport` with a
+  content-free `HttpRequestMetrics` report. Generated requests now carry
+  explicit URL, header-count, aggregate-header-byte, JSON-object, and body
+  postconditions before leaving the sans-I/O boundary. Directly constructed or
+  mutated requests receive the same HTTPS/loopback-HTTP authority checks, and
+  ambiguous duplicate top-level JSON fields are rejected.
+
 - Added versioned `AgentCapabilities` discovery for protocol/delivery
   negotiation across split terminal and shell integrations. Its bounded ASCII
   token supports capability subsets, strict parsing, and preference-ordered
@@ -34,6 +41,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Provider extension values are measured through the JSON serializer before
+  cloning or request assembly, with independent per-value and cumulative
+  encoded budgets. Extension failures and duplicate/reserved-name diagnostics
+  no longer reflect caller-controlled names or values.
+- Provider configuration rejects port zero and caps implausible output-token
+  requests, while generated headers are checked as unique canonical lowercase
+  HTTP tokens with printable-ASCII values and exactly one JSON content type.
+
+- API keys are now validated as exact, non-empty printable-ASCII HTTP header
+  values. Configuration with surrounding/internal whitespace, Unicode, or
+  other transport-dependent bytes is rejected instead of being silently
+  trimmed or delegated to an HTTP client's inconsistent header parser.
 - Declared Rust 1.86 as the crate MSRV, added docs.rs and repository metadata,
   forbade unsafe Rust, and restricted published package contents to the public
   source, examples, guides, policies, changelog, and licenses.
@@ -121,8 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   toolchain convention (`minimal` profile with rustfmt and Clippy).
 - High-level agent request preparation now redacts high-confidence secrets by
   default before history budgeting. Opting out is explicit.
-- `HttpRequest` debug output now reports only request-body length instead of
-  emitting AI-bound user context.
+- `HttpRequest` debug output now reports only URL/body lengths and header count
+  instead of emitting AI-bound context or caller-controlled header names and
+  values.
 - Plain HTTP loopback endpoints are accepted for every provider so local
   OpenAI-compatible servers and proxies can be configured without weakening
   the HTTPS requirement for remote hosts.

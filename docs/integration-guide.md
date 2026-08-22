@@ -118,7 +118,11 @@ terminate the surrounding prompt envelope.
 ## Perform the HTTP request
 
 `prepared.request` contains a URL, lowercase headers, and a serialized JSON
-body for an HTTP `POST`. The embedding transport remains responsible for:
+body for an HTTP `POST`. Builders have already called
+`HttpRequest::validate_transport`; an integration that mutates or constructs
+the public value directly should call it again immediately before transport.
+Its `HttpRequestMetrics` result contains only URL/header/body sizes and counts.
+The embedding transport remains responsible for:
 
 - TLS policy, DNS resolution, proxy behavior, and redirect policy;
 - connection, response, and overall deadlines plus cancellation;
@@ -130,9 +134,10 @@ Remote base URLs must use HTTPS. The host must be an ASCII DNS name or a
 canonical IP literal; ambiguous numeric, percent-encoded, Unicode, empty-label,
 and otherwise transport-dependent spellings are rejected. Plain HTTP is
 accepted only for syntactic loopback hosts so local Ollama and
-OpenAI-compatible servers remain usable. `HttpRequest` debug formatting
-redacts header values and omits the body, but applications should still treat
-the value itself as sensitive.
+OpenAI-compatible servers remain usable. `HttpRequest` debug formatting emits
+only the same content-free sizes/counts: it omits the URL, every header name
+and value, and the body. Applications should still treat the value itself as
+sensitive.
 
 If the transport fails before a response can be decoded, record a bounded,
 non-secret diagnostic with `AgentSession::model_failed`. A retry can then use

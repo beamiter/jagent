@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-21
+Updated: 2026-08-22
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -9,6 +9,66 @@ The low-level provider, tool, stream, and session APIs remain available, while
 new integrations can bind request preparation, response decoding, and session
 ingestion to one `AgentProtocol` and receive machine-readable history
 transformation reports.
+
+## 2026-08-22 ten-round provider hardening
+
+1. `ChatConfig` and `HttpRequest` Debug report only transport metadata, counts,
+   and byte lengths; they do not echo credentials, model/URL text, header
+   names or values, or request bodies.
+2. Provider parsing bounds the raw spelling, rejects invisible formatting,
+   and never reflects an unknown value into diagnostics.
+3. `ChatConfig::endpoint` makes configuration validation part of endpoint
+   resolution while retaining the unchecked `Provider::endpoint` compatibility API.
+4. Every built request now obtains its URL through that validated endpoint.
+5. Provider extension fields cannot replace core `model`, `messages`,
+   `system`, `max_tokens`, `temperature`, or `options` fields.
+6. Extensions likewise cannot replace `stream` or `stream_options`, so a
+   protocol-bound delivery mode cannot be silently changed.
+7. Extension count, name size/visibility, and uniqueness are checked while
+   ordinary future provider fields remain available.
+8. The complete encoded request body has a final 4 MiB ceiling after provider
+   fields and JSON escaping are applied.
+9. History retention budgets exact JSON string escaping and message framing;
+   escape-heavy input is sampled to the same ceiling as ordinary text.
+10. `HistoryReport::sent_history_json_bytes` exposes that non-sensitive wire
+    cost, with a serde-based oracle and cross-provider failure-path tests.
+
+## 2026-08-22 twenty-round request transport hardening
+
+1. Completed endpoint URLs have an explicit byte ceiling independent of the
+   configured base-URL ceiling.
+2. A request may contain at most 16 headers before entering an HTTP stack.
+3. Header names and values share a checked 64 KiB aggregate byte budget.
+4. Header names must use the RFC token alphabet.
+5. Generated and validated header names use one canonical lowercase spelling.
+6. Header values must be printable ASCII, excluding control and newline
+   injection.
+7. Duplicate header names are rejected instead of relying on transport-specific
+   merge rules.
+8. Exactly one `content-type: application/json` header is required.
+9. The complete serialized body retains its 4 MiB post-assembly ceiling.
+10. The transport validator requires one syntactically complete top-level JSON
+    object with unique top-level keys, without allocating a second
+    `serde_json::Value` tree.
+11. `HttpRequest::transport_metrics` uses checked arithmetic and exposes only
+    byte/count metadata.
+12. `HttpRequest` Debug now derives its URL/header/body accounting from that
+    same content-free metrics contract.
+13. Every built request passes the public transport validator as its final
+    postcondition.
+14. Each provider-extension value is measured by the real JSON serializer
+    before it is cloned into the body.
+15. Extensions also share a 2 MiB encoded aggregate budget, preserving room
+    for the bounded core request fields.
+16. Extension serialization and budget errors are generic and never echo a
+    caller-controlled field name or value.
+17. The extension preflight runs before history cloning, body construction,
+    or extension cloning.
+18. `max_tokens` is limited to the documented positive range ending at one
+    million instead of accepting an arbitrary `u32` from corrupt settings.
+19. Port zero is rejected for both HTTPS and local-loopback HTTP authorities.
+20. Cross-provider and adversarial direct-request tests pin metrics, headers,
+    body shape, extension escaping, aggregate budgets, port, and token edges.
 
 ## Current 0.7 surface
 
@@ -97,8 +157,9 @@ tool event is not approval.
   compatibility wrapper. Detection covers established provider/package token
   formats, named secrets and headers, private-key blocks, and signed/OAuth URL
   parameters without treating every opaque identifier as a secret.
-- `HttpRequest::Debug` reports body length instead of logging AI-bound user
-  context. Credential headers remain redacted.
+- `HttpRequest::Debug` reports only URL/body lengths and the header count.
+  Caller-controlled header names and values are omitted wholesale rather than
+  relying on a finite credential-name list.
 - Plain HTTP is accepted for syntactic loopback endpoints for every provider,
   enabling local OpenAI-compatible servers and proxies. Remote endpoints still
   require HTTPS and an ASCII DNS name or canonical IP literal; URL whitespace,
@@ -150,10 +211,11 @@ consumer migration details.
 
 ## Remaining integration boundaries
 
-`jagent` remains sans-IO. Consumers own:
+`jagent` remains sans-IO. It now validates the request value's URL/body/header
+shape and budgets; consumers still own:
 
-- HTTP header/count limits, TLS policy, redirects, deadlines, cancellation,
-  and response status handling;
+- HTTP framing overhead, TLS policy, redirects, deadlines, cancellation, and
+  response status handling;
 - API-key acquisition and storage;
 - PTY/process creation, shell semantics, execution timeout, and output capture;
 - the approval UI and deliberate execution of `ApprovedCommand`;

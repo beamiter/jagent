@@ -8,16 +8,20 @@
 //! [`build_chat_request`] compatibility entry point returns only the request.
 
 use crate::safety::is_unsafe_invisible_char;
-use crate::text::elide_middle;
+use crate::text::{ceil_char_boundary, elide_middle, floor_char_boundary};
 use crate::tools::{agent_body_fields, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::io::{self, Write};
 use std::str::FromStr;
 
 pub const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 pub const MAX_MODEL_TEXT_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_HISTORY_TURNS: usize = 40;
+/// Ceiling for encoded retained-history message objects (including JSON
+/// escaping and separators, excluding only the surrounding array brackets).
 pub const MAX_REQUEST_HISTORY_BYTES: usize = 256 * 1024;
 pub const MAX_REQUEST_TURN_BYTES: usize = 192 * 1024;
 /// Generous ceiling for a credential copied into one HTTP header. This bounds
@@ -33,6 +37,25 @@ pub const MAX_BASE_URL_BYTES: usize = 4 * 1024;
 /// than elided: silently truncating it could drop the rules the reply is
 /// parsed against.
 pub const MAX_REQUEST_SYSTEM_BYTES: usize = 64 * 1024;
+/// Byte ceiling for the complete encoded JSON request body. The history and
+/// system budgets keep ordinary requests well below this; this final guard
+/// also covers JSON escaping and provider-specific extension fields.
+pub const MAX_REQUEST_JSON_BYTES: usize = 4 * 1024 * 1024;
+/// Byte ceiling for a completed provider endpoint after its fixed path is
+/// appended to a validated base URL.
+pub const MAX_REQUEST_URL_BYTES: usize = MAX_BASE_URL_BYTES + 64;
+/// Maximum number of headers in one sans-I/O request.
+pub const MAX_REQUEST_HEADERS: usize = 16;
+/// Aggregate header-name and header-value bytes in one request. Framing added
+/// by an HTTP implementation is intentionally excluded.
+pub const MAX_REQUEST_HEADER_BYTES: usize = 64 * 1024;
+/// Per-extension encoded JSON ceiling, measured before cloning its [`Value`].
+pub const MAX_REQUEST_EXTENSION_JSON_BYTES: usize = 1024 * 1024;
+/// Aggregate encoded JSON ceiling for provider extensions.
+pub const MAX_REQUEST_EXTENSIONS_JSON_BYTES: usize = 2 * 1024 * 1024;
+/// Generous library-side guard against a corrupt setting becoming an
+/// implausibly large provider generation request.
+pub const MAX_REQUEST_MAX_TOKENS: u32 = 1_000_000;
 /// Byte ceiling for one encoded non-streaming response envelope, applied by
 /// [`parse_chat_response_bytes`]. Integrations that decode the body themselves
 /// must apply an equivalent transport limit before calling the `Value`-based
@@ -83,6 +106,10 @@ impl Provider {
         }
     }
 
+    /// Append this provider's path to an already trusted base URL.
+    ///
+    /// This compatibility helper does not validate `base_url`; outbound
+    /// request code should prefer [`ChatConfig::endpoint`].
     pub fn endpoint(self, base_url: &str) -> String {
         let base = base_url.trim_end_matches('/');
         match self {
@@ -102,12 +129,15 @@ impl FromStr for Provider {
     type Err = ProviderError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let value = value.trim();
-        if value.len() > MAX_PROVIDER_NAME_BYTES || value.chars().any(char::is_control) {
+        if value.len() > MAX_PROVIDER_NAME_BYTES
+            || value.chars().any(char::is_control)
+            || value.chars().any(is_unsafe_invisible_char)
+        {
             return Err(ProviderError::InvalidConfiguration(
                 "AI provider name is invalid or exceeds its byte limit".into(),
             ));
         }
+        let value = value.trim();
         if value.eq_ignore_ascii_case("anthropic") || value.eq_ignore_ascii_case("claude") {
             Ok(Self::Anthropic)
         } else if value.eq_ignore_ascii_case("openai")
@@ -118,9 +148,9 @@ impl FromStr for Provider {
         } else if value.eq_ignore_ascii_case("ollama") {
             Ok(Self::Ollama)
         } else {
-            Err(ProviderError::InvalidConfiguration(format!(
-                "unknown AI provider '{value}'"
-            )))
+            Err(ProviderError::InvalidConfiguration(
+                "unknown AI provider".into(),
+            ))
         }
     }
 }
@@ -206,17 +236,195 @@ pub struct HttpRequest {
     pub body: String,
 }
 
+/// Non-sensitive accounting for one [`HttpRequest`].
+///
+/// Counts deliberately omit every header name/value and all URL/body text, so
+/// callers may report this value without creating a credential or prompt sink.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HttpRequestMetrics {
+    pub url_bytes: usize,
+    pub header_count: usize,
+    pub header_bytes: usize,
+    pub body_bytes: usize,
+}
+
+impl HttpRequest {
+    /// Return checked, content-free wire-size accounting.
+    pub fn transport_metrics(&self) -> Result<HttpRequestMetrics, ProviderError> {
+        let header_bytes = self
+            .headers
+            .iter()
+            .try_fold(0_usize, |total, (name, value)| {
+                total.checked_add(name.len())?.checked_add(value.len())
+            });
+        let Some(header_bytes) = header_bytes else {
+            return Err(ProviderError::InvalidConfiguration(
+                "request header byte accounting overflowed".into(),
+            ));
+        };
+        Ok(HttpRequestMetrics {
+            url_bytes: self.url.len(),
+            header_count: self.headers.len(),
+            header_bytes,
+            body_bytes: self.body.len(),
+        })
+    }
+
+    /// Validate the complete sans-I/O value immediately before transport.
+    ///
+    /// Builders call this themselves. It is public because `HttpRequest` has
+    /// public fields for compatibility and an integration may mutate or build
+    /// one directly before handing it to an HTTP stack.
+    pub fn validate_transport(&self) -> Result<HttpRequestMetrics, ProviderError> {
+        let metrics = self.transport_metrics()?;
+        if !transport_url_is_valid(&self.url, MAX_REQUEST_URL_BYTES) {
+            return Err(ProviderError::InvalidConfiguration(
+                "request URL is not a bounded absolute HTTPS or loopback HTTP URL".into(),
+            ));
+        }
+        if metrics.header_count > MAX_REQUEST_HEADERS
+            || metrics.header_bytes > MAX_REQUEST_HEADER_BYTES
+        {
+            return Err(ProviderError::InvalidConfiguration(
+                "request headers exceed their count or byte limit".into(),
+            ));
+        }
+
+        let mut content_type_count = 0_usize;
+        for (index, (name, value)) in self.headers.iter().enumerate() {
+            if !is_lowercase_header_name(name) {
+                return Err(ProviderError::InvalidConfiguration(
+                    "request header name is not canonical lowercase HTTP token text".into(),
+                ));
+            }
+            if !value.bytes().all(|byte| matches!(byte, 0x20..=0x7e)) {
+                return Err(ProviderError::InvalidConfiguration(
+                    "request header value is not printable ASCII".into(),
+                ));
+            }
+            if self.headers[..index]
+                .iter()
+                .any(|(previous, _)| previous == name)
+            {
+                return Err(ProviderError::InvalidConfiguration(
+                    "request contains a duplicate header name".into(),
+                ));
+            }
+            if name == "content-type" {
+                content_type_count = content_type_count.saturating_add(1);
+                if value != "application/json" {
+                    return Err(ProviderError::InvalidConfiguration(
+                        "request content-type must be application/json".into(),
+                    ));
+                }
+            }
+        }
+        if content_type_count != 1 {
+            return Err(ProviderError::InvalidConfiguration(
+                "request must contain exactly one JSON content-type header".into(),
+            ));
+        }
+        if metrics.body_bytes > MAX_REQUEST_JSON_BYTES || !is_json_object(&self.body) {
+            return Err(ProviderError::InvalidConfiguration(
+                "request body must be one JSON object within its byte limit".into(),
+            ));
+        }
+        Ok(metrics)
+    }
+}
+
+fn is_lowercase_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
+fn is_json_object(body: &str) -> bool {
+    struct ObjectOnly;
+
+    impl<'de> Deserialize<'de> for ObjectOnly {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct Visitor;
+
+            impl<'de> serde::de::Visitor<'de> for Visitor {
+                type Value = ObjectOnly;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+
+                fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+                where
+                    M: serde::de::MapAccess<'de>,
+                {
+                    let mut fields = HashSet::new();
+                    while let Some(field) = map.next_key::<String>()? {
+                        if !fields.insert(field) {
+                            return Err(serde::de::Error::custom(
+                                "duplicate top-level request field",
+                            ));
+                        }
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                    Ok(ObjectOnly)
+                }
+            }
+
+            deserializer.deserialize_map(Visitor)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    ObjectOnly::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+}
+
 impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let metrics = self.transport_metrics().unwrap_or(HttpRequestMetrics {
+            url_bytes: self.url.len(),
+            header_count: self.headers.len(),
+            header_bytes: usize::MAX,
+            body_bytes: self.body.len(),
+        });
         formatter
             .debug_struct("HttpRequest")
-            .field("url", &self.url)
-            .field("headers", &RedactedHeaders(&self.headers))
+            // A caller can construct this public sans-I/O value directly;
+            // avoid echoing URL userinfo/query credentials in diagnostics.
+            .field("url_bytes", &metrics.url_bytes)
+            // Header names and values are both caller-controlled. A finite
+            // sensitive-name list cannot cover cookies, proxy credentials,
+            // provider extensions, or application-specific secret headers,
+            // while hostile names can also forge log structure. Keep only
+            // the count in Debug; the transport still receives exact bytes.
+            .field("header_count", &metrics.header_count)
+            .field("header_bytes", &metrics.header_bytes)
             // Request bodies contain user context and can therefore contain
             // credentials that no finite pattern list will reliably catch.
             // Keep Debug useful for transport diagnostics without turning an
             // innocent tracing statement into a second secret sink.
-            .field("body_bytes", &self.body.len())
+            .field("body_bytes", &metrics.body_bytes)
             .finish()
     }
 }
@@ -232,25 +440,6 @@ impl std::fmt::Debug for HttpRequest {
 pub struct BuiltRequest {
     pub request: HttpRequest,
     pub omitted_history_turns: usize,
-}
-
-struct RedactedHeaders<'a>(&'a [(String, String)]);
-
-impl std::fmt::Debug for RedactedHeaders<'_> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut list = formatter.debug_list();
-        for (name, value) in self.0 {
-            let value = if name.eq_ignore_ascii_case("authorization")
-                || name.eq_ignore_ascii_case("x-api-key")
-            {
-                "[REDACTED]"
-            } else {
-                value
-            };
-            list.entry(&(name, value));
-        }
-        list.finish()
-    }
 }
 
 /// Chat client configuration owned by the integration.
@@ -274,8 +463,8 @@ impl std::fmt::Debug for ChatConfig {
             .debug_struct("ChatConfig")
             .field("provider", &self.provider)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
+            .field("model_bytes", &self.model.len())
+            .field("base_url_bytes", &self.base_url.len())
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
             .finish()
@@ -304,23 +493,13 @@ impl ChatConfig {
         // previous `trim()` accepted surrounding whitespace here but later
         // built an unusable, transport-dependent URL from the original value.
         validate_base_url(&self.base_url)?;
-        if self.max_tokens == 0 {
-            return Err(ProviderError::InvalidConfiguration(
-                "max_tokens must be positive".into(),
-            ));
+        if !(1..=MAX_REQUEST_MAX_TOKENS).contains(&self.max_tokens) {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "max_tokens must be between 1 and {MAX_REQUEST_MAX_TOKENS}"
+            )));
         }
         if let Some(api_key) = self.api_key.as_deref() {
-            let api_key = api_key.trim();
-            if api_key.len() > MAX_API_KEY_BYTES {
-                return Err(ProviderError::InvalidConfiguration(
-                    "API key exceeds its byte limit".into(),
-                ));
-            }
-            if api_key.chars().any(char::is_control) {
-                return Err(ProviderError::InvalidConfiguration(
-                    "API key contains a control character".into(),
-                ));
-            }
+            validate_api_key(api_key)?;
         }
         if let Some(temperature) = self.temperature {
             if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
@@ -331,6 +510,41 @@ impl ChatConfig {
         }
         Ok(())
     }
+
+    /// Return the exact provider endpoint only after validating every
+    /// transport-relevant field in this configuration.
+    pub fn endpoint(&self) -> Result<String, ProviderError> {
+        self.validate()?;
+        Ok(self.provider.endpoint(&self.base_url))
+    }
+}
+
+/// Validate the exact credential bytes request construction will place in an
+/// HTTP header. Silently trimming a settings value makes configuration
+/// diagnostics disagree with the request, while non-ASCII or whitespace
+/// bytes are accepted inconsistently by HTTP client implementations.
+fn validate_api_key(api_key: &str) -> Result<(), ProviderError> {
+    if api_key.is_empty() {
+        return Err(ProviderError::InvalidConfiguration(
+            "API key must not be empty".into(),
+        ));
+    }
+    if api_key.len() > MAX_API_KEY_BYTES {
+        return Err(ProviderError::InvalidConfiguration(
+            "API key exceeds its byte limit".into(),
+        ));
+    }
+    if api_key.chars().any(char::is_control) {
+        return Err(ProviderError::InvalidConfiguration(
+            "API key contains a control character".into(),
+        ));
+    }
+    if !api_key.bytes().all(|byte| matches!(byte, 0x21..=0x7e)) {
+        return Err(ProviderError::InvalidConfiguration(
+            "API key must contain only visible ASCII characters with no whitespace".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_model(model: &str) -> Result<(), ProviderError> {
@@ -369,27 +583,36 @@ fn validate_base_url(base_url: &str) -> Result<(), ProviderError> {
              (plain HTTP is accepted only for a loopback endpoint)"
         ))
     };
-    if base_url.is_empty()
-        || base_url.trim() != base_url
-        || base_url.len() > MAX_BASE_URL_BYTES
-        || base_url.contains([' ', '?', '#', '\\'])
-        || base_url.chars().any(char::is_control)
-        || base_url.chars().any(is_unsafe_invisible_char)
+    transport_url_is_valid(base_url, MAX_BASE_URL_BYTES)
+        .then_some(())
+        .ok_or_else(invalid)
+}
+
+fn transport_url_is_valid(url: &str, max_bytes: usize) -> bool {
+    if url.is_empty()
+        || url.trim() != url
+        || url.len() > max_bytes
+        || url.contains(['?', '#', '\\'])
+        || url.chars().any(char::is_whitespace)
+        || url.chars().any(char::is_control)
+        || url.chars().any(is_unsafe_invisible_char)
     {
-        return Err(invalid());
+        return false;
     }
-    let (scheme, rest) = base_url.split_once("://").ok_or_else(invalid)?;
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
     let authority = rest.split('/').next().unwrap_or_default();
     let Some(host) = authority_host(authority) else {
-        return Err(invalid());
+        return false;
     };
     if authority.contains('@') || !is_valid_url_host(host) {
-        return Err(invalid());
+        return false;
     }
     match scheme {
-        "https" => Ok(()),
-        "http" if is_loopback_authority(authority) => Ok(()),
-        _ => Err(invalid()),
+        "https" => true,
+        "http" if is_loopback_authority(authority) => true,
+        _ => false,
     }
 }
 
@@ -498,7 +721,7 @@ fn authority_host(authority: &str) -> Option<&str> {
 fn is_port(port: &str) -> bool {
     !port.is_empty()
         && port.chars().all(|digit| digit.is_ascii_digit())
-        && port.parse::<u16>().is_ok()
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
 /// Bound a conversation history to the request budgets, newest-first. Leading
@@ -535,6 +758,9 @@ pub struct HistoryReport {
     /// UTF-8 text bytes retained across the sent turns, excluding JSON and
     /// provider framing overhead.
     pub sent_history_text_bytes: usize,
+    /// Encoded JSON bytes occupied by the retained message objects and their
+    /// separating commas, excluding the surrounding array brackets.
+    pub sent_history_json_bytes: usize,
 }
 
 /// A bounded history together with a complete loss/preparation report.
@@ -596,9 +822,8 @@ pub fn bound_history_cow_with_report<'a>(
         }
         let prepared = prepare(&turn.text);
         let changed = prepared.as_ref() != turn.text;
-        let elided = prepared.len() > MAX_REQUEST_TURN_BYTES;
-        let text = elide_middle(&prepared, MAX_REQUEST_TURN_BYTES);
-        let cost = text.len().saturating_add(32);
+        let (text, elided, message_bytes) = bound_history_turn(turn.role, &prepared);
+        let cost = message_bytes.saturating_add(usize::from(!retained_reversed.is_empty()));
         if !retained_reversed.is_empty()
             && retained_bytes.saturating_add(cost) > MAX_REQUEST_HISTORY_BYTES
         {
@@ -634,6 +859,14 @@ pub fn bound_history_cow_with_report<'a>(
             .iter()
             .map(|turn| turn.message.text.len())
             .fold(0_usize, usize::saturating_add),
+        sent_history_json_bytes: retained_reversed
+            .iter()
+            .enumerate()
+            .map(|(index, turn)| {
+                history_turn_wire_bytes(turn.message.role, &turn.message.text)
+                    .saturating_add(usize::from(index > 0))
+            })
+            .fold(0_usize, usize::saturating_add),
     };
     PreparedHistory {
         messages: retained_reversed
@@ -642,6 +875,76 @@ pub fn bound_history_cow_with_report<'a>(
             .collect(),
         report,
     }
+}
+
+fn bound_history_turn(role: Role, text: &str) -> (String, bool, usize) {
+    let initial_limit = text.len().min(MAX_REQUEST_TURN_BYTES);
+    if elided_history_turn_wire_bytes(role, text, initial_limit) <= MAX_REQUEST_HISTORY_BYTES {
+        let bounded = elide_middle(text, initial_limit);
+        let bytes = history_turn_wire_bytes(role, &bounded);
+        return (bounded, initial_limit < text.len(), bytes);
+    }
+
+    // Find the largest raw-text budget whose JSON representation still fits.
+    // The oracle computes slices without allocating, so hostile escape-heavy
+    // text causes exactly one final sample allocation rather than one per
+    // search step.
+    let mut low = 0_usize;
+    let mut high = initial_limit;
+    while low < high {
+        let middle = low + (high - low).div_ceil(2);
+        if elided_history_turn_wire_bytes(role, text, middle) <= MAX_REQUEST_HISTORY_BYTES {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let bounded = elide_middle(text, low);
+    let bytes = history_turn_wire_bytes(role, &bounded);
+    (bounded, low < text.len(), bytes)
+}
+
+fn elided_history_turn_wire_bytes(role: Role, text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return history_turn_wire_bytes(role, text);
+    }
+    const MARKER: &str = "\n\n… [bytes elided] …\n\n";
+    let retained_budget = max_bytes.saturating_sub(MARKER.len());
+    if retained_budget == 0 {
+        return history_turn_wire_bytes(role, &text[..floor_char_boundary(text, max_bytes)]);
+    }
+    let head_budget = retained_budget / 2;
+    let tail_budget = retained_budget.saturating_sub(head_budget);
+    let head = &text[..floor_char_boundary(text, head_budget)];
+    let tail = &text[ceil_char_boundary(text, text.len().saturating_sub(tail_budget))..];
+    history_turn_wire_overhead(role)
+        .saturating_add(json_string_contents_len(head))
+        .saturating_add(json_string_contents_len(MARKER))
+        .saturating_add(json_string_contents_len(tail))
+        .saturating_add(2)
+}
+
+fn history_turn_wire_bytes(role: Role, text: &str) -> usize {
+    history_turn_wire_overhead(role)
+        .saturating_add(json_string_contents_len(text))
+        .saturating_add(2)
+}
+
+fn history_turn_wire_overhead(role: Role) -> usize {
+    // Serialized message object excluding the content string itself and its
+    // two quote bytes. Field order does not affect the total.
+    b"{\"role\":\"\",\"content\":}".len() + role.as_str().len()
+}
+
+fn json_string_contents_len(text: &str) -> usize {
+    text.chars().fold(0_usize, |bytes, character| {
+        let encoded = match character {
+            '"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        bytes.saturating_add(encoded)
+    })
 }
 
 /// Build one bounded chat POST, discarding the number of history turns this
@@ -783,7 +1086,8 @@ fn build_request_with(
     stream: bool,
     extra_body_fields: &[(&'static str, Value)],
 ) -> Result<BuiltRequest, ProviderError> {
-    config.validate()?;
+    let url = config.endpoint()?;
+    let _extension_json_bytes = validate_extra_body_fields(extra_body_fields)?;
     if let Some(system) = system {
         if system.len() > MAX_REQUEST_SYSTEM_BYTES {
             return Err(ProviderError::InvalidConfiguration(format!(
@@ -796,11 +1100,7 @@ fn build_request_with(
     // a caller that forgot cannot make this crate emit an unbounded body.
     let (history, omitted_history_turns) = bound_history(history);
     let history = &history[..];
-    let api_key = config
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty());
+    let api_key = config.api_key.as_deref();
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     match config.provider {
         Provider::Anthropic => {
@@ -818,17 +1118,125 @@ fn build_request_with(
         }
     }
     let mut body = request_body(config, system, history, stream);
+    if !body.is_object() {
+        return Err(ProviderError::InvalidConfiguration(
+            "provider request body is not a JSON object".into(),
+        ));
+    }
     for (field, value) in extra_body_fields {
         body[*field] = value.clone();
     }
+    let body = serde_json::to_string(&body).map_err(|_| {
+        ProviderError::InvalidConfiguration("provider request JSON could not be encoded".into())
+    })?;
+    if body.len() > MAX_REQUEST_JSON_BYTES {
+        return Err(ProviderError::InvalidConfiguration(format!(
+            "encoded request body exceeds the {MAX_REQUEST_JSON_BYTES}-byte limit"
+        )));
+    }
+    let request = HttpRequest { url, headers, body };
+    request.validate_transport()?;
     Ok(BuiltRequest {
-        request: HttpRequest {
-            url: config.provider.endpoint(&config.base_url),
-            headers,
-            body: body.to_string(),
-        },
+        request,
         omitted_history_turns,
     })
+}
+
+fn validate_extra_body_fields(
+    extra_body_fields: &[(&'static str, Value)],
+) -> Result<usize, ProviderError> {
+    const MAX_EXTRA_BODY_FIELDS: usize = 16;
+    const MAX_EXTRA_BODY_FIELD_BYTES: usize = 64;
+    const RESERVED: [&str; 8] = [
+        "model",
+        "messages",
+        "system",
+        "max_tokens",
+        "temperature",
+        "stream",
+        "stream_options",
+        "options",
+    ];
+    if extra_body_fields.len() > MAX_EXTRA_BODY_FIELDS {
+        return Err(ProviderError::InvalidConfiguration(
+            "too many provider extension fields".into(),
+        ));
+    }
+    let mut encoded_bytes = 2_usize; // enclosing object braces
+    for (index, (field, value)) in extra_body_fields.iter().enumerate() {
+        if field.is_empty()
+            || field.len() > MAX_EXTRA_BODY_FIELD_BYTES
+            || !field.bytes().all(|byte| matches!(byte, 0x21..=0x7e))
+        {
+            return Err(ProviderError::InvalidConfiguration(
+                "provider extension field name is invalid".into(),
+            ));
+        }
+        if RESERVED.contains(field) {
+            return Err(ProviderError::InvalidConfiguration(
+                "provider extension may not replace a reserved field".into(),
+            ));
+        }
+        if extra_body_fields[..index]
+            .iter()
+            .any(|(previous, _)| previous == field)
+        {
+            return Err(ProviderError::InvalidConfiguration(
+                "duplicate provider extension field".into(),
+            ));
+        }
+        let value_bytes = encoded_json_len(value, MAX_REQUEST_EXTENSION_JSON_BYTES)?;
+        let field_bytes = json_string_contents_len(field)
+            .checked_add(2) // field-name quotes
+            .and_then(|bytes| bytes.checked_add(1)) // colon
+            .and_then(|bytes| bytes.checked_add(value_bytes))
+            .and_then(|bytes| bytes.checked_add(usize::from(index > 0)))
+            .ok_or_else(|| {
+                ProviderError::InvalidConfiguration(
+                    "provider extension byte accounting overflowed".into(),
+                )
+            })?;
+        encoded_bytes = encoded_bytes.checked_add(field_bytes).ok_or_else(|| {
+            ProviderError::InvalidConfiguration(
+                "provider extension byte accounting overflowed".into(),
+            )
+        })?;
+        if encoded_bytes > MAX_REQUEST_EXTENSIONS_JSON_BYTES {
+            return Err(ProviderError::InvalidConfiguration(format!(
+                "provider extensions exceed the {MAX_REQUEST_EXTENSIONS_JSON_BYTES}-byte encoded limit"
+            )));
+        }
+    }
+    Ok(encoded_bytes)
+}
+
+fn encoded_json_len(value: &Value, limit: usize) -> Result<usize, ProviderError> {
+    struct CountingWriter {
+        bytes: usize,
+        limit: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if buffer.len() > self.limit.saturating_sub(self.bytes) {
+                return Err(io::Error::other("encoded JSON byte limit exceeded"));
+            }
+            self.bytes += buffer.len();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CountingWriter { bytes: 0, limit };
+    serde_json::to_writer(&mut writer, value).map_err(|_| {
+        ProviderError::InvalidConfiguration(format!(
+            "provider extension would make the encoded request body exceed its {limit}-byte extension limit"
+        ))
+    })?;
+    Ok(writer.bytes)
 }
 
 fn request_body(
@@ -1528,6 +1936,8 @@ mod tests {
         let secret = "sk-test-never-log-this-value";
         let mut chat = config(Provider::Anthropic);
         chat.api_key = Some(secret.into());
+        chat.model = format!("model-{secret}");
+        chat.base_url = format!("https://user:{secret}@example.test");
         let config_debug = format!("{chat:?}");
         assert!(config_debug.contains("[REDACTED]"));
         assert!(!config_debug.contains(secret));
@@ -1535,11 +1945,143 @@ mod tests {
         // The same value in the body must stay out of Debug too. Request
         // context is sensitive even when it does not match a known token
         // shape, so Debug reports only the encoded length.
-        let request = build_chat_request(&chat, None, &[user(secret)]).unwrap();
+        let mut valid = config(Provider::Anthropic);
+        valid.api_key = Some(secret.into());
+        let request = build_chat_request(&valid, None, &[user(secret)]).unwrap();
         let request_debug = format!("{request:?}");
-        assert!(request_debug.contains("[REDACTED]"));
+        assert!(request_debug.contains("header_count"));
         assert!(request_debug.contains("body_bytes"));
         assert!(!request_debug.contains(secret));
+
+        let direct = HttpRequest {
+            url: format!("https://user:{secret}@example.test/?key={secret}"),
+            headers: vec![
+                ("cookie".into(), format!("session={secret}")),
+                ("proxy-authorization".into(), secret.into()),
+                (format!("x-private-{secret}"), secret.into()),
+            ],
+            body: String::new(),
+        };
+        let direct_debug = format!("{direct:?}");
+        assert!(direct_debug.contains("header_count: 3"));
+        assert!(!direct_debug.contains(secret));
+        assert!(!direct_debug.contains("cookie"));
+    }
+
+    #[test]
+    fn request_metrics_and_transport_validation_are_content_free() {
+        let secret = "private-header-and-body-value";
+        let request = HttpRequest {
+            url: "https://example.test/v1/chat/completions".into(),
+            headers: vec![
+                ("content-type".into(), "application/json".into()),
+                ("x-private".into(), secret.into()),
+            ],
+            body: format!(r#"{{"prompt":"{secret}"}}"#),
+        };
+        let metrics = request.validate_transport().unwrap();
+        assert_eq!(metrics.url_bytes, request.url.len());
+        assert_eq!(metrics.header_count, 2);
+        assert_eq!(
+            metrics.header_bytes,
+            request
+                .headers
+                .iter()
+                .map(|(name, value)| name.len() + value.len())
+                .sum::<usize>()
+        );
+        assert_eq!(metrics.body_bytes, request.body.len());
+        assert!(!format!("{metrics:?}").contains(secret));
+        assert!(!format!("{request:?}").contains(secret));
+    }
+
+    #[test]
+    fn transport_validation_rejects_noncanonical_headers_and_bodies() {
+        let valid = || HttpRequest {
+            url: "https://example.test/v1".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: "{}".into(),
+        };
+
+        let mut cases = Vec::new();
+        let mut request = valid();
+        request.headers[0].0 = "Content-Type".into();
+        cases.push(request);
+        let mut request = valid();
+        request.headers.push(("bad:name".into(), "value".into()));
+        cases.push(request);
+        let mut request = valid();
+        request
+            .headers
+            .push(("x-value".into(), "line\nbreak".into()));
+        cases.push(request);
+        let mut request = valid();
+        request
+            .headers
+            .push(("content-type".into(), "application/json".into()));
+        cases.push(request);
+        let mut request = valid();
+        request.headers[0].1 = "text/plain".into();
+        cases.push(request);
+        let mut request = valid();
+        request.headers.clear();
+        cases.push(request);
+        let mut request = valid();
+        request.body = "[]".into();
+        cases.push(request);
+        let mut request = valid();
+        request.body = "{not-json}".into();
+        cases.push(request);
+        let mut request = valid();
+        request.body = r#"{"model":"first","model":"second"}"#.into();
+        cases.push(request);
+        let mut request = valid();
+        request.url = "x".repeat(MAX_REQUEST_URL_BYTES + 1);
+        cases.push(request);
+        for invalid_url in [
+            "ftp://example.test/v1",
+            "http://example.test/v1",
+            "https://example.test/v1?secret=value",
+            "https://example.test/v1#fragment",
+            "https://example.test\\other",
+            "https://example.test/line\nbreak",
+            "https://user:secret@example.test/v1",
+            "https://example.test:0/v1",
+            "https://2130706433/v1",
+        ] {
+            let mut request = valid();
+            request.url = invalid_url.into();
+            cases.push(request);
+        }
+        let mut request = valid();
+        request
+            .headers
+            .extend((0..MAX_REQUEST_HEADERS).map(|index| (format!("x-{index}"), String::new())));
+        cases.push(request);
+        let mut request = valid();
+        request
+            .headers
+            .push(("x-large".into(), "x".repeat(MAX_REQUEST_HEADER_BYTES)));
+        cases.push(request);
+
+        for request in cases {
+            assert!(request.validate_transport().is_err());
+        }
+    }
+
+    #[test]
+    fn config_caps_tokens_and_rejects_port_zero() {
+        let mut chat = config(Provider::OpenAiCompatible);
+        chat.max_tokens = MAX_REQUEST_MAX_TOKENS;
+        assert!(chat.validate().is_ok());
+        chat.max_tokens = MAX_REQUEST_MAX_TOKENS + 1;
+        assert!(chat.validate().is_err());
+
+        chat.max_tokens = 512;
+        chat.base_url = "https://example.test:0/v1".into();
+        assert!(chat.validate().is_err());
+        chat.base_url = "http://127.0.0.2:0/v1".into();
+        assert!(chat.validate().is_err());
     }
 
     #[test]
@@ -1608,6 +2150,15 @@ mod tests {
             Provider::Ollama.endpoint("http://127.0.0.1:11434/api/"),
             "http://127.0.0.1:11434/api/chat"
         );
+
+        let config = config(Provider::OpenAiCompatible);
+        assert_eq!(
+            config.endpoint().unwrap(),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        let mut invalid = config;
+        invalid.api_key = Some(" unsafe ".into());
+        assert!(invalid.endpoint().is_err());
     }
 
     #[test]
@@ -1618,6 +2169,13 @@ mod tests {
             .parse::<Provider>()
             .is_err());
         assert!("open\nai".parse::<Provider>().is_err());
+        assert!("\u{202e}openai".parse::<Provider>().is_err());
+        assert!(format!("{}openai", " ".repeat(MAX_PROVIDER_NAME_BYTES))
+            .parse::<Provider>()
+            .is_err());
+        let unknown = "secret-provider-marker";
+        let error = unknown.parse::<Provider>().unwrap_err().to_string();
+        assert!(!error.contains(unknown));
 
         let mut bad = config(Provider::Ollama);
         bad.base_url = "localhost:11434".into();
@@ -1639,6 +2197,45 @@ mod tests {
         let mut bad = config(Provider::OpenAiCompatible);
         bad.api_key = Some("x".repeat(MAX_API_KEY_BYTES + 1));
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn api_keys_are_exact_visible_ascii_header_values() {
+        for hostile in [
+            "",
+            " secret-leading-123",
+            "secret-trailing-123 ",
+            "secret\tpart-123",
+            "secret\npart-123",
+            "secret part-123",
+            "clé-api-123",
+            "secret\u{00a0}part-123",
+            "secret\u{200b}part-123",
+        ] {
+            let mut chat = config(Provider::OpenAiCompatible);
+            chat.api_key = Some(hostile.into());
+            let error = chat.validate().expect_err("unsafe header value accepted");
+            let rendered = error.to_string();
+            if !hostile.is_empty() {
+                assert!(
+                    !rendered.contains(hostile),
+                    "credential leaked through error"
+                );
+            }
+            assert!(
+                build_chat_request(&chat, None, &[user("hi")]).is_err(),
+                "request builder accepted {hostile:?}"
+            );
+        }
+
+        let key = "sk-safe_ABC123.+/=";
+        let mut chat = config(Provider::OpenAiCompatible);
+        chat.api_key = Some(key.into());
+        let request = build_chat_request(&chat, None, &[user("hi")]).unwrap();
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "authorization" && value == &format!("Bearer {key}")));
     }
 
     #[test]
@@ -1933,6 +2530,7 @@ mod tests {
         assert_eq!(prepared.report.input_history_turns, 3);
         assert_eq!(prepared.report.sent_history_turns, 2);
         assert_eq!(prepared.report.omitted_history_turns, 1);
+        assert!(prepared.report.sent_history_json_bytes <= MAX_REQUEST_HISTORY_BYTES);
         assert_eq!(prepared.report.changed_history_turns, 1);
         assert_eq!(prepared.report.elided_history_turns, 1);
         assert_eq!(
@@ -1952,6 +2550,190 @@ mod tests {
         assert_eq!(prepared.report.elided_history_turns, 0);
         assert_eq!(prepared.report.omitted_history_turns, 0);
         assert_eq!(prepared.messages[0].text, "[REDACTED]");
+    }
+
+    #[test]
+    fn history_json_budget_uses_an_exact_serde_compatible_oracle() {
+        for role in [Role::User, Role::Assistant] {
+            for text in [
+                "plain",
+                "quote \" and slash \\",
+                "line\nnull\0tab\t",
+                "编译🙂",
+            ] {
+                let expected = serde_json::to_string(&json!({
+                    "role": role.as_str(),
+                    "content": text,
+                }))
+                .unwrap()
+                .len();
+                assert_eq!(history_turn_wire_bytes(role, text), expected, "{text:?}");
+            }
+        }
+
+        let hostile = "\0\"\\\n".repeat(MAX_REQUEST_TURN_BYTES / 4);
+        let prepared = bound_history_with_report(&[user(&hostile)]);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.report.elided_history_turns, 1);
+        assert!(prepared.report.sent_history_json_bytes <= MAX_REQUEST_HISTORY_BYTES);
+        let actual = prepared
+            .messages
+            .iter()
+            .map(|message| {
+                serde_json::to_string(&json!({
+                    "role": message.role.as_str(),
+                    "content": message.text,
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+            .len();
+        assert_eq!(prepared.report.sent_history_json_bytes, actual);
+    }
+
+    #[test]
+    fn provider_extensions_cannot_replace_core_or_stream_fields() {
+        let config = config(Provider::OpenAiCompatible);
+        let allowed = build_request_with(
+            &config,
+            None,
+            &[user("hello")],
+            false,
+            &[("response_format", json!({"type": "json_object"}))],
+        )
+        .unwrap();
+        let body: Value = serde_json::from_str(&allowed.request.body).unwrap();
+        assert_eq!(body["response_format"]["type"], "json_object");
+        assert_eq!(body["model"], config.model);
+
+        for reserved in [
+            "model",
+            "messages",
+            "system",
+            "max_tokens",
+            "temperature",
+            "stream",
+            "stream_options",
+            "options",
+        ] {
+            let secret = "secret-extension-value";
+            let error = build_request_with(
+                &config,
+                None,
+                &[user("hello")],
+                false,
+                &[(reserved, json!(secret))],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains(secret));
+        }
+
+        assert!(build_request_with(
+            &config,
+            None,
+            &[],
+            false,
+            &[("extension", json!(1)), ("extension", json!(2))],
+        )
+        .is_err());
+        assert!(build_request_with(&config, None, &[], false, &[("", json!(1))]).is_err());
+        let too_many = vec![("extension", json!(null)); 17];
+        assert!(build_request_with(&config, None, &[], false, &too_many).is_err());
+    }
+
+    #[test]
+    fn complete_encoded_request_body_has_a_final_ceiling() {
+        let config = config(Provider::OpenAiCompatible);
+        let oversized = "x".repeat(MAX_REQUEST_JSON_BYTES);
+        let error = build_request_with(
+            &config,
+            None,
+            &[],
+            false,
+            &[("future_extension", json!(oversized))],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("encoded request body"));
+
+        let ordinary = build_request_with(
+            &config,
+            Some("system"),
+            &[user("hello")],
+            false,
+            &[("future_extension", json!({"enabled": true}))],
+        )
+        .unwrap();
+        assert!(ordinary.request.body.len() < MAX_REQUEST_JSON_BYTES);
+    }
+
+    #[test]
+    fn extension_budgets_measure_encoded_values_before_request_assembly() {
+        let escaped = json!("\0\"\\\n".repeat(1024));
+        assert_eq!(
+            encoded_json_len(&escaped, MAX_REQUEST_EXTENSION_JSON_BYTES).unwrap(),
+            serde_json::to_string(&escaped).unwrap().len()
+        );
+
+        // Raw bytes remain below the limit while JSON escaping pushes the
+        // encoded value over it.
+        let escape_heavy = json!("\n".repeat(MAX_REQUEST_EXTENSION_JSON_BYTES / 2 + 1));
+        let error = build_request_with(
+            &config(Provider::OpenAiCompatible),
+            None,
+            &[],
+            false,
+            &[("future_extension", escape_heavy)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("encoded request body"));
+
+        let large = "x".repeat(700 * 1024);
+        let extensions = [
+            ("future_a", json!(large)),
+            ("future_b", json!("x".repeat(700 * 1024))),
+            ("future_c", json!("x".repeat(700 * 1024))),
+        ];
+        let error = build_request_with(
+            &config(Provider::OpenAiCompatible),
+            None,
+            &[],
+            false,
+            &extensions,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("provider extensions exceed"));
+    }
+
+    #[test]
+    fn extension_failures_never_echo_names_or_values() {
+        let secret = "extension-secret-marker";
+        for fields in [
+            vec![("model", json!(secret))],
+            vec![(secret, json!(1)), (secret, json!(2))],
+            vec![(
+                "future_extension",
+                json!(format!(
+                    "{secret}{}",
+                    "x".repeat(MAX_REQUEST_EXTENSION_JSON_BYTES)
+                )),
+            )],
+        ] {
+            let error = build_request_with(
+                &config(Provider::OpenAiCompatible),
+                None,
+                &[],
+                false,
+                &fields,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(!error.contains(secret));
+        }
     }
 
     #[test]

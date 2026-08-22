@@ -81,8 +81,8 @@ pub use prompt::{
     EnvironmentMeta, GitMeta,
 };
 pub use provider::{
-    BuiltRequest, ChatConfig, ChatResponse, HistoryReport, HttpRequest, Message, PreparedHistory,
-    Provider, ProviderError, Role, Usage,
+    BuiltRequest, ChatConfig, ChatResponse, HistoryReport, HttpRequest, HttpRequestMetrics,
+    Message, PreparedHistory, Provider, ProviderError, Role, Usage,
 };
 pub use redact::{redact_secrets, redact_secrets_cow};
 pub use response::{AgentResponse, AgentStream};
