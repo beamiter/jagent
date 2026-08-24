@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-22
+Updated: 2026-08-24
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -9,6 +9,12 @@ The low-level provider, tool, stream, and session APIs remain available, while
 new integrations can bind request preparation, response decoding, and session
 ingestion to one `AgentProtocol` and receive machine-readable history
 transformation reports.
+
+The high-level history window is now a release-mode postcondition as well as a
+debug invariant: if a provider builder omits any turn after
+`bound_history_*_with_report` has already produced the canonical window,
+`prepare_agent_request` fails closed. This keeps the preparation report and the
+encoded request truthful if the two JSON-wire budgets ever drift.
 
 ## 2026-08-22 ten-round provider hardening
 

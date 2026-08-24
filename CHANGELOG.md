@@ -73,6 +73,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The protocol-aware request path now rejects a second history omission at
+  runtime in release builds. A future drift between preparation and provider
+  JSON-wire budgets can no longer silently make `AgentRequestReport`
+  understate lost context.
 - Corrected migration guidance to distinguish the high-level request path's
   default secret redaction from the low-level builders' explicit preparation
   policy.

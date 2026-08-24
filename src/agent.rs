@@ -16,7 +16,7 @@ use crate::prompt::{build_agent_system_prompt, build_agent_tool_system_prompt};
 use crate::provider::{
     bound_history_cow_with_report, bound_history_with_report,
     build_agent_chat_request_streaming_with_report, build_agent_chat_request_with_report,
-    ChatConfig, HistoryReport, HttpRequest, Message, Provider, ProviderError,
+    BuiltRequest, ChatConfig, HistoryReport, HttpRequest, Message, Provider, ProviderError,
 };
 use crate::redact::redact_secrets_cow;
 use crate::response::{AgentResponse, AgentStream};
@@ -246,9 +246,7 @@ pub fn prepare_agent_request(
             spec.protocol,
         )?
     };
-    // Preparation already produced an idempotent history window. Keeping the
-    // assertion here protects that contract if either layer's budgets change.
-    debug_assert_eq!(built.omitted_history_turns, 0);
+    let built = require_idempotent_history(built)?;
 
     let request_body_bytes = built.request.body.len();
     Ok(PreparedAgentRequest {
@@ -262,6 +260,21 @@ pub fn prepare_agent_request(
         protocol: spec.protocol,
         streaming: spec.streaming,
     })
+}
+
+/// Enforce the high-level preparation path's idempotence in every build.
+///
+/// `bound_history_*_with_report` has already produced the canonical retained
+/// window before the provider builder runs. A second omission means those two
+/// wire-budget contracts drifted. Continuing would make the report understate
+/// lost context, so this is a runtime error rather than a debug-only assertion.
+fn require_idempotent_history(built: BuiltRequest) -> Result<BuiltRequest, ProviderError> {
+    if built.omitted_history_turns != 0 {
+        return Err(ProviderError::InvalidConfiguration(
+            "agent request builder omitted already-prepared history".to_string(),
+        ));
+    }
+    Ok(built)
 }
 
 #[cfg(test)]
@@ -286,6 +299,34 @@ mod tests {
             role: Role::User,
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn a_second_history_omission_fails_closed_in_release_builds_too() {
+        let request = HttpRequest {
+            url: "https://example.test/v1/chat/completions".to_string(),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: "{}".to_string(),
+        };
+        assert_eq!(
+            require_idempotent_history(BuiltRequest {
+                request: request.clone(),
+                omitted_history_turns: 0,
+            })
+            .unwrap()
+            .request,
+            request
+        );
+        let error = require_idempotent_history(BuiltRequest {
+            request,
+            omitted_history_turns: 1,
+        })
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidConfiguration(_)));
+        assert_eq!(
+            error.to_string(),
+            "invalid configuration: agent request builder omitted already-prepared history"
+        );
     }
 
     #[test]

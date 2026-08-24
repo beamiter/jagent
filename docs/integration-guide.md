@@ -115,6 +115,11 @@ budget after JSON escaping, mark locally shortened block output as truncated,
 and escape any raw closing-tag prefix inside an untrusted value so it cannot
 terminate the surrounding prompt envelope.
 
+Preparation also checks that the provider builder omits no additional turn
+from this already-bounded history. That is a release-mode failure, not a debug
+assertion: a successful `PreparedAgentRequest` therefore has one truthful
+history-loss report even if internal wire budgets change in a later release.
+
 ## Perform the HTTP request
 
 `prepared.request` contains a URL, lowercase headers, and a serialized JSON
