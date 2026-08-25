@@ -126,6 +126,9 @@ history-loss report even if internal wire budgets change in a later release.
 body for an HTTP `POST`. Builders have already called
 `HttpRequest::validate_transport`; an integration that mutates or constructs
 the public value directly should call it again immediately before transport.
+The validator requires one complete JSON object whose member names are unique
+at every depth, so nested messages, tools, and provider options cannot acquire
+transport-dependent first-value/last-value meanings.
 Its `HttpRequestMetrics` result contains only URL/header/body sizes and counts.
 The embedding transport remains responsible for:
 

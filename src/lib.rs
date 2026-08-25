@@ -77,6 +77,7 @@ pub use capabilities::{
     AgentDelivery, CapabilityError, AGENT_CAPABILITIES_V1_WIRE, AGENT_CAPABILITIES_V2_WIRE,
     AGENT_CAPABILITIES_VERSION, MAX_AGENT_CAPABILITIES_WIRE_BYTES,
 };
+pub use json::validate_no_duplicate_members;
 pub use prompt::{
     agent_user_prompt, build_agent_system_prompt, build_agent_tool_system_prompt, BlockContext,
     EnvironmentMeta, GitMeta,

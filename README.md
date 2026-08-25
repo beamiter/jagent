@@ -277,10 +277,11 @@ subset and may omit a usable mode; it never invents a crossed combination.
 
 1. Generated commands are never executed by this crate. Approval returns an
    `ApprovedCommand`; the caller must deliberately hand it to an executor.
-2. Malformed model replies fail closed. Complete response bytes, streaming
-   frames, text actions, and native-tool arguments reject duplicate
-   JSON object members instead of inheriting a parser's first/last-value rule;
-   parse failure never becomes a command proposal.
+2. Ambiguous JSON fails closed. Outbound request validation and inbound
+   complete responses, streaming frames, text actions, and native-tool
+   arguments reject duplicate object members at every depth instead of
+   inheriting a parser's first/last-value rule; parse failure never becomes a
+   command proposal.
 3. Transcripts, observations, request history, encoded prompt contexts,
    response envelopes, streamed frames, model text, and tool arguments are
    byte-bounded.
@@ -314,6 +315,12 @@ alias, function, or helper will do.
 | `stream` | Low-level SSE/NDJSON `StreamParser` and `StreamEvent`s. |
 | `redact` | Conservative high-confidence secret scrubbing; the borrowing API is `redact_secrets_cow`. |
 | `safety` | Non-authorizing destructive-command warnings. |
+
+`validate_no_duplicate_members` exposes the same allocation-light recursive
+JSON preflight used by these wire decoders. Integrations can apply it to other
+already byte-bounded JSON trust boundaries before their own typed decode,
+without constructing a second `Value` tree or learning a hostile field name
+from the error.
 
 ## Low-level compatibility APIs
 

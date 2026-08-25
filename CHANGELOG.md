@@ -9,12 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the narrow `validate_no_duplicate_members(&[u8])` structural preflight
+  used by jagent's own wire decoders, so integrations can apply the identical
+  recursive uniqueness rule to other already byte-bounded JSON trust
+  boundaries before typed deserialization. Development tests force
+  serde_json's map-backed `arbitrary_precision` number path so downstream
+  feature unification cannot silently change that contract.
 - Added `HttpRequest::transport_metrics` and `validate_transport` with a
   content-free `HttpRequestMetrics` report. Generated requests now carry
   explicit URL, header-count, aggregate-header-byte, JSON-object, and body
   postconditions before leaving the sans-I/O boundary. Directly constructed or
   mutated requests receive the same HTTPS/loopback-HTTP authority checks, and
-  ambiguous duplicate top-level JSON fields are rejected.
+  ambiguous duplicate JSON fields are rejected recursively.
 
 - Added versioned `AgentCapabilities` discovery for protocol/delivery
   negotiation across split terminal and shell integrations. Its bounded ASCII
@@ -73,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `HttpRequest::validate_transport` now rejects duplicate JSON object members
+  recursively, including nested messages, tools, and provider options. The
+  earlier top-level-only preflight left directly constructed or mutated bodies
+  with parser-dependent first-value/last-value semantics below the root.
 - Complete provider responses, SSE/NDJSON frames, JSON-in-text actions, and
   string-valued native-tool arguments now reject duplicate JSON object members
   at every depth. The shared duplicate-aware preflight prevents

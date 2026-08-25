@@ -26,6 +26,19 @@ tree or a public API change. The compatibility `Value`-based response APIs
 still require already-decoded trusted input, where duplicate spelling is
 necessarily no longer observable.
 
+The same recursive uniqueness rule now closes the remaining outbound gap.
+`HttpRequest::validate_transport` rejects duplicate members inside nested
+messages, tools, and provider options as well as at the root, without retaining
+a decoded request tree. Directly constructed or mutated request bodies can no
+longer pass validation while different transports/providers choose different
+values.
+The visitor is exposed narrowly as `validate_no_duplicate_members(&[u8])`, so
+`jterm_core::bounded_json` can re-export one semantic implementation for
+credential, IPC, and persistence boundaries instead of copying the decoder.
+The development graph forces serde_json's map-backed `arbitrary_precision`
+number representation so downstream feature unification cannot change number
+or root-object handling unnoticed.
+
 ## 2026-08-22 ten-round provider hardening
 
 1. `ChatConfig` and `HttpRequest` Debug report only transport metadata, counts,
@@ -64,7 +77,7 @@ necessarily no longer observable.
 8. Exactly one `content-type: application/json` header is required.
 9. The complete serialized body retains its 4 MiB post-assembly ceiling.
 10. The transport validator requires one syntactically complete top-level JSON
-    object with unique top-level keys, without allocating a second
+    object with unique member names recursively, without allocating a second
     `serde_json::Value` tree.
 11. `HttpRequest::transport_metrics` uses checked arithmetic and exposes only
     byte/count metadata.

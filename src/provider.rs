@@ -13,7 +13,6 @@ use crate::tools::{agent_body_fields, AgentProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::borrow::Cow;
-use std::collections::HashSet;
 use std::io::{self, Write};
 use std::str::FromStr;
 
@@ -359,45 +358,7 @@ fn is_lowercase_header_name(name: &str) -> bool {
 }
 
 fn is_json_object(body: &str) -> bool {
-    struct ObjectOnly;
-
-    impl<'de> Deserialize<'de> for ObjectOnly {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            struct Visitor;
-
-            impl<'de> serde::de::Visitor<'de> for Visitor {
-                type Value = ObjectOnly;
-
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.write_str("a JSON object")
-                }
-
-                fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-                where
-                    M: serde::de::MapAccess<'de>,
-                {
-                    let mut fields = HashSet::new();
-                    while let Some(field) = map.next_key::<String>()? {
-                        if !fields.insert(field) {
-                            return Err(serde::de::Error::custom(
-                                "duplicate top-level request field",
-                            ));
-                        }
-                        map.next_value::<serde::de::IgnoredAny>()?;
-                    }
-                    Ok(ObjectOnly)
-                }
-            }
-
-            deserializer.deserialize_map(Visitor)
-        }
-    }
-
-    let mut deserializer = serde_json::Deserializer::from_str(body);
-    ObjectOnly::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+    crate::json::validate_object(body.as_bytes()).is_ok()
 }
 
 impl std::fmt::Debug for HttpRequest {
@@ -2034,6 +1995,13 @@ mod tests {
         cases.push(request);
         let mut request = valid();
         request.body = r#"{"model":"first","model":"second"}"#.into();
+        cases.push(request);
+        let mut request = valid();
+        request.body =
+            r#"{"messages":[{"role":"user","content":"safe","content":"different"}]}"#.into();
+        cases.push(request);
+        let mut request = valid();
+        request.body = r#"{"tools":[{"function":{"name":"run","\u006eame":"say"}}]}"#.into();
         cases.push(request);
         let mut request = valid();
         request.url = "x".repeat(MAX_REQUEST_URL_BYTES + 1);

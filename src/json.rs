@@ -18,15 +18,50 @@ use std::fmt;
 
 const DUPLICATE_MEMBER: &str = "duplicate JSON object member";
 
-pub(crate) fn from_slice(input: &[u8]) -> Result<Value, serde_json::Error> {
+/// Validate one complete JSON value and reject duplicate object members at
+/// every depth without retaining a decoded [`serde_json::Value`] tree.
+///
+/// Object names are compared after JSON string decoding, so escaped and plain
+/// spellings of the same name are duplicates. The error is intentionally
+/// generic and never reflects an untrusted member name. This is a structural
+/// preflight: callers must still enforce their raw-input byte ceiling first and
+/// deserialize into their schema only after it succeeds.
+pub fn validate_no_duplicate_members(input: &[u8]) -> Result<(), serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_slice(input);
     NoDuplicateMembers::deserialize(&mut deserializer)?;
-    deserializer.end()?;
+    deserializer.end()
+}
+
+pub(crate) fn from_slice(input: &[u8]) -> Result<Value, serde_json::Error> {
+    validate_no_duplicate_members(input)?;
     serde_json::from_slice(input)
 }
 
 pub(crate) fn from_str(input: &str) -> Result<Value, serde_json::Error> {
     from_slice(input.as_bytes())
+}
+
+/// Validate one complete top-level object and reject duplicate members at
+/// every depth without retaining a decoded value tree.
+pub(crate) fn validate_object(input: &[u8]) -> Result<(), serde_json::Error> {
+    validate_no_duplicate_members(input)?;
+
+    // With serde_json's `arbitrary_precision` feature, numbers are presented
+    // to generic visitors through an internal map representation. Requiring
+    // the JSON object delimiter after full validation keeps this protocol
+    // shape check independent of feature unification in downstream graphs.
+    if input
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'{')
+    {
+        Ok(())
+    } else {
+        Err(<serde_json::Error as de::Error>::custom(
+            "expected a JSON object",
+        ))
+    }
 }
 
 struct NoDuplicateMembers;
@@ -120,7 +155,9 @@ mod tests {
             "true",
             "-9223372036854775808",
             "18446744073709551615",
+            "18446744073709551616",
             "1.25e10",
+            "1.2345678901234567890123456789",
             r#""text""#,
             r#"[null,true,7,"text",{"nested":[1,2,3]}]"#,
             r#"{"text":"hello","nested":{"enabled":true},"empty":[]}"#,
@@ -162,6 +199,22 @@ mod tests {
     fn trailing_or_malformed_input_stays_invalid() {
         for input in [r#"{"ok":true} trailing"#, r#"{"ok":true"#] {
             assert!(from_str(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn object_preflight_requires_one_object_and_checks_nested_members() {
+        validate_object(br#"{"messages":[{"role":"user","content":"hello"}]}"#).unwrap();
+
+        for input in [
+            br#"[]"#.as_slice(),
+            br#"18446744073709551616"#.as_slice(),
+            br#"1.2345678901234567890123456789"#.as_slice(),
+            br#"{"messages":[{"content":"safe","content":"different"}]}"#.as_slice(),
+            br#"{"tools":[{"function":{"name":"run","\u006eame":"say"}}]}"#.as_slice(),
+            br#"{"ok":true} trailing"#.as_slice(),
+        ] {
+            assert!(validate_object(input).is_err(), "{input:?}");
         }
     }
 }
