@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used by jagent's own wire decoders, so integrations can apply the identical
   recursive uniqueness rule to other already byte-bounded JSON trust
   boundaries before typed deserialization. Development tests force
-  serde_json's map-backed `arbitrary_precision` number path so downstream
-  feature unification cannot silently change that contract.
+  serde_json's map-backed `arbitrary_precision` number and `raw_value` paths so
+  downstream feature unification cannot silently change that contract.
 - Added `HttpRequest::transport_metrics` and `validate_transport` with a
   content-free `HttpRequestMetrics` report. Generated requests now carry
   explicit URL, header-count, aggregate-header-byte, JSON-object, and body
@@ -78,6 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations, and review-smuggling control or invisible characters.
 
 ### Fixed
+
+- Rejected serde_json's private RawValue sentinel during structural preflight.
+  With the dependency's `raw_value` feature unified into a downstream graph,
+  native `Value` decoding otherwise reparsed the sentinel's string value as a
+  new unchecked JSON document, allowing nested duplicate members to bypass the
+  first pass and collapse with last-value-wins semantics.
 
 - `HttpRequest::validate_transport` now rejects duplicate JSON object members
   recursively, including nested messages, tools, and provider options. The

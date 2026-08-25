@@ -5,10 +5,10 @@
 //! agent protocol ambiguous: another JSON implementation may keep the first
 //! value, so the same bytes can name two different commands or completion
 //! states. An allocation-light preflight retains only the names in each open
-//! object while validating the complete structure. The ordinary
-//! `serde_json::Value` decoder then constructs the single retained response
-//! tree, preserving whichever compatible `serde_json` features the embedding
-//! dependency graph selected.
+//! object while validating the complete structure and excluding private
+//! decoder escape hatches. The ordinary `serde_json::Value` decoder then
+//! constructs the single retained response tree under a feature-independent
+//! ambiguity contract.
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
@@ -17,13 +17,17 @@ use std::collections::HashSet;
 use std::fmt;
 
 const DUPLICATE_MEMBER: &str = "duplicate JSON object member";
+const RESERVED_MEMBER: &str = "reserved JSON object member";
+const SERDE_JSON_RAW_VALUE_MEMBER: &str = "$serde_json::private::RawValue";
 
 /// Validate one complete JSON value and reject duplicate object members at
 /// every depth without retaining a decoded [`serde_json::Value`] tree.
 ///
 /// Object names are compared after JSON string decoding, so escaped and plain
-/// spellings of the same name are duplicates. The error is intentionally
-/// generic and never reflects an untrusted member name. This is a structural
+/// spellings of the same name are duplicates. The private serde_json RawValue
+/// sentinel is also rejected: feature-unified `Value` decoding otherwise
+/// reparses its string value as unchecked JSON. Errors are intentionally
+/// generic and never reflect an untrusted member name. This is a structural
 /// preflight: callers must still enforce their raw-input byte ceiling first and
 /// deserialize into their schema only after it succeeds.
 pub fn validate_no_duplicate_members(input: &[u8]) -> Result<(), serde_json::Error> {
@@ -132,6 +136,14 @@ impl<'de> Visitor<'de> for NoDuplicateMembersVisitor {
     {
         let mut members = HashSet::new();
         while let Some(member) = object.next_key::<String>()? {
+            if member == SERDE_JSON_RAW_VALUE_MEMBER {
+                // serde_json's `raw_value` feature gives this private token a
+                // special meaning when it is the first key seen by a Value
+                // visitor: the string value is parsed again as JSON. Reject it
+                // in every position so member order cannot expose unchecked
+                // duplicate fields through the second decode.
+                return Err(de::Error::custom(RESERVED_MEMBER));
+            }
             if !members.insert(member) {
                 // Do not reflect a provider/model-controlled member name in
                 // logs. Stop before decoding the duplicate's value too.
@@ -192,6 +204,44 @@ mod tests {
         assert_eq!(
             from_str(&json!({"command": "safe"}).to_string()).unwrap(),
             json!({"command": "safe"})
+        );
+    }
+
+    #[test]
+    fn raw_value_private_sentinel_cannot_reparse_unchecked_json() {
+        let input = r#"{"$serde_json::private::RawValue":"{\"command\":\"safe\",\"command\":\"dangerous\"}"}"#;
+
+        // This assertion pins the dev-only `raw_value` feature path: native
+        // Value decoding reparses the string and silently retains the last
+        // duplicate. jagent must stop before that decoder runs.
+        assert_eq!(
+            serde_json::from_str::<Value>(input).unwrap(),
+            json!({"command": "dangerous"})
+        );
+
+        let error = validate_no_duplicate_members(input.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(RESERVED_MEMBER), "{error}");
+        assert!(!error.contains("RawValue"), "{error}");
+        assert!(!error.contains("serde_json"), "{error}");
+        assert!(from_str(input).is_err());
+    }
+
+    #[test]
+    fn raw_value_sentinel_is_reserved_independent_of_spelling_or_position() {
+        for input in [
+            r#"{"safe":true,"$serde_json::private::RawValue":"{}"}"#,
+            r#"{"nested":{"\u0024serde_json::private::RawValue":"[]"}}"#,
+        ] {
+            assert!(validate_no_duplicate_members(input.as_bytes()).is_err());
+        }
+
+        let near_miss = r#"{"$serde_json::private::RawValues":"ordinary"}"#;
+        validate_no_duplicate_members(near_miss.as_bytes()).unwrap();
+        assert_eq!(
+            from_str(near_miss).unwrap(),
+            json!({"$serde_json::private::RawValues": "ordinary"})
         );
     }
 

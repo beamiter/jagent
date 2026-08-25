@@ -36,8 +36,11 @@ The visitor is exposed narrowly as `validate_no_duplicate_members(&[u8])`, so
 `jterm_core::bounded_json` can re-export one semantic implementation for
 credential, IPC, and persistence boundaries instead of copying the decoder.
 The development graph forces serde_json's map-backed `arbitrary_precision`
-number representation so downstream feature unification cannot change number
-or root-object handling unnoticed.
+number representation and its `raw_value` Value-decoder escape path. The
+preflight rejects the private RawValue sentinel in every object position, so a
+feature-unified decoder cannot reinterpret a string as a second unchecked JSON
+document; genuine large numbers and ordinary near-miss member names remain
+accepted.
 
 ## 2026-08-22 ten-round provider hardening
 

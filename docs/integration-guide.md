@@ -163,7 +163,9 @@ provider envelope and rejects declared refusals, filtering, pauses, errors, and
 unknown completion states before action parsing. The byte-oriented decoder
 also rejects duplicate JSON object members at every depth. This prevents the
 same provider bytes from selecting different completion states, tool calls, or
-commands under first-value-wins and last-value-wins JSON implementations.
+commands under first-value-wins and last-value-wins JSON implementations. The
+same preflight rejects serde_json's private RawValue sentinel before a
+feature-unified `Value` decoder can reinterpret its string as unchecked JSON.
 `AgentResponse::protocol` exposes the retained wire protocol for diagnostics.
 
 The lower-level chat and native-tool parsers retain compatibility with sparse

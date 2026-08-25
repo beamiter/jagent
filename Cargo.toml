@@ -36,5 +36,6 @@ serde_json = "1"
 
 [dev-dependencies]
 # Downstream feature unification must not change the duplicate-member or
-# top-level-object contracts. Keep serde_json's map-backed number path in CI.
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+# top-level-object contracts. Keep serde_json's map-backed number and raw-value
+# paths in CI.
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }

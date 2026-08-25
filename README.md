@@ -280,8 +280,9 @@ subset and may omit a usable mode; it never invents a crossed combination.
 2. Ambiguous JSON fails closed. Outbound request validation and inbound
    complete responses, streaming frames, text actions, and native-tool
    arguments reject duplicate object members at every depth instead of
-   inheriting a parser's first/last-value rule; parse failure never becomes a
-   command proposal.
+   inheriting a parser's first/last-value rule. The private serde_json RawValue
+   escape key is rejected before a feature-unified decoder can reparse its
+   string; parse failure never becomes a command proposal.
 3. Transcripts, observations, request history, encoded prompt contexts,
    response envelopes, streamed frames, model text, and tool arguments are
    byte-bounded.
@@ -320,7 +321,9 @@ alias, function, or helper will do.
 JSON preflight used by these wire decoders. Integrations can apply it to other
 already byte-bounded JSON trust boundaries before their own typed decode,
 without constructing a second `Value` tree or learning a hostile field name
-from the error.
+from the error. It also rejects serde_json's private RawValue sentinel, which a
+feature-unified `Value` decoder would otherwise reinterpret as a second,
+unchecked JSON document.
 
 ## Low-level compatibility APIs
 
