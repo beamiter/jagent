@@ -58,6 +58,7 @@
 
 pub mod agent;
 pub mod capabilities;
+mod json;
 pub mod prompt;
 pub mod provider;
 pub mod redact;

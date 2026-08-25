@@ -27,9 +27,9 @@
 //! mirrors `reached_token_limit`, and [`StreamEvent::Usage`] mirrors its
 //! usage extraction.
 //!
-//! Fail closed (jagent invariant #2): a malformed frame, an invalid-UTF-8
-//! frame, payload after an end signal, an empty completed text response, a
-//! provider-reported stream error, or an exceeded bound emits one
+//! Fail closed (jagent invariant #2): a malformed or duplicate-member frame,
+//! an invalid-UTF-8 frame, payload after an end signal, an empty completed text
+//! response, a provider-reported stream error, or an exceeded bound emits one
 //! [`StreamEvent::Protocol`], after which the parser is inert and ignores all
 //! further input. Bounds (invariant #3): the raw response, number of decoded
 //! frames, a single buffered line/frame, cumulative delivered text/tool
@@ -429,7 +429,7 @@ impl StreamParser {
     }
 
     fn anthropic_frame(&mut self, data: &str, events: &mut Vec<StreamEvent>) {
-        let Ok(frame) = serde_json::from_str::<Value>(data) else {
+        let Ok(frame) = crate::json::from_str(data) else {
             self.fail("malformed JSON in stream frame", events);
             return;
         };
@@ -729,7 +729,7 @@ impl StreamParser {
             self.complete(events);
             return;
         }
-        let Ok(frame) = serde_json::from_str::<Value>(data) else {
+        let Ok(frame) = crate::json::from_str(data) else {
             self.fail("malformed JSON in stream frame", events);
             return;
         };
@@ -912,7 +912,7 @@ impl StreamParser {
         if !self.begin_decoded_frame(events) {
             return;
         }
-        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+        let Ok(frame) = crate::json::from_str(line) else {
             self.fail("malformed JSON in stream frame", events);
             return;
         };
@@ -2030,6 +2030,25 @@ mod tests {
         );
         assert_eq!(parser.push(b"\n"), vec![]);
         assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn duplicate_stream_frame_members_fail_before_any_delta_is_published() {
+        // Keeping the last finish_reason would hide the provider's filtered
+        // status. No text or completion event may escape the ambiguous frame.
+        let body = concat!(
+            "data: {\"choices\":[{\"index\":0,",
+            "\"delta\":{\"content\":\"valid-looking action\"},",
+            "\"finish_reason\":\"content_filter\",",
+            "\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let events = run(Provider::OpenAiCompatible, body);
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Protocol(message)]
+                if message == "malformed JSON in stream frame"
+        ));
     }
 
     #[test]

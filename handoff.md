@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-24
+Updated: 2026-08-25
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -15,6 +15,16 @@ debug invariant: if a provider builder omits any turn after
 `bound_history_*_with_report` has already produced the canonical window,
 `prepare_agent_request` fails closed. This keeps the preparation report and the
 encoded request truthful if the two JSON-wire budgets ever drift.
+
+Untrusted action/response JSON now has one interpretation across the complete
+and streaming paths. A shared allocation-light preflight rejects duplicate
+object members recursively before the ordinary `Value` decoder retains a
+response tree or any response delta/action is promoted; the same rule covers
+JSON-in-text actions and string-valued native-tool arguments. This closes the
+previous first-value/last-value ambiguity without a second decoded response
+tree or a public API change. The compatibility `Value`-based response APIs
+still require already-decoded trusted input, where duplicate spelling is
+necessarily no longer observable.
 
 ## 2026-08-22 ten-round provider hardening
 
@@ -212,7 +222,10 @@ consumer migration details.
 5. Provider response bytes, streaming bodies/frames, histories, prompts,
    transcript fields, observations, tool identifiers, and arguments remain
    independently bounded.
-6. Restore continues to validate proposal ordering, lifecycle, observation
+6. Encoded response frames and action objects reject duplicate JSON members
+   recursively; no parser-specific first/last-value choice may select an
+   action or completion state.
+7. Restore continues to validate proposal ordering, lifecycle, observation
    binding, active state, and transcript budgets before making a session live.
 
 ## Remaining integration boundaries

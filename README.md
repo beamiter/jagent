@@ -277,8 +277,10 @@ subset and may omit a usable mode; it never invents a crossed combination.
 
 1. Generated commands are never executed by this crate. Approval returns an
    `ApprovedCommand`; the caller must deliberately hand it to an executor.
-2. Malformed model replies fail closed. Parse failure never becomes a command
-   proposal.
+2. Malformed model replies fail closed. Complete response bytes, streaming
+   frames, text actions, and native-tool arguments reject duplicate
+   JSON object members instead of inheriting a parser's first/last-value rule;
+   parse failure never becomes a command proposal.
 3. Transcripts, observations, request history, encoded prompt contexts,
    response envelopes, streamed frames, model text, and tool arguments are
    byte-bounded.

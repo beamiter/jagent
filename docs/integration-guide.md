@@ -157,8 +157,11 @@ For a non-streaming request, pass the complete response bytes to
 uses the bound action protocol, and rejects a delivery-mode mismatch. The
 high-level path also requires exactly one completed, protocol-consistent
 provider envelope and rejects declared refusals, filtering, pauses, errors, and
-unknown completion states before action parsing. `AgentResponse::protocol`
-exposes the retained wire protocol for diagnostics.
+unknown completion states before action parsing. The byte-oriented decoder
+also rejects duplicate JSON object members at every depth. This prevents the
+same provider bytes from selecting different completion states, tool calls, or
+commands under first-value-wins and last-value-wins JSON implementations.
+`AgentResponse::protocol` exposes the retained wire protocol for diagnostics.
 
 The lower-level chat and native-tool parsers retain compatibility with sparse
 fixtures used by existing integrations. The native-tool parser still accepts
@@ -180,7 +183,8 @@ For a streaming request:
 5. Consume the accumulator with `into_response`.
 
 Chunk boundaries need not align with UTF-8 characters, SSE frames, or NDJSON
-lines. `AgentStream` reassembles them under byte and frame limits. A returned
+lines. `AgentStream` reassembles them under byte and frame limits and applies
+the same duplicate-member rejection to every decoded frame. A returned
 `StreamEvent::ToolCall` is not execution permission: streamed calls remain
 non-actionable until the enclosing response completes, is converted into an
 `AgentResponse`, and is accepted by the session. `AgentStream::protocol`

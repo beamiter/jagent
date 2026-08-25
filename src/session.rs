@@ -203,8 +203,9 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Strictly parse one action. A single json code fence is tolerated, but
-/// prose, unknown actions/keys, wrong types, and empty required fields fail.
-/// Parse failure never degrades into a command proposal.
+/// prose, duplicate object members, unknown actions/keys, wrong types, and
+/// empty required fields fail. Parse failure never degrades into a command
+/// proposal.
 pub fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
     if raw.len() > MAX_ACTION_JSON_BYTES {
         return Err(ParseError::FieldTooLarge("reply"));
@@ -213,7 +214,7 @@ pub fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
     if payload.is_empty() {
         return Err(ParseError::Empty);
     }
-    let value: Value = serde_json::from_str(payload)
+    let value = crate::json::from_str(payload)
         .map_err(|error| ParseError::InvalidJson(error.to_string()))?;
     let object = value.as_object().ok_or(ParseError::ExpectedObject)?;
     let action = required_string(object, "action", 32)?;
@@ -226,9 +227,9 @@ pub fn parse_action(raw: &str) -> Result<ParsedAction, ParseError> {
 ///
 /// `arguments` is the raw JSON object text (empty means "no arguments" and is
 /// read as `{}`). The rules are identical to the text protocol minus the
-/// `action` field, which the tool name supplies: unknown names, wrong types,
-/// missing or empty required fields, extra keys, and multi-line commands all
-/// fail closed and never degrade into a proposal.
+/// `action` field, which the tool name supplies: duplicate object members,
+/// unknown names, wrong types, missing or empty required fields, extra keys,
+/// and multi-line commands all fail closed and never degrade into a proposal.
 pub fn parse_tool_action(name: &str, arguments: &str) -> Result<ParsedAction, ParseError> {
     let name = name.trim();
     if arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
@@ -238,7 +239,8 @@ pub fn parse_tool_action(name: &str, arguments: &str) -> Result<ParsedAction, Pa
     let value: Value = if payload.is_empty() {
         Value::Object(Map::new())
     } else {
-        serde_json::from_str(payload).map_err(|error| ParseError::InvalidJson(error.to_string()))?
+        crate::json::from_str(payload)
+            .map_err(|error| ParseError::InvalidJson(error.to_string()))?
     };
     let object = value.as_object().ok_or(ParseError::ExpectedObject)?;
     action_from_object(name, object, &[])
@@ -2783,6 +2785,25 @@ mod tests {
             &serde_json::json!({"action": "run", "command": "printf '编译🙂'"}).to_string()
         )
         .is_ok());
+    }
+
+    #[test]
+    fn action_protocol_rejects_duplicate_json_members_in_both_carriers() {
+        let text = r#"{"action":"run","command":"printf safe","command":"rm -rf important"}"#;
+        let Err(ParseError::InvalidJson(message)) = parse_action(text) else {
+            panic!("duplicate text-protocol command must fail as invalid JSON");
+        };
+        assert!(message.contains("duplicate JSON object member"));
+        assert!(!message.contains("command"));
+
+        // JSON escape decoding happens before member comparison, so two wire
+        // spellings cannot bypass the same rule in native tool arguments.
+        let native = r#"{"command":"printf safe","\u0063ommand":"rm -rf important"}"#;
+        let Err(ParseError::InvalidJson(message)) = parse_tool_action("run", native) else {
+            panic!("duplicate native-tool command must fail as invalid JSON");
+        };
+        assert!(message.contains("duplicate JSON object member"));
+        assert!(!message.contains("command"));
     }
 
     #[test]

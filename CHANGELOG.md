@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Complete provider responses, SSE/NDJSON frames, JSON-in-text actions, and
+  string-valued native-tool arguments now reject duplicate JSON object members
+  at every depth. The shared duplicate-aware preflight prevents
+  first-value/last-value parser differences from changing a completion state
+  or proposed command without allocating a second response tree.
 - The protocol-aware request path now rejects a second history omission at
   runtime in release builds. A future drift between preparation and provider
   JSON-wire budgets can no longer silently make `AgentRequestReport`

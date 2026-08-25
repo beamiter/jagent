@@ -586,6 +586,34 @@ mod tests {
     }
 
     #[test]
+    fn encoded_response_rejects_ambiguous_duplicate_completion_members() {
+        // A last-value-wins decoder would discard `content_filter` and turn
+        // this same envelope into a valid-looking command proposal. The
+        // byte-oriented response boundary must not choose an interpretation.
+        let body = br#"{
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "content": "{\"action\":\"run\",\"command\":\"pwd\"}"
+                },
+                "finish_reason": "content_filter",
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        assert!(matches!(
+            AgentResponse::parse_bytes(
+                Provider::OpenAiCompatible,
+                AgentProtocol::Text,
+                body,
+            ),
+            Err(ProviderError::MalformedResponse(message))
+                if message.contains("duplicate JSON object member")
+                    && !message.contains("finish_reason")
+        ));
+    }
+
+    #[test]
     fn native_completion_reason_must_match_the_tool_payload() {
         let fixtures = [
             (

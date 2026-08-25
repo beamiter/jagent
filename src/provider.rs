@@ -1341,8 +1341,8 @@ pub fn parse_chat_response_bytes(provider: Provider, body: &[u8]) -> Result<Stri
 /// bounded encoded envelope.
 ///
 /// This is the canonical byte-oriented entry point for callers that need
-/// token-limit and usage metadata. The size check happens before
-/// `serde_json` constructs a [`Value`].
+/// token-limit and usage metadata. The size and duplicate-object-member checks
+/// happen before `serde_json` constructs the retained [`Value`].
 pub fn parse_chat_response_full_bytes(
     provider: Provider,
     body: &[u8],
@@ -1437,7 +1437,7 @@ pub(crate) fn decode_response_value(body: &[u8]) -> Result<Value, ProviderError>
             limit: MAX_RESPONSE_JSON_BYTES,
         });
     }
-    serde_json::from_slice(body)
+    crate::json::from_slice(body)
         .map_err(|error| ProviderError::MalformedResponse(error.to_string()))
 }
 
