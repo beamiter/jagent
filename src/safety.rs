@@ -410,6 +410,61 @@ fn git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
         .map(|token| (token.as_str(), &tokens[index + 1..]))
 }
 
+/// Recognize the `git push` spellings that can replace or delete remote refs.
+/// Push options may be interspersed with positionals, and `-o` consumes either
+/// the rest of its short-option token or the following token.  Parse that
+/// boundary explicitly so an option value such as `-o +audit` is not mistaken
+/// for a forced refspec while compact boolean clusters such as `-uf` remain
+/// visible.
+fn dangerous_git_push(arguments: &[String]) -> bool {
+    let mut index = 0;
+    let mut options = true;
+
+    while let Some(token) = arguments.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && token.starts_with("--") {
+            if token.starts_with("--force") || matches!(token, "--mirror" | "--prune" | "--delete")
+            {
+                return true;
+            }
+            let takes_value = matches!(
+                token,
+                "--repo" | "--receive-pack" | "--exec" | "--push-option"
+            );
+            index += if takes_value { 2 } else { 1 };
+            continue;
+        }
+        if options && token.starts_with('-') && token != "-" {
+            let mut flags = token[1..].chars();
+            while let Some(flag) = flags.next() {
+                if matches!(flag, 'd' | 'f') {
+                    return true;
+                }
+                if flag == 'o' {
+                    // `-ovalue` consumes the remainder; bare `-o` consumes
+                    // the next argv.  Neither payload is another option or a
+                    // refspec, even when it starts with `-`, `+`, or `:`.
+                    if flags.as_str().is_empty() {
+                        index += 1;
+                    }
+                    break;
+                }
+            }
+            index += 1;
+            continue;
+        }
+        if token.starts_with('+') || token.starts_with(':') {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 fn has_recursive_rm_dangerous_target(tokens: &[String]) -> bool {
     if tokens.first().map(|token| command_name(token)) != Some("rm") {
         return false;
@@ -611,14 +666,7 @@ fn dangerous_segment(tokens: &[String], depth: usize) -> Option<&'static str> {
         {
             return Some("git clean -f can permanently delete untracked files");
         }
-        if subcommand == "push"
-            && arguments.iter().any(|token| {
-                token == "-f"
-                    || token.starts_with("--force")
-                    || token == "--delete"
-                    || token.starts_with(':')
-            })
-        {
+        if subcommand == "push" && dangerous_git_push(arguments) {
             return Some("git push can overwrite or delete remote history");
         }
         if matches!(subcommand, "restore" | "rm") {
@@ -785,6 +833,15 @@ mod tests {
         assert!(is_dangerous("git reset --hard HEAD~1").is_some());
         assert!(is_dangerous("git clean -fdx").is_some());
         assert!(is_dangerous("git push --force origin main").is_some());
+        assert!(is_dangerous("git push -uf origin main").is_some());
+        assert!(is_dangerous("git push -fu origin main").is_some());
+        assert!(is_dangerous("git push -ud origin obsolete").is_some());
+        assert!(is_dangerous("git push origin +main").is_some());
+        assert!(is_dangerous("git push --mirror origin").is_some());
+        assert!(is_dangerous("git push --prune origin").is_some());
+        assert!(is_dangerous("git push -o +audit origin main").is_none());
+        assert!(is_dangerous("git push -o:review origin main").is_none());
+        assert!(is_dangerous("git push -o -d origin main").is_none());
         assert!(is_dangerous("systemctl reboot").is_some());
         assert!(is_dangerous("docker system prune -af").is_some());
         assert!(is_dangerous("hostname build-node").is_some());
