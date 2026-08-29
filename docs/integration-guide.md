@@ -220,6 +220,14 @@ safety. They recognize common destructive shell, Git, service,
 infrastructure, storage, wrapper, and review-smuggling forms, but intentionally
 remain conservative heuristics rather than a shell policy engine.
 
+Anywhere an integration displays or forwards agent-authored text on its own —
+a review card, an editor buffer a proposal is inserted into, a status line —
+check it with `jagent::is_unsafe_invisible_char` rather than a local table.
+That is the exact set a proposal was already validated against; a private copy
+only diverges from it, and the code points that matter most are unassigned, so
+they are neither controls nor whitespace and nothing else in the pipeline
+rejects them.
+
 ## Persistence and shutdown
 
 When `session.snapshot()` returns a value, serialize it with `to_json` and

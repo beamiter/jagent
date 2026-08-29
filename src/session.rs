@@ -2788,6 +2788,68 @@ mod tests {
     }
 
     #[test]
+    fn run_action_rejects_unassigned_tag_plane_and_bidi_escapes() {
+        // `validate_command` is the only gate between a model reply and an
+        // approval card, so it has to refuse code points that are invisible
+        // without being controls. U+E0000 and U+E0080 are unassigned, which
+        // means `char::is_control` is false and they are not whitespace: an
+        // enumeration of only the assigned tag characters let
+        // `{"run": "ls -la /etc\u{E0000}"}` through.
+        for hidden in [
+            '\u{e0000}',
+            '\u{e0002}',
+            '\u{e001f}',
+            '\u{e0080}',
+            '\u{e00ff}',
+            '\u{e01f0}',
+            '\u{e0fff}',
+            '\u{fff0}',
+            '\u{fff8}',
+            '\u{202a}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}',
+            '\u{2068}',
+            '\u{2069}',
+        ] {
+            let command = format!("ls -la /etc{hidden}");
+            assert!(
+                matches!(
+                    validate_command(&command),
+                    Err(ParseError::InvalidCommand(ref message))
+                        if message.contains("invisible or bidirectional")
+                ),
+                "validate_command accepted U+{:04X}",
+                hidden as u32
+            );
+            let reply = serde_json::json!({"action": "run", "command": command}).to_string();
+            assert!(
+                matches!(
+                    parse_action(&reply),
+                    Err(ParseError::InvalidCommand(ref message))
+                        if message.contains("invisible or bidirectional")
+                ),
+                "parse_action accepted U+{:04X}",
+                hidden as u32
+            );
+        }
+        // The widened ranges must not swallow assigned neighbours: a command
+        // that legitimately spells them still parses.
+        for visible in ['\u{fff9}', '\u{fffb}', '\u{13430}'] {
+            let reply = serde_json::json!({
+                "action": "run",
+                "command": format!("printf '%s' '{visible}'"),
+            })
+            .to_string();
+            assert!(
+                parse_action(&reply).is_ok(),
+                "parse_action rejected legitimate U+{:04X}",
+                visible as u32
+            );
+        }
+    }
+
+    #[test]
     fn action_protocol_rejects_duplicate_json_members_in_both_carriers() {
         let text = r#"{"action":"run","command":"printf safe","command":"rm -rf important"}"#;
         let Err(ParseError::InvalidJson(message)) = parse_action(text) else {

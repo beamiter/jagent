@@ -16,8 +16,10 @@
 //! - [`session`] — the pure agent state machine. The model may only *propose*
 //!   commands; approval returns an [`session::ApprovedCommand`] value to the
 //!   caller, and nothing in this crate can execute it.
-//! - [`safety`] — recognizable-danger warnings and a retired auto-approval
-//!   compatibility hook that always fails closed.
+//! - [`safety`] — recognizable-danger warnings, the shared
+//!   [`safety::is_unsafe_invisible_char`] predicate that every integration
+//!   should reuse rather than copy, and a retired auto-approval compatibility
+//!   hook that always fails closed.
 //! - [`provider`] — provider-neutral chat request construction (Anthropic /
 //!   OpenAI-compatible / Ollama) returning [`provider::BuiltRequest`] data
 //!   that keeps its plain [`provider::HttpRequest`] and history diagnostics,
@@ -88,7 +90,7 @@ pub use provider::{
 };
 pub use redact::{redact_secrets, redact_secrets_cow};
 pub use response::{AgentResponse, AgentStream};
-pub use safety::{is_auto_approvable, is_dangerous};
+pub use safety::{is_auto_approvable, is_dangerous, is_unsafe_invisible_char};
 pub use session::{
     AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
     CommandExecutionFailure, CommandExecutionOutcome, ModelOutcome, ParseError, PendingProposal,

@@ -9,7 +9,39 @@ pub(crate) const MAX_COMMAND_BYTES: usize = 16 * 1024;
 /// configured endpoint must read as the host it actually resolves to. Ordinary
 /// non-ASCII text, combining marks, and emoji that do not rely on invisible
 /// presentation selectors remain valid.
-pub(crate) fn is_unsafe_invisible_char(character: char) -> bool {
+///
+/// Two ranges are deliberately wider than Unicode's present default-ignorable
+/// assignments, because an *unassigned* code point is the weakest link here:
+/// it has general category `Cn`, so `char::is_control` is false, it is not
+/// whitespace, and enumerating only the characters Unicode has assigned so far
+/// leaves a hole that a model reply can aim at. The supplementary tag plane is
+/// therefore matched whole (`E0000..=E0FFF`, not just the assigned tag
+/// characters `E0020..=E007F` and variation selectors), and the reserved
+/// specials `FFF0..=FFF8` are matched too. The assigned interlinear annotation
+/// anchors (`FFF9..=FFFB`) and Egyptian layout controls (`U+13430` onward)
+/// stay allowed because Unicode does not classify them as default-ignorable.
+/// This keeps the gate at least as strict as the terminal family's own
+/// review-text predicate, which is the set the approval UI renders against.
+///
+/// This is public because the rule has to be *shared*, not re-derived. The
+/// crate's command validation is the single choke point every integration's
+/// model output crosses before becoming a proposal, and this predicate is the
+/// only invisible-character check it applies. An integration that copies the
+/// table instead of calling this forks the gate: the copy stops widening the
+/// day this one does, and nothing fails until a reply aims at the difference.
+/// Callers that render or forward agent text — a review card, a shell branch
+/// that inserts a proposed command into the input buffer — should call this,
+/// so the crate that holds the family's safety invariants holds this one too.
+/// The set may be widened, never narrowed; downstream boundaries are entitled
+/// to assume it stays a superset of Unicode's default-ignorable assignments.
+///
+/// ```
+/// // Unassigned tag-plane code points have general category `Cn`: not a
+/// // control, not whitespace, and invisible wherever the text is displayed.
+/// assert!(jagent::is_unsafe_invisible_char('\u{e0000}'));
+/// assert!(!jagent::is_unsafe_invisible_char('好'));
+/// ```
+pub fn is_unsafe_invisible_char(character: char) -> bool {
     (character.is_whitespace() && character != ' ')
         || matches!(
             character,
@@ -26,11 +58,12 @@ pub(crate) fn is_unsafe_invisible_char(character: char) -> bool {
             | '\u{fe00}'..='\u{fe0f}' // variation selectors
             | '\u{feff}' // zero-width no-break space / BOM
             | '\u{ffa0}' // halfwidth Hangul filler
+            | '\u{fff0}'..='\u{fff8}' // unassigned specials reserved for formats
             | '\u{1bca0}'..='\u{1bca3}' // shorthand format controls
             | '\u{1d173}'..='\u{1d17a}' // musical format controls
-            | '\u{e0001}' // language tag
-            | '\u{e0020}'..='\u{e007f}' // tag characters
-            | '\u{e0100}'..='\u{e01ef}' // supplementary variation selectors
+            | '\u{e0000}'..='\u{e0fff}' // whole tag plane: tags, language tag,
+            // supplementary variation selectors, and every unassigned code
+            // point between them
         )
 }
 
@@ -843,6 +876,178 @@ mod tests {
         let padded = format!("pwd{}", " ".repeat(MAX_COMMAND_BYTES));
         assert!(is_dangerous(&padded).is_some());
         assert!(is_dangerous("git\u{202e} status").is_some());
+    }
+
+    #[test]
+    fn unassigned_tag_plane_and_reserved_specials_are_rejected() {
+        // The escapes that motivated widening this set. U+E0000 and U+E0080
+        // are *unassigned* (general category Cn), so `char::is_control` is
+        // false and they are not whitespace: enumerating only the assigned tag
+        // characters left them as the one way past the sole gate on a
+        // model-proposed command. The bidi overrides/isolates are here for the
+        // same reason a review card exists at all — they let displayed text
+        // disagree with the bytes the shell receives.
+        for hidden in [
+            '\u{e0000}', // unassigned plane-14 start
+            '\u{e0001}', // language tag (deprecated)
+            '\u{e0002}', // unassigned
+            '\u{e001f}', // unassigned, just below the tag characters
+            '\u{e0020}', // tag space
+            '\u{e007f}', // cancel tag
+            '\u{e0080}', // unassigned, just above the tag characters
+            '\u{e00ff}', // unassigned
+            '\u{e0100}', // variation selector-17
+            '\u{e01ef}', // variation selector-256
+            '\u{e01f0}', // unassigned, just above the selectors
+            '\u{e0fff}', // unassigned plane-14 reserve
+            '\u{fff0}',  // reserved specials
+            '\u{fff8}',  // reserved specials
+            '\u{202a}',
+            '\u{202b}',
+            '\u{202c}',
+            '\u{202d}',
+            '\u{202e}', // bidi embed/override
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}', // bidi isolates
+        ] {
+            // Nothing else in the pipeline would have caught these, which is
+            // exactly why this predicate has to.
+            assert!(
+                !hidden.is_control() && !hidden.is_whitespace(),
+                "U+{:04X} is caught by an earlier check; this case proves nothing",
+                hidden as u32
+            );
+            assert!(
+                is_unsafe_invisible_char(hidden),
+                "U+{:04X} is not treated as invisible",
+                hidden as u32
+            );
+            assert_eq!(
+                is_dangerous(&format!("ls -la /etc{hidden}")),
+                Some("command contains control or invisible characters"),
+                "U+{:04X} did not raise a review warning",
+                hidden as u32
+            );
+        }
+    }
+
+    #[test]
+    fn assigned_neighbours_of_the_widened_ranges_stay_usable() {
+        // The widened ranges stop where Unicode assigns visible meaning:
+        // interlinear annotation anchors, Egyptian layout controls, and
+        // ordinary supplementary text must not become unreviewable.
+        for visible in [
+            '\u{fff9}',  // interlinear annotation anchor
+            '\u{fffb}',  // interlinear annotation terminator
+            '\u{13430}', // Egyptian hieroglyph vertical joiner
+            '\u{e1000}', // plane 14, above the tag block
+            '好',
+            '🙂',
+        ] {
+            assert!(
+                !is_unsafe_invisible_char(visible),
+                "U+{:04X} must remain valid command text",
+                visible as u32
+            );
+        }
+        assert!(is_dangerous("printf '编译🙂'").is_none());
+    }
+
+    /// The exact code points the shared predicate promises to reject, written
+    /// out independently of the implementation so a narrowing edit has to
+    /// change two places, and so a consumer can diff its own historical copy
+    /// against one list.
+    const PINNED_UNSAFE_RANGES: &[(u32, u32)] = &[
+        (0x00ad, 0x00ad),   // soft hyphen
+        (0x034f, 0x034f),   // combining grapheme joiner
+        (0x061c, 0x061c),   // Arabic letter mark
+        (0x115f, 0x1160),   // Hangul fillers
+        (0x17b4, 0x17b5),   // Khmer inherent vowels
+        (0x180b, 0x180f),   // Mongolian selectors/separator
+        (0x200b, 0x200f),   // zero-width + direction marks
+        (0x2028, 0x202e),   // line/paragraph + bidi embedding/override
+        (0x2060, 0x206f),   // invisible operators, isolates, deprecated controls
+        (0x3164, 0x3164),   // Hangul filler
+        (0xfe00, 0xfe0f),   // variation selectors
+        (0xfeff, 0xfeff),   // zero-width no-break space / BOM
+        (0xffa0, 0xffa0),   // halfwidth Hangul filler
+        (0xfff0, 0xfff8),   // unassigned specials reserved for formats
+        (0x1bca0, 0x1bca3), // shorthand format controls
+        (0x1d173, 0x1d17a), // musical format controls
+        (0xe0000, 0xe0fff), // whole supplementary tag plane
+    ];
+
+    #[test]
+    fn the_shared_invisible_set_is_pinned_in_both_directions() {
+        // Publishing this predicate makes its set a contract: the terminal
+        // family's review-text check and the shell's insert branch are meant
+        // to call it instead of keeping copies, which is only safe while the
+        // set here stays a superset of theirs. Sweeping every scalar pins it
+        // both ways — a dropped range fails the first assertion, an
+        // accidental widening the second — so the narrowing that let
+        // `U+E0000` through can never come back unnoticed.
+        //
+        // Whitespace is deliberately allowed to exceed the table:
+        // `char::is_whitespace` tracks whichever Unicode version the
+        // toolchain ships, and a std update must not read as a regression.
+        let pinned = |cp: u32| {
+            PINNED_UNSAFE_RANGES
+                .iter()
+                .any(|(lo, hi)| (*lo..=*hi).contains(&cp))
+        };
+        let mut pinned_members = 0u32;
+        for code_point in 0..=0x10_FFFF_u32 {
+            let Some(character) = char::from_u32(code_point) else {
+                continue; // surrogate half, not a scalar value
+            };
+            if pinned(code_point) {
+                pinned_members += 1;
+                assert!(
+                    is_unsafe_invisible_char(character),
+                    "U+{code_point:04X} left the shared invisible set"
+                );
+            } else if !character.is_whitespace() {
+                assert!(
+                    !is_unsafe_invisible_char(character),
+                    "U+{code_point:04X} entered the shared invisible set without \
+                     being added to the pinned table"
+                );
+            }
+        }
+        assert_eq!(
+            pinned_members, 4176,
+            "the pinned table itself changed size; update it deliberately"
+        );
+    }
+
+    #[test]
+    fn the_shared_predicate_is_reachable_from_the_crate_root() {
+        // The defect this closes was not the range list but its visibility:
+        // while the table was crate-private, every consumer had to re-derive
+        // it, and the crate that exists to hold the family's safety
+        // invariants held the weakest copy of this one. Binding the re-export
+        // as a plain function pointer is what an integration actually does.
+        let shared: fn(char) -> bool = crate::is_unsafe_invisible_char;
+        for sample in [
+            '\u{e0000}', // the escape that motivated widening the plane
+            '\u{e0080}',
+            '\u{fff0}',
+            '\u{202e}', // right-to-left override
+            '好',
+            '🙂',
+            ' ',
+        ] {
+            assert_eq!(
+                shared(sample),
+                is_unsafe_invisible_char(sample),
+                "the crate-root re-export disagrees with the module for U+{:04X}",
+                sample as u32
+            );
+        }
+        assert!(shared('\u{e0000}'));
+        assert!(!shared('好'));
     }
 
     #[test]

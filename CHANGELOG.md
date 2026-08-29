@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Exported `is_unsafe_invisible_char` so integrations can apply the crate's own
+  invisible/bidirectional rule instead of re-deriving it. It is the only such
+  check on a model-proposed command, and while it was crate-private every
+  consumer kept a private copy that could only diverge from it; a review card,
+  or a shell branch that inserts a proposal into the input buffer, can now call
+  the same predicate the proposal was validated with. The set may be widened,
+  never narrowed, and a test sweeps every Unicode scalar to hold it to that in
+  both directions.
 - Added the narrow `validate_no_duplicate_members(&[u8])` structural preflight
   used by jagent's own wire decoders, so integrations can apply the identical
   recursive uniqueness rule to other already byte-bounded JSON trust
@@ -120,6 +128,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- The invisible/bidirectional character set that gates every model-proposed
+  command, provider model name, endpoint URL, and generated header value now
+  matches the whole supplementary tag plane (`U+E0000..=U+E0FFF`) and the
+  reserved specials (`U+FFF0..=U+FFF8`) rather than only the tag characters and
+  variation selectors Unicode has assigned. Unassigned code points such as
+  `U+E0000` and `U+E0080` have general category `Cn`, so `char::is_control` is
+  false and they are not whitespace; a reply like
+  `{"action":"run","command":"ls -la /etc\u{E0000}"}` previously passed
+  `validate_command` and reached the approval card carrying text the reviewer
+  could not see. Assigned neighbours (`U+FFF9..=U+FFFB` interlinear annotation
+  anchors, `U+13430` onward) remain valid command text.
 - High-level response handling now fails closed before action conversion on
   provider refusals, content filtering, context truncation, unknown completion
   reasons, multiple choices, legacy `function_call` deltas, malformed choices,
