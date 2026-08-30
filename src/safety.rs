@@ -4302,6 +4302,118 @@ fn cryptsetup_changes_state(tokens: &[String]) -> bool {
     action == "token" && arguments.len() >= 2 && matches!(arguments[0], "add" | "remove" | "import")
 }
 
+fn wipefs_erases_signatures(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut erase = false;
+    let mut no_act = false;
+    let mut targets = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "all",
+                        "backup",
+                        "force",
+                        "noheadings",
+                        "json",
+                        "no-act",
+                        "offset",
+                        "output",
+                        "parsable",
+                        "quiet",
+                        "types",
+                        "lock",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some(resolved @ ("offset" | "output" | "types")) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        erase |= resolved == "offset";
+                    }
+                    Some("all") if attached.is_none() => {
+                        erase = true;
+                        index += 1;
+                    }
+                    Some("no-act") if attached.is_none() => {
+                        no_act = true;
+                        index += 1;
+                    }
+                    Some("backup" | "force" | "noheadings" | "json" | "parsable" | "quiet")
+                        if attached.is_none() =>
+                    {
+                        index += 1
+                    }
+                    // GNU optional arguments are attached with `=`; bare
+                    // `--lock` must leave the following device positional.
+                    Some("lock") => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => erase = true,
+                        'n' => no_act = true,
+                        'b' | 'f' | 'i' | 'J' | 'p' | 'q' => {}
+                        'o' | 'O' | 't' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            erase |= flag == 'o';
+                            break;
+                        }
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += usize::from(!option.is_empty());
+        index += 1;
+    }
+
+    erase && !no_act && targets > 0
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5314,7 +5426,9 @@ fn dangerous_segment(
             return Some("date --set changes the system clock");
         }
         "truncate" | "shred" => return Some("can irreversibly destroy file contents"),
-        "wipefs" => return Some("wipefs can erase filesystem signatures"),
+        "wipefs" if wipefs_erases_signatures(selected.tokens) => {
+            return Some("wipefs can erase filesystem signatures");
+        }
         "fdisk" | "sfdisk" | "cfdisk" | "parted" => {
             return Some("disk partition tools can destroy filesystem data");
         }
@@ -6712,6 +6826,46 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "cryptsetup inspection, validation, invalid argv, option value, or name substring was treated as mutation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wipefs_distinguishes_signature_queries_dry_runs_and_erasure() {
+        for command in [
+            "wipefs --all /dev/sdb",
+            "wipefs -a /dev/sdb /dev/sdc",
+            "wipefs --offset 0x438 /dev/sdb",
+            "wipefs -o0x438 --backup /dev/sdb",
+            "wipefs --all --force --lock=nonblock /dev/sdb",
+            "env wipefs -a /dev/sdb",
+            "nohup wipefs --offset 0 /dev/sdb",
+            "printf ignored | xargs wipefs --all /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "wipefs /dev/sdb",
+            "wipefs --json /dev/sdb",
+            "wipefs --output UUID,TYPE /dev/sdb",
+            "wipefs --types --all /dev/sdb",
+            "wipefs --all --no-act /dev/sdb",
+            "wipefs -na /dev/sdb",
+            "wipefs -n -o 0x438 /dev/sdb",
+            "wipefs --all",
+            "wipefs --offset 0x438",
+            "wipefs --help --all /dev/sdb",
+            "wipefs --version --offset 0 /dev/sdb",
+            "wipefs --lock /dev/sdb",
+            "wipefs --lock=invalid /dev/sdb",
+            "wipefs --unknown --all /dev/sdb",
+            "wipefs -- -a",
+            "wipefser --all /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "wipefs query, no-act, incomplete or invalid argv, option value, or command-name substring was treated as erasure for {command:?}"
             );
         }
     }
