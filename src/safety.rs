@@ -3667,6 +3667,191 @@ fn umount_changes_topology(tokens: &[String]) -> bool {
     !fake && (all || targets > 0)
 }
 
+fn losetup_changes_mapping(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut query = false;
+    let mut find = false;
+    let mut detach = false;
+    let mut detach_all = false;
+    let mut set_capacity = false;
+    let mut positionals = 0usize;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "all",
+                        "detach",
+                        "detach-all",
+                        "find",
+                        "set-capacity",
+                        "associated",
+                        "nooverlap",
+                        "offset",
+                        "sizelimit",
+                        "sector-size",
+                        "partscan",
+                        "read-only",
+                        "direct-io",
+                        "show",
+                        "verbose",
+                        "json",
+                        "list",
+                        "noheadings",
+                        "output",
+                        "output-all",
+                        "raw",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("detach") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        detach = true;
+                    }
+                    Some("detach-all") if attached.is_none() => {
+                        detach_all = true;
+                        index += 1;
+                    }
+                    Some("find") if attached.is_none() => {
+                        find = true;
+                        index += 1;
+                    }
+                    Some("set-capacity") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        set_capacity = true;
+                    }
+                    Some(
+                        flag @ ("associated" | "offset" | "sizelimit" | "sector-size" | "output"),
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        query |= matches!(flag, "associated" | "output");
+                    }
+                    Some("direct-io")
+                        if attached.is_none()
+                            || attached.is_some_and(|value| matches!(value, "on" | "off")) =>
+                    {
+                        index += 1;
+                    }
+                    Some("all" | "json" | "list" | "noheadings" | "output-all" | "raw")
+                        if attached.is_none() =>
+                    {
+                        query = true;
+                        index += 1;
+                    }
+                    Some("nooverlap" | "partscan" | "read-only" | "show" | "verbose")
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' | 'J' | 'l' | 'n' => query = true,
+                        'D' => detach_all = true,
+                        'f' => find = true,
+                        'd' | 'c' | 'j' | 'o' | 'b' | 'O' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            detach |= flag == 'd';
+                            set_capacity |= flag == 'c';
+                            query |= matches!(flag, 'j' | 'O');
+                            break;
+                        }
+                        'L' | 'P' | 'r' | 'v' => {}
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        index += 1;
+    }
+
+    if detach_all {
+        return true;
+    }
+    if detach {
+        return true;
+    }
+    if set_capacity {
+        return true;
+    }
+    if query {
+        return false;
+    }
+    if find {
+        positionals == 1
+    } else {
+        positionals == 2
+    }
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -4232,6 +4417,9 @@ fn dangerous_segment(
     }
     if command == "umount" && umount_changes_topology(selected.tokens) {
         return Some("umount detaches mounted filesystems");
+    }
+    if command == "losetup" && losetup_changes_mapping(selected.tokens) {
+        return Some("losetup changes loop-device mappings");
     }
     if match command {
         "kill" => kill_delivers_signal(selected.tokens),
@@ -5541,6 +5729,51 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "mount query, dry-run, invalid argv, or command-name substring was treated as a topology change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn losetup_distinguishes_mapping_changes_from_device_queries() {
+        for command in [
+            "losetup /dev/loop0 disk.img",
+            "losetup -fP disk.img",
+            "losetup --find --show --read-only disk.img",
+            "losetup -d /dev/loop0",
+            "losetup -d/dev/loop0",
+            "losetup --detach /dev/loop0 /dev/loop1",
+            "losetup -D",
+            "losetup -c /dev/loop0",
+            "losetup --set-capacity=/dev/loop0",
+            "losetup -a -d /dev/loop0",
+            "env losetup --set-capacity /dev/loop0",
+            "nohup losetup --detach /dev/loop0",
+            "printf x | xargs losetup -d /dev/loop0",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "losetup",
+            "losetup /dev/loop0",
+            "losetup -a",
+            "losetup -f",
+            "losetup --associated disk.img",
+            "losetup -l /dev/loop0",
+            "losetup --json --list",
+            "losetup --help /dev/loop0 disk.img",
+            "losetup --version -D",
+            "losetup -d",
+            "losetup -c",
+            "losetup --offset",
+            "losetup --detach=",
+            "losetup --direct-io=bogus -f disk.img",
+            "losetup --unknown /dev/loop0 disk.img",
+            "loosetup -d /dev/loop0",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "losetup query, terminal form, invalid argv, or name substring was treated as a mapping change for {command:?}"
             );
         }
     }
