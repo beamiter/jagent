@@ -291,6 +291,10 @@ a command—remain non-executable; `${NAME}` produces a static warning because
 environment-dependent executable text cannot be reviewed exactly. Both env and
 xargs recursion budgets fail closed with a static warning once further child
 argv can no longer be classified within the bounded walk.
+Bash builtin carriers are option-aware as well. `exec -a NAME` (attached or
+clustered) consumes the replacement argv-zero before exposing the executable;
+`command -v/-V` is treated as a query, and help, invalid options, or a
+non-existent `builtin` target do not reinterpret later words as execution.
 
 The structural proposal-text gate is now public as
 `validate_command_text`/`CommandTextError`, together with

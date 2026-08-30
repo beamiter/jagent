@@ -164,6 +164,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   options are bounded, and malformed variable names or `--null` plus a command
   remain inert. `${NAME}` expansion warns instead of guessing runtime bytes;
   exceeding the env/xargs dispatcher review budget now warns fail-closed.
+- Bash builtin wrapper parsing now consumes `exec -a NAME`, including attached
+  and clustered forms, before reviewing the actual executable. Query-only
+  `command -v/-V`, help/invalid options, and non-builtin `builtin` targets stay
+  inert instead of misclassifying their remaining argv as an executed command.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as

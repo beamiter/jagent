@@ -325,6 +325,11 @@ while malformed variable names and the command-incompatible `--null` form stay
 inert. Exceeding either dispatcher budget also warns instead of silently
 treating the hidden child as safe.
 
+Bash `exec`, `command`, and `builtin` prefixes retain their execution modes:
+`exec -a NAME` still exposes the real executable, while `command -v/-V`, help,
+invalid options, and non-existent `builtin` targets remain non-executing data
+instead of producing a warning for their later arguments.
+
 Use `validate_command_text` before an integration copies a proposal into an
 approval card, persistence adapter, or review-only shell insertion. It applies
 the same public `MAX_COMMAND_BYTES` ceiling and exact single-line/control/bidi
