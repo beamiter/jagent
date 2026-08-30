@@ -304,7 +304,10 @@ subset and may omit a usable mode; it never invents a crossed combination.
 execution, and command-text heuristics cannot prove what a configured shell,
 alias, function, or helper will do. Its network-content warning follows a
 pipeline through intermediate filters before an interpreter, rather than
-assuming one benign-looking stage makes downloaded bytes trustworthy.
+assuming one benign-looking stage makes downloaded bytes trustworthy. It also
+looks through a bounded chain of `xargs` dispatchers while consuming their
+option values, so network-controlled argv cannot hide a shell behind
+`xargs -0/-n/-I`.
 Classification also interprets shell ANSI-C quoted executable/script text, so
 the review warning describes the command after `$'\xNN'`, octal, or Unicode
 escape expansion rather than trusting its encoded spelling.

@@ -146,6 +146,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell pipeline instead of checking only the adjacent stage, so filters such
   as `tee` or `sed` cannot hide a later interpreter. The stdin-interpreter set
   now also covers `ash`, the C-shell family, `python2`, and `php`.
+- Network provenance now follows a bounded chain of `xargs` dispatchers to its
+  fixed command. GNU/POSIX and common BSD option values are consumed before
+  classification, covering `curl | xargs sh` without mistaking `-I sh` or
+  `-n sh` option arguments for an interpreter.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as

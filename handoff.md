@@ -265,7 +265,10 @@ The non-authorizing command warning now carries network provenance across the
 whole pipeline: `curl ... | tee setup.sh | sh` is treated like the adjacent
 `curl ... | sh` form. Its stdin-interpreter set also includes ash/csh/tcsh,
 Python 2, and PHP, matching the terminal family's correction guard rather than
-leaving the shared warning as the narrower copy.
+leaving the shared warning as the narrower copy. A bounded `xargs` dispatcher
+walk consumes GNU/POSIX and common BSD option values before inspecting the
+fixed child command, closing `curl | xargs sh` without treating replacement or
+count values such as `-I sh` / `-n sh` as executables.
 The lexer now also decodes Bash-compatible ANSI-C quote escapes before applying
 those warnings. Executable concatenation and nested scripts such as
 `r$'\x6d' -rf /` and `eval $'git reset --hard HEAD~1'` can no longer hide
