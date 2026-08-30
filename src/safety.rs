@@ -5724,7 +5724,12 @@ fn hostname_family_changes_name(tokens: &[String], command: &str) -> bool {
     boot || mode != HostnameMode::Query && (file || positionals == 1)
 }
 
-fn find_deletes_paths(tokens: &[String]) -> bool {
+struct FindEffects<'a> {
+    delete: bool,
+    commands: Vec<&'a [String]>,
+}
+
+fn parse_find_effects(tokens: &[String]) -> Option<FindEffects<'_>> {
     const ONE_VALUE: &[&str] = &[
         "-amin",
         "-anewer",
@@ -5799,10 +5804,11 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
     let mut need_operand = true;
     let mut parentheses = 0usize;
     let mut delete = false;
+    let mut commands = Vec::new();
 
     while let Some(token) = tokens.get(index).map(String::as_str) {
         if matches!(token, "--help" | "--version" | "-help" | "-version") {
-            return false;
+            return None;
         }
         if !expression_started {
             if token == "--" || matches!(token, "-H" | "-L" | "-P") {
@@ -5810,9 +5816,7 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
                 continue;
             }
             if token == "-D" {
-                if tokens.get(index + 1).is_none() {
-                    return false;
-                }
+                tokens.get(index + 1)?;
                 index += 2;
                 continue;
             }
@@ -5842,7 +5846,7 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
             }
             ")" => {
                 if !expression_started || need_operand || parentheses == 0 {
-                    return false;
+                    return None;
                 }
                 parentheses -= 1;
                 need_operand = false;
@@ -5850,7 +5854,7 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
             }
             "-a" | "-and" | "-o" | "-or" | "," => {
                 if !expression_started || need_operand {
-                    return false;
+                    return None;
                 }
                 need_operand = true;
                 index += 1;
@@ -5862,9 +5866,7 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
                 index += 1;
             }
             "-fprintf" => {
-                if tokens.get(index + 2).is_none() {
-                    return false;
-                }
+                tokens.get(index + 2)?;
                 expression_started = true;
                 need_operand = false;
                 index += 3;
@@ -5878,14 +5880,13 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
                 {
                     end += 1;
                 }
-                let Some(terminator) = tokens.get(end).map(String::as_str) else {
-                    return false;
-                };
+                let terminator = tokens.get(end).map(String::as_str)?;
                 if end == command_start
                     || terminator == "+" && tokens.get(end - 1).map(String::as_str) != Some("{}")
                 {
-                    return false;
+                    return None;
                 }
+                commands.push(&tokens[command_start..end]);
                 expression_started = true;
                 need_operand = false;
                 index = end + 1;
@@ -5895,9 +5896,7 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
                     .strip_prefix("-newer")
                     .is_some_and(|suffix| suffix.len() == 2) =>
             {
-                if tokens.get(index + 1).is_none() {
-                    return false;
-                }
+                tokens.get(index + 1)?;
                 expression_started = true;
                 need_operand = false;
                 index += 2;
@@ -5907,11 +5906,14 @@ fn find_deletes_paths(tokens: &[String]) -> bool {
                 need_operand = false;
                 index += 1;
             }
-            _ => return false,
+            _ => return None,
         }
     }
 
-    delete && expression_started && !need_operand && parentheses == 0
+    if expression_started && need_operand || parentheses != 0 {
+        return None;
+    }
+    Some(FindEffects { delete, commands })
 }
 
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
@@ -7156,6 +7158,28 @@ fn dangerous_segment(
     {
         return Some("permission changes against a top-level or home path");
     }
+    if command == "find" {
+        let effects = parse_find_effects(selected.tokens)?;
+        if effects.delete {
+            return Some("find -delete permanently removes matched paths");
+        }
+        for child in effects.commands {
+            if child.first().is_some_and(|program| program.contains("{}")) {
+                return Some("find executes a matched path as a command");
+            }
+            if depth >= 4 {
+                return Some("command dispatcher nesting exceeds the review limit");
+            }
+            let normalized_child: Vec<String> = child
+                .iter()
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
+            if dangerous_segment_with_dispatch(child, &normalized_child, depth + 1, true).is_some()
+            {
+                return Some("find dispatches a dangerous child command");
+            }
+        }
+    }
 
     match command {
         "hostname" | "domainname" | "nisdomainname" | "ypdomainname" | "dnsdomainname"
@@ -7186,9 +7210,6 @@ fn dangerous_segment(
         }
         "parted" if parted_changes_partition_table(selected.tokens) => {
             return Some("parted can change a disk partition table");
-        }
-        "find" if find_deletes_paths(selected.tokens) => {
-            return Some("find -delete permanently removes matched paths");
         }
         "rsync"
             if effective[1..]
@@ -9472,6 +9493,38 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "find terminal, value, child argv, incomplete, invalid, or command-name substring was treated as a delete action for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_fixed_child_commands_reenter_safety_classification() {
+        for command in [
+            "find . -exec hostname build-node \\;",
+            "find . -execdir date -s tomorrow \\;",
+            "find . -ok domainname corp.example \\;",
+            "find . -exec sh -c 'rm -rf /' \\;",
+            "find . -exec sudo id \\;",
+            "find . -exec '{}' \\;",
+            "find . -exec env hostname build-node \\;",
+            "find . -exec echo '{}' \\; -exec hostname build-node \\;",
+            "find . -exec xargs hostname build-node \\;",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "find . -exec echo '{}' \\;",
+            "find . -exec printf -delete '{}' \\;",
+            "find . -exec hostname -f \\;",
+            "find . -exec date -u \\;",
+            "find . -exec rm --help \\;",
+            "find . -ok echo '{}' \\;",
+            "find --help . -exec hostname build-node \\;",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "safe find child or terminal parent was treated as a dangerous child dispatch for {command:?}"
             );
         }
     }
