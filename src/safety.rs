@@ -5273,6 +5273,97 @@ fn mkfs_btrfs_formats(tokens: &[String]) -> bool {
     targets > 0 && !feature_listing
 }
 
+fn mkfs_fat_formats(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut create_file = false;
+    let mut positionals = 0usize;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = argument.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &["mbr", "codepage", "variant", "invariant", "offset", "help"],
+                ) {
+                    Some("mbr") => {
+                        if attached.is_some_and(|mode| !matches!(mode, "y" | "n" | "a")) {
+                            return false;
+                        }
+                        index += 1;
+                    }
+                    Some("codepage" | "variant" | "offset") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("invariant") if attached.is_none() => index += 1,
+                    Some("help") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'C' => create_file = true,
+                        'a' | 'A' | 'c' | 'I' | 'v' => {}
+                        'b' | 'f' | 'D' | 'F' | 'g' | 'h' | 'i' | 'l' | 'm' | 'M' | 'n' | 'r'
+                        | 'R' | 's' | 'S' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += usize::from(!argument.is_empty());
+        if positionals > 2 {
+            return false;
+        }
+        index += 1;
+    }
+
+    if create_file {
+        positionals == 2
+    } else {
+        positionals > 0
+    }
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6480,10 +6571,22 @@ fn dangerous_segment(
     if command == "mkfs.btrfs" && mkfs_btrfs_formats(selected.tokens) {
         return Some("mkfs formats a filesystem");
     }
+    if matches!(command, "mkdosfs" | "mkfs.fat" | "mkfs.msdos" | "mkfs.vfat")
+        && mkfs_fat_formats(selected.tokens)
+    {
+        return Some("mkfs formats a filesystem");
+    }
     if command.starts_with("mkfs.")
         && !matches!(
             command,
-            "mkfs.btrfs" | "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4" | "mkfs.xfs"
+            "mkfs.btrfs"
+                | "mkfs.ext2"
+                | "mkfs.ext3"
+                | "mkfs.ext4"
+                | "mkfs.fat"
+                | "mkfs.msdos"
+                | "mkfs.vfat"
+                | "mkfs.xfs"
         )
         && mkfs_backend_formats(selected.tokens)
     {
@@ -8443,6 +8546,49 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "Btrfs terminal, feature-list, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fat_mkfs_distinguishes_labels_and_image_creation_operands() {
+        for command in [
+            "mkfs.fat /dev/sdb",
+            "mkfs.fat -n DATA /dev/sdb",
+            "mkfs.vfat -F 32 /dev/sdb",
+            "mkfs.msdos -I /dev/sdb",
+            "mkdosfs /dev/sdb",
+            "mkfs.fat -C disk.img 1024",
+            "mkfs.fat --offset 8 /dev/sdb",
+            "mkfs.fat --mbr=y /dev/sdb",
+            "mkfs.fat --variant Atari /dev/sdb",
+            "mkfs.fat -- /dev/sdb",
+            "env mkdosfs /dev/sdb",
+            "printf ignored | xargs mkfs.vfat /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mkfs.fat",
+            "mkfs.fat -n DATA",
+            "mkfs.fat -n /dev/sdb",
+            "mkfs.fat -C disk.img",
+            "mkfs.fat -C disk.img 1024 extra",
+            "mkfs.fat --help /dev/sdb",
+            "mkfs.fat --hel /dev/sdb",
+            "mkfs.fat --version /dev/sdb",
+            "mkfs.fat --codepage 850",
+            "mkfs.fat --offset /dev/sdb",
+            "mkfs.fat --invariant",
+            "mkfs.fat --mbr",
+            "mkfs.fat --mbr=invalid /dev/sdb",
+            "mkfs.fat --invariant=yes /dev/sdb",
+            "mkfs.fat -Z /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "FAT terminal, option-only, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
             );
         }
     }
