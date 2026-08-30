@@ -5916,6 +5916,163 @@ fn parse_find_effects(tokens: &[String]) -> Option<FindEffects<'_>> {
     Some(FindEffects { delete, commands })
 }
 
+fn has_find_placeholder(token: &str) -> bool {
+    token.contains("{}")
+}
+
+fn rm_removes_find_match(tokens: &[String]) -> bool {
+    let mut options = true;
+    let mut matched_target = false;
+
+    for token in &tokens[1..] {
+        if options && token == "--" {
+            options = false;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "force",
+                        "interactive",
+                        "one-file-system",
+                        "no-preserve-root",
+                        "preserve-root",
+                        "recursive",
+                        "dir",
+                        "verbose",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("interactive")
+                        if attached.is_none()
+                            || attached.is_some_and(|value| {
+                                matches!(value, "never" | "once" | "always")
+                            }) => {}
+                    Some("preserve-root") if attached.is_none() || attached == Some("all") => {}
+                    Some(
+                        "force" | "one-file-system" | "no-preserve-root" | "recursive" | "dir"
+                        | "verbose",
+                    ) if attached.is_none() => {}
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+                if !flags
+                    .chars()
+                    .all(|flag| matches!(flag, 'f' | 'i' | 'I' | 'r' | 'R' | 'd' | 'v'))
+                {
+                    return false;
+                }
+                continue;
+            }
+        }
+        matched_target |= has_find_placeholder(token);
+    }
+
+    matched_target
+}
+
+fn unlink_removes_find_match(tokens: &[String]) -> bool {
+    let mut options = true;
+    let mut targets = 0usize;
+    let mut matched_target = false;
+
+    for token in &tokens[1..] {
+        if options && token == "--" {
+            options = false;
+            continue;
+        }
+        if options && token.starts_with('-') && token != "-" {
+            let Some(long) = token.strip_prefix("--") else {
+                return false;
+            };
+            if !matches!(long, "help" | "version") {
+                return false;
+            }
+            return false;
+        }
+        targets += 1;
+        matched_target |= has_find_placeholder(token);
+    }
+
+    targets == 1 && matched_target
+}
+
+fn rmdir_removes_find_match(tokens: &[String]) -> bool {
+    let mut options = true;
+    let mut matched_target = false;
+
+    for token in &tokens[1..] {
+        if options && token == "--" {
+            options = false;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                if !matches!(
+                    unique_long_option(
+                        long,
+                        &[
+                            "ignore-fail-on-non-empty",
+                            "parents",
+                            "verbose",
+                            "help",
+                            "version",
+                        ],
+                    ),
+                    Some("ignore-fail-on-non-empty" | "parents" | "verbose")
+                ) {
+                    return false;
+                }
+                continue;
+            }
+            if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+                if !flags.chars().all(|flag| matches!(flag, 'p' | 'v')) {
+                    return false;
+                }
+                continue;
+            }
+        }
+        matched_target |= has_find_placeholder(token);
+    }
+
+    matched_target
+}
+
+fn find_child_removes_match(tokens: &[String]) -> bool {
+    fn inner(tokens: &[String], depth: usize) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        if let Ok(Some(dispatched)) = env_dispatched_command(tokens, true) {
+            return inner(&dispatched, depth + 1);
+        }
+
+        let effective = effective_direct_command(tokens);
+        let Some(command) = effective.first().map(|token| command_name(token)) else {
+            return false;
+        };
+        match command {
+            "rm" => rm_removes_find_match(effective),
+            "unlink" => unlink_removes_find_match(effective),
+            "rmdir" => rmdir_removes_find_match(effective),
+            "xargs" => xargs_dispatched_command(effective)
+                .is_some_and(|dispatched| inner(dispatched, depth + 1)),
+            _ => false,
+        }
+    }
+
+    inner(tokens, 0)
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -7166,6 +7323,9 @@ fn dangerous_segment(
         for child in effects.commands {
             if child.first().is_some_and(|program| program.contains("{}")) {
                 return Some("find executes a matched path as a command");
+            }
+            if find_child_removes_match(child) {
+                return Some("find dispatches a child command that removes matched paths");
             }
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
@@ -9525,6 +9685,40 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "safe find child or terminal parent was treated as a dangerous child dispatch for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_child_removal_tools_track_only_effective_match_operands() {
+        for command in [
+            "find . -exec rm '{}' \\;",
+            "find . -execdir rm -rf -- '{}' +",
+            "find . -ok rm -- './{}' \\;",
+            "find . -okdir unlink '{}' \\;",
+            "find . -exec rmdir -pv '{}' \\;",
+            "find . -exec env rm -f '{}' \\;",
+            "find . -exec nohup unlink -- '{}' \\;",
+            "find . -exec busybox rm './{}' \\;",
+            "find . -exec xargs rm -- '{}' \\;",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "find . -exec rm --help '{}' \\;",
+            "find . -exec rm --version '{}' \\;",
+            "find . -exec rm --interactive='{}' literal \\;",
+            "find . -exec rm --recursive='{}' \\;",
+            "find . -exec unlink --help '{}' \\;",
+            "find . -exec unlink '{}' extra \\;",
+            "find . -exec rmdir --version '{}' \\;",
+            "find . -exec rmdir --parents='{}' \\;",
+            "find . -exec echo rm '{}' \\;",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "find child option value, terminal or invalid argv was treated as matched-path removal for {command:?}"
             );
         }
     }
