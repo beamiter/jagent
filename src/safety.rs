@@ -4925,6 +4925,118 @@ fn parted_changes_partition_table(tokens: &[String]) -> bool {
     false
 }
 
+fn mkfs_frontend_formats(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut verbose = 0usize;
+    let mut builder_arguments = 0usize;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if argument == "--" {
+            builder_arguments += tokens[index + 1..]
+                .iter()
+                .filter(|argument| !argument.is_empty())
+                .count();
+            break;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            let (spelling, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match unique_long_option(spelling, &["type", "verbose", "help", "version"]) {
+                Some("type") => {
+                    index += 1;
+                    let value = if let Some(value) = attached {
+                        value
+                    } else {
+                        let Some(value) = tokens.get(index).map(String::as_str) else {
+                            return false;
+                        };
+                        index += 1;
+                        value
+                    };
+                    if value.is_empty() {
+                        return false;
+                    }
+                }
+                Some("verbose") if attached.is_none() => {
+                    verbose += 1;
+                    index += 1;
+                }
+                Some("help" | "version") if attached.is_none() => return false,
+                Some(_) => return false,
+                None => {
+                    // mkfs passes the first unrecognized option and everything
+                    // after it to the filesystem-specific builder. Later -V
+                    // flags therefore cannot turn this into a frontend dry run.
+                    builder_arguments += tokens[index..]
+                        .iter()
+                        .filter(|argument| !argument.is_empty())
+                        .count();
+                    break;
+                }
+            }
+            continue;
+        }
+        if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+            index += 1;
+            let mut passed_to_builder = false;
+            for (offset, flag) in short.char_indices() {
+                match flag {
+                    'V' => verbose += 1,
+                    'h' => return false,
+                    't' => {
+                        let value_start = offset + flag.len_utf8();
+                        let value = if value_start < short.len() {
+                            &short[value_start..]
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        break;
+                    }
+                    _ => {
+                        passed_to_builder = true;
+                        break;
+                    }
+                }
+            }
+            if passed_to_builder {
+                builder_arguments += 1;
+                builder_arguments += tokens[index..]
+                    .iter()
+                    .filter(|argument| !argument.is_empty())
+                    .count();
+                break;
+            }
+            continue;
+        }
+
+        // util-linux getopt permutes recognized frontend options past device
+        // operands, so keep parsing instead of ending option processing here.
+        builder_arguments += usize::from(!argument.is_empty());
+        index += 1;
+    }
+
+    builder_arguments > 0 && verbose < 2
+}
+
+fn mkfs_backend_formats(tokens: &[String]) -> bool {
+    let mut has_argument = false;
+    for argument in &tokens[1..] {
+        if matches!(argument.as_str(), "--help" | "--version") {
+            return false;
+        }
+        has_argument |= !argument.is_empty();
+    }
+    has_argument
+}
+
 fn truncate_changes_file_length(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -6107,7 +6219,10 @@ fn dangerous_segment(
     if has_recursive_rm_dangerous_target(effective) {
         return Some("recursive rm against a top-level, home, or current-directory path");
     }
-    if command == "mkfs" || command.starts_with("mkfs.") {
+    if command == "mkfs" && mkfs_frontend_formats(selected.tokens) {
+        return Some("mkfs formats a filesystem");
+    }
+    if command.starts_with("mkfs.") && mkfs_backend_formats(selected.tokens) {
         return Some("mkfs formats a filesystem");
     }
     if command == "dd"
@@ -7893,6 +8008,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "shred terminal, no-op, incomplete or invalid argv, option value, or command-name substring was treated as content destruction for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mkfs_distinguishes_frontend_dry_runs_and_terminal_invocations() {
+        for command in [
+            "mkfs /dev/sdb",
+            "mkfs -t ext4 /dev/sdb",
+            "mkfs --type=xfs /dev/sdb",
+            "mkfs -V /dev/sdb",
+            "mkfs --verbose /dev/sdb",
+            "mkfs -F /dev/sdb",
+            "mkfs.ext4 /dev/sdb",
+            "mkfs.xfs -f /dev/sdb",
+            "env mkfs /dev/sdb",
+            "nohup mkfs.ext4 /dev/sdb",
+            "printf ignored | xargs mkfs /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mkfs --help /dev/sdb",
+            "mkfs --version /dev/sdb",
+            "mkfs",
+            "mkfs -t ext4",
+            "mkfs --type=xfs",
+            "mkfs -V -V /dev/sdb",
+            "mkfs -VV /dev/sdb",
+            "mkfs --verbose --verbose /dev/sdb",
+            "mkfs /dev/sdb -V -V",
+            "mkfs -V -V -F /dev/sdb",
+            "mkfs.ext4",
+            "mkfs.ext4 --help /dev/sdb",
+            "mkfs.btrfs --version /dev/sdb",
+            "mkfser /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "mkfs terminal, frontend dry-run, incomplete argv, or command-name substring was treated as formatting for {command:?}"
             );
         }
     }
