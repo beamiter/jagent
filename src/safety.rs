@@ -5594,6 +5594,136 @@ fn date_sets_clock(tokens: &[String]) -> bool {
             .is_some_and(|operand| traditional_date_operand_sets_clock(operand))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostnameMode {
+    Host,
+    Nis,
+    Query,
+}
+
+fn hostname_family_changes_name(tokens: &[String], command: &str) -> bool {
+    let mut mode = match command {
+        "hostname" => HostnameMode::Host,
+        "domainname" | "nisdomainname" | "ypdomainname" => HostnameMode::Nis,
+        "dnsdomainname" => HostnameMode::Query,
+        _ => return false,
+    };
+    let mut index = 1usize;
+    let mut options = true;
+    let mut boot = false;
+    let mut file = false;
+    let mut positionals = 0usize;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = argument.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "alias",
+                        "all-fqdns",
+                        "all-ip-addresses",
+                        "boot",
+                        "domain",
+                        "file",
+                        "fqdn",
+                        "help",
+                        "ip-address",
+                        "long",
+                        "nis",
+                        "short",
+                        "version",
+                        "yp",
+                    ],
+                ) {
+                    Some("file") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        file = true;
+                    }
+                    Some("boot") if attached.is_none() => {
+                        boot = true;
+                        index += 1;
+                    }
+                    Some("nis" | "yp") if attached.is_none() => {
+                        mode = HostnameMode::Nis;
+                        index += 1;
+                    }
+                    Some(
+                        "alias" | "all-fqdns" | "all-ip-addresses" | "domain" | "fqdn"
+                        | "ip-address" | "long" | "short",
+                    ) if attached.is_none() => {
+                        mode = HostnameMode::Query;
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'b' => boot = true,
+                        'v' => {}
+                        'y' => mode = HostnameMode::Nis,
+                        'a' | 'A' | 'd' | 'f' | 'i' | 'I' | 's' => {
+                            mode = HostnameMode::Query;
+                        }
+                        'h' | 'V' => return false,
+                        'F' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            file = true;
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        if positionals > 1 {
+            return false;
+        }
+        index += 1;
+    }
+
+    boot || mode != HostnameMode::Query && (file || positionals == 1)
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6838,8 +6968,10 @@ fn dangerous_segment(
     }
 
     match command {
-        "hostname" if effective.len() > 1 => {
-            return Some("hostname arguments can change the system hostname");
+        "hostname" | "domainname" | "nisdomainname" | "ypdomainname" | "dnsdomainname"
+            if hostname_family_changes_name(selected.tokens, command) =>
+        {
+            return Some("hostname-family arguments can change a system name");
         }
         "date" if date_sets_clock(selected.tokens) => {
             return Some("date --set changes the system clock");
@@ -9052,6 +9184,61 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "date display, terminal, incomplete, invalid, or command-name substring was treated as a clock change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hostname_family_distinguishes_queries_from_name_changes() {
+        for command in [
+            "hostname build-node",
+            "hostname -b",
+            "hostname --boot",
+            "hostname -F hostname.txt",
+            "hostname --file=hostname.txt",
+            "hostname -y corp.example",
+            "hostname --nis corp.example",
+            "domainname corp.example",
+            "nisdomainname corp.example",
+            "ypdomainname -F domain.txt",
+            "dnsdomainname -y corp.example",
+            "hostname -- --help",
+            "env hostname build-node",
+            "nohup domainname corp.example",
+            "printf ignored | xargs hostname build-node",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "hostname",
+            "hostname -a",
+            "hostname -A",
+            "hostname -d",
+            "hostname -f",
+            "hostname -i",
+            "hostname -I",
+            "hostname -s",
+            "hostname -y",
+            "hostname --fqdn",
+            "hostname -V build-node",
+            "hostname --help build-node",
+            "hostname --version build-node",
+            "hostname -F",
+            "hostname --file",
+            "hostname -d build-node",
+            "hostname -f build-node",
+            "hostname --unknown build-node",
+            "domainname",
+            "nisdomainname -y",
+            "dnsdomainname",
+            "dnsdomainname corp.example",
+            "dnsdomainname -F domain.txt",
+            "hostnames build-node",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "hostname-family query, terminal, incomplete, invalid, or command-name substring was treated as a name change for {command:?}"
             );
         }
     }
