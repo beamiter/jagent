@@ -254,6 +254,12 @@ consumer migration details.
    accounting, final-turn state binding, and transcript budgets before making
    a session live.
 
+The non-authorizing command warning now carries network provenance across the
+whole pipeline: `curl ... | tee setup.sh | sh` is treated like the adjacent
+`curl ... | sh` form. Its stdin-interpreter set also includes ash/csh/tcsh,
+Python 2, and PHP, matching the terminal family's correction guard rather than
+leaving the shared warning as the narrower copy.
+
 ## Remaining integration boundaries
 
 `jagent` remains sans-IO. It now validates the request value's URL/body/header

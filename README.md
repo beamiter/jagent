@@ -302,7 +302,9 @@ subset and may omit a usable mode; it never invents a crossed combination.
 
 `is_dangerous` provides review warnings only. It neither authorizes nor blocks
 execution, and command-text heuristics cannot prove what a configured shell,
-alias, function, or helper will do.
+alias, function, or helper will do. Its network-content warning follows a
+pipeline through intermediate filters before an interpreter, rather than
+assuming one benign-looking stage makes downloaded bytes trustworthy.
 
 ## High-level modules
 

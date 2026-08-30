@@ -136,6 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- Network-to-interpreter warnings now follow downloaded bytes across an entire
+  shell pipeline instead of checking only the adjacent stage, so filters such
+  as `tee` or `sed` cannot hide a later interpreter. The stdin-interpreter set
+  now also covers `ash`, the C-shell family, `python2`, and `php`.
+
 - The invisible/bidirectional character set that gates every model-proposed
   command, provider model name, endpoint URL, and generated header value now
   matches the whole supplementary tag plane (`U+E0000..=U+E0FFF`) and the
