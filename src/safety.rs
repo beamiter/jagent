@@ -5162,6 +5162,117 @@ fn mkfs_xfs_formats(tokens: &[String]) -> bool {
     !no_modify && (positionals == 1 || implicit_data_target)
 }
 
+fn mkfs_btrfs_formats(tokens: &[String]) -> bool {
+    const LONG_OPTIONS: &[&str] = &[
+        "alloc-start",
+        "byte-count",
+        "checksum",
+        "csum",
+        "data",
+        "device-uuid",
+        "features",
+        "force",
+        "help",
+        "label",
+        "leafsize",
+        "metadata",
+        "mixed",
+        "nodiscard",
+        "nodesize",
+        "quiet",
+        "rootdir",
+        "runtime-features",
+        "sectorsize",
+        "shrink",
+        "uuid",
+        "verbose",
+        "version",
+    ];
+
+    let mut index = 1usize;
+    let mut options = true;
+    let mut feature_listing = false;
+    let mut targets = 0usize;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = argument.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(spelling, LONG_OPTIONS) {
+                    Some(
+                        resolved @ ("alloc-start" | "byte-count" | "checksum" | "csum" | "data"
+                        | "device-uuid" | "features" | "label" | "leafsize"
+                        | "metadata" | "nodesize" | "rootdir" | "runtime-features"
+                        | "sectorsize" | "uuid"),
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        feature_listing |= resolved == "features" && value == "list-all";
+                    }
+                    Some("force" | "mixed" | "nodiscard" | "quiet" | "shrink" | "verbose")
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'V' => return false,
+                        'f' | 'M' | 'K' | 'q' | 'v' => {}
+                        'A' | 'b' | 'l' | 'n' | 's' | 'm' | 'd' | 'L' | 'R' | 'O' | 'r' | 'U' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            feature_listing |= flag == 'O' && value == "list-all";
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += usize::from(!argument.is_empty());
+        index += 1;
+    }
+
+    targets > 0 && !feature_listing
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6366,10 +6477,13 @@ fn dangerous_segment(
     if command == "mkfs.xfs" && mkfs_xfs_formats(selected.tokens) {
         return Some("mkfs formats a filesystem");
     }
+    if command == "mkfs.btrfs" && mkfs_btrfs_formats(selected.tokens) {
+        return Some("mkfs formats a filesystem");
+    }
     if command.starts_with("mkfs.")
         && !matches!(
             command,
-            "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4" | "mkfs.xfs"
+            "mkfs.btrfs" | "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4" | "mkfs.xfs"
         )
         && mkfs_backend_formats(selected.tokens)
     {
@@ -8283,6 +8397,52 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "XFS no-modify, terminal, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_mkfs_requires_an_effective_creation_target() {
+        for command in [
+            "mkfs.btrfs /dev/sdb",
+            "mkfs.btrfs -f /dev/sdb",
+            "mkfs.btrfs -L data /dev/sdb",
+            "mkfs.btrfs -L -V /dev/sdb",
+            "mkfs.btrfs -n 16384 /dev/sdb",
+            "mkfs.btrfs -O free-space-tree /dev/sdb",
+            "mkfs.btrfs --rootdir root image.btrfs",
+            "mkfs.btrfs /dev/sdb /dev/sdc",
+            "mkfs.btrfs -- /dev/sdb",
+            "mkfs.btrfs --for /dev/sdb",
+            "mkfs.btrfs --verb /dev/sdb",
+            "mkfs.btrfs --checksum sha256 /dev/sdb",
+            "mkfs.btrfs -l 16384 /dev/sdb",
+            "mkfs.btrfs -R quota /dev/sdb",
+            "env mkfs.btrfs /dev/sdb",
+            "printf ignored | xargs mkfs.btrfs /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mkfs.btrfs",
+            "mkfs.btrfs -L data",
+            "mkfs.btrfs -n /dev/sdb",
+            "mkfs.btrfs -V /dev/sdb",
+            "mkfs.btrfs --version /dev/sdb",
+            "mkfs.btrfs --vers /dev/sdb",
+            "mkfs.btrfs --help /dev/sdb",
+            "mkfs.btrfs -O list-all /dev/sdb",
+            "mkfs.btrfs --features=list-all /dev/sdb",
+            "mkfs.btrfs -L data -O list-all /dev/sdb",
+            "mkfs.btrfs --check /dev/sdb",
+            "mkfs.btrfs --ver /dev/sdb",
+            "mkfs.btrfs --force=yes /dev/sdb",
+            "mkfs.btrfs --unknown /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "Btrfs terminal, feature-list, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
             );
         }
     }
