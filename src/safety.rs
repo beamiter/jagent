@@ -6073,6 +6073,299 @@ fn find_child_removes_match(tokens: &[String]) -> bool {
     inner(tokens, 0)
 }
 
+fn rsync_removes_files(tokens: &[String]) -> bool {
+    const NO_VALUE: &[&str] = &[
+        "verbose",
+        "quiet",
+        "no-motd",
+        "checksum",
+        "archive",
+        "recursive",
+        "relative",
+        "no-implied-dirs",
+        "backup",
+        "update",
+        "inplace",
+        "append",
+        "append-verify",
+        "dirs",
+        "old-dirs",
+        "old-d",
+        "mkpath",
+        "links",
+        "copy-links",
+        "copy-unsafe-links",
+        "safe-links",
+        "munge-links",
+        "copy-dirlinks",
+        "keep-dirlinks",
+        "hard-links",
+        "perms",
+        "executability",
+        "acls",
+        "xattrs",
+        "owner",
+        "group",
+        "devices",
+        "copy-devices",
+        "write-devices",
+        "specials",
+        "times",
+        "atimes",
+        "open-noatime",
+        "crtimes",
+        "omit-dir-times",
+        "omit-link-times",
+        "super",
+        "fake-super",
+        "sparse",
+        "preallocate",
+        "dry-run",
+        "whole-file",
+        "one-file-system",
+        "existing",
+        "ignore-existing",
+        "remove-source-files",
+        "del",
+        "delete",
+        "delete-before",
+        "delete-during",
+        "delete-delay",
+        "delete-after",
+        "delete-excluded",
+        "ignore-missing-args",
+        "delete-missing-args",
+        "ignore-errors",
+        "force",
+        "partial",
+        "delay-updates",
+        "prune-empty-dirs",
+        "numeric-ids",
+        "from0",
+        "cvs-exclude",
+        "old-args",
+        "protect-args",
+        "secluded-args",
+        "no-protect-args",
+        "no-secluded-args",
+        "trust-sender",
+        "blocking-io",
+        "stats",
+        "8-bit-output",
+        "human-readable",
+        "progress",
+        "itemize-changes",
+        "list-only",
+        "fsync",
+        "ipv4",
+        "ipv6",
+        "no-r",
+        "no-recursive",
+        "no-d",
+        "no-dirs",
+        "no-R",
+        "no-relative",
+        "no-l",
+        "no-links",
+        "no-p",
+        "no-perms",
+        "no-t",
+        "no-times",
+        "no-g",
+        "no-group",
+        "no-o",
+        "no-owner",
+        "no-D",
+        "no-devices",
+        "no-specials",
+        "no-H",
+        "no-hard-links",
+        "no-A",
+        "no-acls",
+        "no-X",
+        "no-xattrs",
+        "no-U",
+        "no-atimes",
+        "no-N",
+        "no-crtimes",
+        "no-c",
+        "no-checksum",
+        "no-z",
+        "no-compress",
+        "no-W",
+        "no-whole-file",
+        "help",
+        "version",
+    ];
+    const TAKES_VALUE: &[&str] = &[
+        "info",
+        "debug",
+        "stderr",
+        "backup-dir",
+        "suffix",
+        "chmod",
+        "checksum-choice",
+        "cc",
+        "block-size",
+        "rsh",
+        "rsync-path",
+        "max-delete",
+        "max-size",
+        "min-size",
+        "max-alloc",
+        "partial-dir",
+        "usermap",
+        "groupmap",
+        "chown",
+        "timeout",
+        "contimeout",
+        "modify-window",
+        "temp-dir",
+        "compare-dest",
+        "copy-dest",
+        "link-dest",
+        "compress-choice",
+        "zc",
+        "compress-level",
+        "zl",
+        "skip-compress",
+        "filter",
+        "exclude",
+        "exclude-from",
+        "include",
+        "include-from",
+        "files-from",
+        "copy-as",
+        "address",
+        "port",
+        "sockopts",
+        "outbuf",
+        "remote-option",
+        "out-format",
+        "log-file",
+        "log-file-format",
+        "password-file",
+        "early-input",
+        "bwlimit",
+        "stop-after",
+        "stop-at",
+        "write-batch",
+        "only-write-batch",
+        "read-batch",
+        "protocol",
+        "iconv",
+        "checksum-seed",
+    ];
+
+    let mut index = 1usize;
+    let mut options = true;
+    let mut positionals = 0usize;
+    let mut recursive = false;
+    let mut dirs = false;
+    let mut destination_delete = false;
+    let mut delete_missing = false;
+    let mut remove_source = false;
+    let mut delete_limit_blocks = false;
+    let mut no_change = false;
+
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (name, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                if TAKES_VALUE.contains(&name) {
+                    index += 1;
+                    let value = if let Some(value) = attached {
+                        value
+                    } else {
+                        let Some(value) = tokens.get(index).map(String::as_str) else {
+                            return false;
+                        };
+                        index += 1;
+                        value
+                    };
+                    if name == "max-delete" {
+                        let Ok(limit) = value.parse::<i128>() else {
+                            return false;
+                        };
+                        if limit < -1 {
+                            return false;
+                        }
+                        delete_limit_blocks = limit <= 0;
+                    }
+                    if name == "only-write-batch" {
+                        no_change = true;
+                    }
+                    continue;
+                }
+                if !NO_VALUE.contains(&name) || attached.is_some() {
+                    return false;
+                }
+                match name {
+                    "archive" => recursive = true,
+                    "recursive" => recursive = true,
+                    "dirs" | "old-dirs" | "old-d" => dirs = true,
+                    "no-r" | "no-recursive" => recursive = false,
+                    "no-d" | "no-dirs" => dirs = false,
+                    "del" | "delete" | "delete-before" | "delete-during" | "delete-delay"
+                    | "delete-after" | "delete-excluded" => destination_delete = true,
+                    "delete-missing-args" => delete_missing = true,
+                    "remove-source-files" => remove_source = true,
+                    "dry-run" | "list-only" => no_change = true,
+                    "help" | "version" => return false,
+                    _ => {}
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => recursive = true,
+                        'r' => recursive = true,
+                        'd' => dirs = true,
+                        'n' => no_change = true,
+                        'V' => return false,
+                        'B' | 'e' | '@' | 'T' | 'f' | 'M' => {
+                            if offset + flag.len_utf8() == short.len() {
+                                let Some(value) = tokens.get(index) else {
+                                    return false;
+                                };
+                                if value.is_empty() {
+                                    return false;
+                                }
+                                index += 1;
+                            }
+                            break;
+                        }
+                        'v' | 'q' | 'c' | 'R' | 'b' | 'u' | 'l' | 'L' | 'k' | 'K' | 'H' | 'p'
+                        | 'E' | 'A' | 'X' | 'o' | 'g' | 'D' | 't' | 'U' | 'N' | 'O' | 'J' | 'S'
+                        | 'W' | 'x' | 'I' | 'C' | 'm' | '0' | 's' | '8' | 'h' | 'P' | 'i' | '4'
+                        | '6' | 'z' | 'F' | 'y' => {}
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        index += 1;
+    }
+
+    !no_change
+        && positionals >= 2
+        && (remove_source
+            || !delete_limit_blocks
+                && (delete_missing || destination_delete && (recursive || dirs)))
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -7371,12 +7664,8 @@ fn dangerous_segment(
         "parted" if parted_changes_partition_table(selected.tokens) => {
             return Some("parted can change a disk partition table");
         }
-        "rsync"
-            if effective[1..]
-                .iter()
-                .any(|token| token.starts_with("--delete")) =>
-        {
-            return Some("rsync --delete can remove destination files");
+        "rsync" if rsync_removes_files(selected.tokens) => {
+            return Some("rsync can remove source or destination files");
         }
         "dropdb" => return Some("dropdb permanently removes a database"),
         "helm" if subcommand_is(effective, &["uninstall", "delete"]) => {
@@ -9719,6 +10008,53 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "find child option value, terminal or invalid argv was treated as matched-path removal for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rsync_parses_effective_deletion_modes_and_option_boundaries() {
+        for command in [
+            "rsync -a --delete src/ dst/",
+            "rsync -d --del src/ dst/",
+            "rsync -r --delete-before src/ dst/",
+            "rsync --dirs --delete-during src/ dst/",
+            "rsync -a --delete-delay src/ dst/",
+            "rsync -a --delete-after src/ dst/",
+            "rsync -a --delete-excluded src/ dst/",
+            "rsync --delete-missing-args missing dst/",
+            "rsync --remove-source-files src/file dst/",
+            "rsync -a --delete --max-delete 1 src/ dst/",
+            "rsync --filter '- *.tmp' -a --delete src/ dst/",
+            "rsync --protect-args --no-specials -a --delete src/ dst/",
+            "env rsync -a --delete src/ dst/",
+            "nohup rsync --remove-source-files src/file dst/",
+            "printf ignored | xargs rsync -a --delete src/ dst/",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "rsync -an --delete src/ dst/",
+            "rsync --dry-run -a --delete src/ dst/",
+            "rsync --list-only -a --delete src/ dst/",
+            "rsync --only-write-batch=batch -a --delete src/ dst/",
+            "rsync -a --delete --max-delete=0 src/ dst/",
+            "rsync -a --delete --max-delete=-1 src/ dst/",
+            "rsync --delete src/ dst/",
+            "rsync --filter --delete src/ dst/",
+            "rsync --exclude --delete src/ dst/",
+            "rsync -- --delete src/ dst/",
+            "rsync --help -a --delete src/ dst/",
+            "rsync -V -a --delete src/ dst/",
+            "rsync -a --delete src/",
+            "rsync -a --delete=now src/ dst/",
+            "rsync --future-option -a --delete src/ dst/",
+            "rsync --remove-source-files --dry-run src/file dst/",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "rsync dry-run, terminal, invalid, incomplete, bounded or positional argv was treated as effective deletion for {command:?}"
             );
         }
     }
