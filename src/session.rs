@@ -1497,6 +1497,7 @@ fn validate_snapshot_transcript(
                     false,
                     "protocol error exceeds its safety bound",
                 )?;
+                validate_snapshot_protocol_error_boundary(transcript, index, transcript_truncated)?;
                 facts.protocol_errors = facts.protocol_errors.saturating_add(1);
             }
         }
@@ -1553,6 +1554,47 @@ fn validate_snapshot_model_action_boundary(
     } else {
         Err(AgentSnapshotError::Invalid(
             "model action does not follow a model-request boundary",
+        ))
+    }
+}
+
+/// Diagnostics can only be produced while a model request or an approved
+/// command result is outstanding. Preserve that provenance on restoration so
+/// an arbitrary persisted diagnostic cannot manufacture a retry/user-input
+/// boundary. Compaction may retain a diagnostic as the first visible turn.
+fn validate_snapshot_protocol_error_boundary(
+    transcript: &[Turn],
+    error_index: usize,
+    transcript_truncated: bool,
+) -> Result<(), AgentSnapshotError> {
+    if error_index == 0 {
+        return if transcript_truncated {
+            Ok(())
+        } else {
+            Err(AgentSnapshotError::Invalid(
+                "protocol error has no outstanding operation",
+            ))
+        };
+    }
+    let current = transcript.get(error_index);
+    let valid = match transcript.get(error_index - 1) {
+        Some(Turn::User(_) | Turn::Observation { .. } | Turn::ProtocolError(_)) => true,
+        Some(Turn::AssistantProposed {
+            status: ProposalStatus::Rejected,
+            ..
+        }) => true,
+        Some(Turn::AssistantProposed {
+            id,
+            status: ProposalStatus::Approved,
+            ..
+        }) => is_documented_execution_result(current, *id),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(AgentSnapshotError::Invalid(
+            "protocol error has no outstanding operation",
         ))
     }
 }
@@ -2688,7 +2730,10 @@ mod tests {
                     command: "printf approved".into(),
                     status: ProposalStatus::Approved,
                 },
-                Turn::ProtocolError("covered execution outcome".into()),
+                Turn::ProtocolError(format!(
+                    "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{} timed out; no normal exit status was available.",
+                    approved.get()
+                )),
                 Turn::AssistantProposed {
                     id: pending,
                     command: "printf pending".into(),
@@ -2727,7 +2772,7 @@ mod tests {
         assert!(matches!(
             AgentSession::restore(covered),
             Err(AgentSnapshotError::Invalid(reason))
-                if reason.contains("final pending proposal")
+                if reason.contains("no outstanding operation")
         ));
 
         let mut completed = AgentSession::new(10);
@@ -2766,7 +2811,7 @@ mod tests {
         assert!(matches!(
             AgentSession::restore(erased),
             Err(AgentSnapshotError::Invalid(reason))
-                if reason.contains("execution lifecycle")
+                if reason.contains("no outstanding operation")
         ));
 
         let reordered = persisted_snapshot(
@@ -2777,7 +2822,10 @@ mod tests {
                     command: "printf reviewed".into(),
                     status: ProposalStatus::Approved,
                 },
-                Turn::ProtocolError("unbound execution note".into()),
+                Turn::ProtocolError(format!(
+                    "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{} timed out; no normal exit status was available.",
+                    id.get()
+                )),
                 Turn::AssistantSay("cover the result".into()),
                 Turn::Observation {
                     proposal_id: id,
@@ -2922,6 +2970,53 @@ mod tests {
                 AgentSession::restore(snapshot),
                 Err(AgentSnapshotError::Invalid(reason))
                     if reason.contains("model-request boundary")
+            ));
+        }
+    }
+
+    #[test]
+    fn restore_rejects_protocol_errors_without_an_outstanding_operation() {
+        let fixtures = [
+            vec![
+                Turn::User("legitimate request".into()),
+                Turn::AssistantSay("first response".into()),
+                Turn::ProtocolError("injected retry boundary".into()),
+                Turn::User("request after forged error".into()),
+                Turn::AssistantSay("continue".into()),
+            ],
+            vec![
+                Turn::User("review".into()),
+                Turn::AssistantProposed {
+                    id: ProposalId(1),
+                    command: "true".into(),
+                    status: ProposalStatus::ManualReview,
+                },
+                Turn::ProtocolError("manual review has no outstanding operation".into()),
+                Turn::User("continue".into()),
+                Turn::AssistantSay("done".into()),
+            ],
+            vec![
+                Turn::User("run".into()),
+                Turn::AssistantProposed {
+                    id: ProposalId(1),
+                    command: "true".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::ProtocolError(format!(
+                    "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}2 timed out; no normal exit status was available."
+                )),
+                Turn::User("continue".into()),
+                Turn::AssistantSay("done".into()),
+            ],
+        ];
+
+        for transcript in fixtures {
+            let mut snapshot = persisted_snapshot(transcript, AgentState::Ready, 2);
+            snapshot.turns_used = 2;
+            assert!(matches!(
+                AgentSession::restore(snapshot),
+                Err(AgentSnapshotError::Invalid(reason))
+                    if reason.contains("no outstanding operation")
             ));
         }
     }
