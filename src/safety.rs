@@ -5409,6 +5409,191 @@ fn dd_writes_raw_device(tokens: &[String]) -> bool {
     })
 }
 
+fn traditional_date_operand_sets_clock(value: &str) -> bool {
+    let (stamp, seconds) = value
+        .split_once('.')
+        .map_or((value, None), |(stamp, seconds)| (stamp, Some(seconds)));
+    if !matches!(stamp.len(), 8 | 10 | 12) || !stamp.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(seconds) = seconds {
+        if seconds.len() != 2
+            || !seconds.bytes().all(|byte| byte.is_ascii_digit())
+            || seconds.parse::<u8>().map_or(true, |seconds| seconds > 60)
+        {
+            return false;
+        }
+    }
+
+    let field = |start, end| stamp[start..end].parse::<u8>().ok();
+    let (Some(month), Some(day), Some(hour), Some(minute)) =
+        (field(0, 2), field(2, 4), field(4, 6), field(6, 8))
+    else {
+        return false;
+    };
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => 29,
+        _ => return false,
+    };
+    (1..=maximum_day).contains(&day) && hour <= 23 && minute <= 59
+}
+
+fn date_sets_clock(tokens: &[String]) -> bool {
+    const LONG_OPTIONS: &[&str] = &[
+        "date",
+        "debug",
+        "file",
+        "iso-8601",
+        "resolution",
+        "rfc-email",
+        "rfc-3339",
+        "reference",
+        "set",
+        "universal",
+        "utc",
+        "help",
+        "version",
+    ];
+
+    let mut index = 1usize;
+    let mut options = true;
+    let mut explicit_set = false;
+    let mut display_sources = 0usize;
+    let mut traditional_incompatible_option = false;
+    let mut positionals = Vec::new();
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = argument.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(spelling, LONG_OPTIONS) {
+                    Some(resolved @ ("date" | "file" | "reference" | "rfc-3339" | "set")) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        traditional_incompatible_option = true;
+                        match resolved {
+                            "set" => explicit_set = true,
+                            "date" | "file" | "reference" => display_sources += 1,
+                            "rfc-3339" if !matches!(value, "date" | "seconds" | "ns") => {
+                                return false;
+                            }
+                            "rfc-3339" => {}
+                            _ => unreachable!("date value option list is exhaustive"),
+                        }
+                    }
+                    Some("iso-8601") => {
+                        if attached.is_some_and(|precision| {
+                            !matches!(precision, "date" | "hours" | "minutes" | "seconds" | "ns")
+                        }) {
+                            return false;
+                        }
+                        traditional_incompatible_option = true;
+                        index += 1;
+                    }
+                    Some("resolution") if attached.is_none() => {
+                        display_sources += 1;
+                        traditional_incompatible_option = true;
+                        index += 1;
+                    }
+                    Some("debug" | "rfc-email") if attached.is_none() => {
+                        traditional_incompatible_option = true;
+                        index += 1;
+                    }
+                    Some("universal" | "utc") if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'u' => {}
+                        'R' => traditional_incompatible_option = true,
+                        'I' => {
+                            let value_start = offset + flag.len_utf8();
+                            if value_start < short.len()
+                                && !matches!(
+                                    &short[value_start..],
+                                    "date" | "hours" | "minutes" | "seconds" | "ns"
+                                )
+                            {
+                                return false;
+                            }
+                            traditional_incompatible_option = true;
+                            break;
+                        }
+                        'd' | 'f' | 'r' | 's' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            traditional_incompatible_option = true;
+                            if flag == 's' {
+                                explicit_set = true;
+                            } else {
+                                display_sources += 1;
+                            }
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals.push(argument);
+        if positionals.len() > 1 {
+            return false;
+        }
+        index += 1;
+    }
+
+    if display_sources > 1 || explicit_set && display_sources > 0 {
+        return false;
+    }
+    if explicit_set {
+        return positionals
+            .first()
+            .is_none_or(|format| format.starts_with('+'));
+    }
+    display_sources == 0
+        && !traditional_incompatible_option
+        && positionals
+            .first()
+            .is_some_and(|operand| traditional_date_operand_sets_clock(operand))
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6656,11 +6841,7 @@ fn dangerous_segment(
         "hostname" if effective.len() > 1 => {
             return Some("hostname arguments can change the system hostname");
         }
-        "date"
-            if effective[1..]
-                .iter()
-                .any(|arg| arg == "-s" || arg == "--set" || arg.starts_with("--set=")) =>
-        {
+        "date" if date_sets_clock(selected.tokens) => {
             return Some("date --set changes the system clock");
         }
         "truncate" if truncate_changes_file_length(selected.tokens) => {
@@ -8820,6 +9001,57 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "dd terminal, zero-count, non-device, invalid, overridden output, or command-name substring was treated as a raw device write for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn date_distinguishes_clock_setting_from_display_modes() {
+        for command in [
+            "date -s tomorrow",
+            "date -stomorrow",
+            "date --set tomorrow",
+            "date --se=tomorrow",
+            "date 01010000",
+            "date 123123592026.60",
+            "date -u 010100002027",
+            "date -- 01010000",
+            "env date -s tomorrow",
+            "nohup date 01010000",
+            "printf ignored | xargs date -s tomorrow",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "date",
+            "date -u",
+            "date +%s",
+            "date -- +%s",
+            "date --help --set tomorrow",
+            "date --version 01010000",
+            "date --set",
+            "date -s ''",
+            "date -d --set",
+            "date --date=--set",
+            "date -f --set",
+            "date -r --set",
+            "date -Iseconds",
+            "date --iso-8601=seconds",
+            "date --resolution",
+            "date -d now 01010000",
+            "date -R 01010000",
+            "date 00000000",
+            "date 02302359",
+            "date 01012460",
+            "date 01010000 extra",
+            "date --iso-8601=bogus --set=tomorrow",
+            "date --unknown --set=tomorrow",
+            "dater -s tomorrow",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "date display, terminal, incomplete, invalid, or command-name substring was treated as a clock change for {command:?}"
             );
         }
     }
