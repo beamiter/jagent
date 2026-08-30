@@ -4533,6 +4533,29 @@ fn systemctl_disrupts_state(tokens: &[String]) -> bool {
             )
 }
 
+fn service_changes_state(tokens: &[String]) -> bool {
+    let arguments = tokens.get(1..).unwrap_or_default();
+
+    // Debian's service wrapper recognizes these terminal options in every
+    // argument position, before it dispatches an init script. Its historical
+    // `--h*` spelling intentionally includes strings such as `--hello`.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-h" | "-V" | "--version") || argument.starts_with("--h")
+    }) {
+        return false;
+    }
+    if arguments == ["--status-all"] {
+        return false;
+    }
+
+    // The first argument names an arbitrary executable init script and the
+    // second is passed through as its action. Only the conventional status
+    // action is a query; unknown actions cannot be assumed to be read-only.
+    arguments
+        .get(1)
+        .is_some_and(|action| action.as_str() != "status")
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -5191,12 +5214,8 @@ fn dangerous_segment(
         "systemctl" if systemctl_disrupts_state(selected.tokens) => {
             return Some("systemctl changes or disrupts system or service state");
         }
-        "service"
-            if effective[1..]
-                .iter()
-                .any(|token| matches!(token.as_str(), "stop" | "restart")) =>
-        {
-            return Some("service command can stop or restart system services");
+        "service" if service_changes_state(selected.tokens) => {
+            return Some("service dispatches a state-changing init-script action");
         }
         _ => {}
     }
@@ -6622,6 +6641,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "systemctl query, dry-run, invalid argv, option value, or name substring was treated as a disruptive verb for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn service_classifies_the_action_slot_and_terminal_options() {
+        for command in [
+            "service jagent start",
+            "service jagent stop",
+            "service jagent restart",
+            "service jagent try-restart",
+            "service jagent reload",
+            "service jagent force-reload",
+            "service jagent force-stop",
+            "service jagent --full-restart",
+            "service jagent rotate-secrets",
+            "service --status-all stop",
+            "env service jagent restart",
+            "nohup service jagent reload",
+            "printf ignored | xargs service jagent restart",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "service jagent status",
+            "service stop status",
+            "service restart status extra",
+            "service --status-all",
+            "service jagent",
+            "service",
+            "service --help jagent stop",
+            "service jagent -h stop",
+            "service jagent --hello stop",
+            "service jagent --version stop",
+            "service jagent -V restart",
+            "services jagent stop",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "service query, incomplete argv, terminal option, or command-name substring was treated as a state change for {command:?}"
             );
         }
     }
