@@ -4775,6 +4775,156 @@ fn cfdisk_can_write_partition_table(tokens: &[String]) -> bool {
     !read_only && targets <= 1
 }
 
+fn parted_changes_partition_table(tokens: &[String]) -> bool {
+    const COMMANDS: &[&str] = &[
+        "align-check",
+        "help",
+        "mklabel",
+        "mktable",
+        "mkpart",
+        "name",
+        "print",
+        "quit",
+        "rescue",
+        "resizepart",
+        "rm",
+        "select",
+        "disk_set",
+        "disk_toggle",
+        "set",
+        "toggle",
+        "type",
+        "unit",
+        "version",
+    ];
+
+    let mut index = 1usize;
+    let mut options = true;
+    let mut list = false;
+    let mut fix = false;
+    let mut positionals = Vec::new();
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "help", "list", "machine", "json", "script", "fix", "version", "align",
+                    ],
+                ) {
+                    Some("align") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("list") if attached.is_none() => {
+                        list = true;
+                        index += 1;
+                    }
+                    Some("fix") if attached.is_none() => {
+                        fix = true;
+                        index += 1;
+                    }
+                    Some("machine" | "json" | "script") if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'l' => list = true,
+                        'f' => fix = true,
+                        'm' | 'j' | 's' => {}
+                        'a' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        'h' | 'v' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals.push(option);
+        index += 1;
+    }
+
+    // --fix may repair inconsistent on-disk metadata while an otherwise
+    // read-only command opens it, including global --list enumeration.
+    if fix {
+        return true;
+    }
+    if list {
+        return false;
+    }
+    // With no DEVICE GNU Parted selects the first block device. With a DEVICE
+    // but no command it enters the writable interactive prompt.
+    if positionals.len() <= 1 {
+        return true;
+    }
+
+    let mut command_index = 1usize;
+    while let Some(spelling) = positionals.get(command_index).copied() {
+        let Some(command) = unique_long_option(spelling, COMMANDS) else {
+            return false;
+        };
+        command_index += 1;
+        match command {
+            "mklabel" | "mktable" | "mkpart" | "name" | "rescue" | "resizepart" | "rm"
+            | "disk_set" | "disk_toggle" | "set" | "toggle" | "type" => return true,
+            "align-check" => command_index = command_index.saturating_add(2),
+            "help" => command_index = command_index.saturating_add(1),
+            "print" => {
+                if positionals.get(command_index).is_some_and(|argument| {
+                    matches!(*argument, "devices" | "free" | "list" | "all")
+                }) {
+                    command_index += 1;
+                }
+            }
+            "quit" => return false,
+            "select" | "unit" => command_index = command_index.saturating_add(1),
+            "version" => {}
+            _ => unreachable!("parted command list is exhaustive"),
+        }
+    }
+    false
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5799,8 +5949,8 @@ fn dangerous_segment(
         "cfdisk" if cfdisk_can_write_partition_table(selected.tokens) => {
             return Some("cfdisk can interactively change a disk partition table");
         }
-        "parted" => {
-            return Some("disk partition tools can destroy filesystem data");
+        "parted" if parted_changes_partition_table(selected.tokens) => {
+            return Some("parted can change a disk partition table");
         }
         "find" if effective[1..].iter().any(|token| token == "-delete") => {
             return Some("find -delete permanently removes matched paths");
@@ -7374,6 +7524,76 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "cfdisk read-only, terminal, invalid argv, option value, or command-name substring was treated as writable partition editing for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parted_distinguishes_queries_from_partition_commands_and_auto_fix() {
+        for command in [
+            "parted",
+            "parted /dev/sdb",
+            "parted --script /dev/sdb",
+            "parted /dev/sdb mklabel gpt",
+            "parted /dev/sdb mktable msdos",
+            "parted /dev/sdb mkpart primary 1MiB 2MiB",
+            "parted /dev/sdb mkla gpt",
+            "parted /dev/sdb mkp primary 1MiB 2MiB",
+            "parted /dev/sdb name 1 data",
+            "parted /dev/sdb rescue 1MiB 2MiB",
+            "parted /dev/sdb resizepart 1 3MiB",
+            "parted /dev/sdb resi 1 3MiB",
+            "parted /dev/sdb rm 1",
+            "parted /dev/sdb disk_set pmbr_boot on",
+            "parted /dev/sdb disk_s pmbr_boot on",
+            "parted /dev/sdb disk_toggle pmbr_boot",
+            "parted /dev/sdb set 1 boot on",
+            "parted /dev/sdb toggle 1 boot",
+            "parted /dev/sdb type 1 0x83",
+            "parted /dev/sdb ty 1 0x83",
+            "parted /dev/sdb print free rm 1",
+            "parted --align rm /dev/sdb rm 1",
+            "parted --script --fix /dev/sdb print",
+            "parted --fix --list",
+            "parted -- -l",
+            "env parted /dev/sdb rm 1",
+            "nohup parted --script /dev/sdb mklabel gpt",
+            "printf ignored | xargs parted /dev/sdb rm 1",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "parted --list",
+            "parted --list /dev/sdb rm 1",
+            "parted /dev/sdb print",
+            "parted /dev/sdb print devices",
+            "parted /dev/sdb print free",
+            "parted /dev/sdb print all",
+            "parted /dev/sdb p",
+            "parted /dev/sdb align-check min 1",
+            "parted /dev/sdb al min 1",
+            "parted /dev/sdb align-check min rm",
+            "parted /dev/sdb help rm",
+            "parted /dev/sdb h rm",
+            "parted /dev/sdb unit s print",
+            "parted /dev/sdb u s p",
+            "parted /dev/sdb select rm print",
+            "parted /dev/sdb sel rm p",
+            "parted /dev/sdb version",
+            "parted /dev/sdb quit rm 1",
+            "parted /dev/sdb q rm 1",
+            "parted -a rm /dev/sdb print",
+            "parted --help /dev/sdb rm 1",
+            "parted --version /dev/sdb rm 1",
+            "parted --align",
+            "parted --unknown /dev/sdb rm 1",
+            "parted /dev/sdb not-a-command",
+            "myparted /dev/sdb rm 1",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "parted query, terminal, invalid argv, command parameter, or command-name substring was treated as partition mutation for {command:?}"
             );
         }
     }
