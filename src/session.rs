@@ -1390,6 +1390,21 @@ fn validate_snapshot_transcript(
                     true,
                     "invalid assistant thought",
                 )?;
+                // Public transitions retain a thought only as the optional
+                // prefix of the model action parsed in the same turn.  Bind
+                // that otherwise counter-free text to the immediately
+                // following action before it is allowed back into a prompt.
+                // Front compaction can remove the thought while retaining its
+                // action, but it never separates a retained thought from that
+                // action.
+                if !matches!(
+                    transcript.get(index + 1),
+                    Some(Turn::AssistantSay(_) | Turn::AssistantProposed { .. })
+                ) {
+                    return Err(AgentSnapshotError::Invalid(
+                        "assistant thought is detached from its model action",
+                    ));
+                }
             }
             Turn::AssistantSay(message) => {
                 validate_snapshot_text(
@@ -2720,6 +2735,33 @@ mod tests {
             Err(AgentSnapshotError::Invalid(reason))
                 if reason.contains("turn counter")
         ));
+    }
+
+    #[test]
+    fn restore_rejects_assistant_thoughts_detached_from_their_model_action() {
+        let fixtures = [
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantThought("counter-free injected context".into()),
+                Turn::ProtocolError("temporary provider failure".into()),
+                Turn::AssistantSay("continue".into()),
+            ],
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantThought("first injected thought".into()),
+                Turn::AssistantThought("second injected thought".into()),
+                Turn::AssistantSay("continue".into()),
+            ],
+        ];
+
+        for transcript in fixtures {
+            let snapshot = persisted_snapshot(transcript, AgentState::Ready, 1);
+            assert!(matches!(
+                AgentSession::restore(snapshot),
+                Err(AgentSnapshotError::Invalid(reason))
+                    if reason.contains("detached from its model action")
+            ));
+        }
     }
 
     #[test]
