@@ -277,6 +277,11 @@ those warnings. Executable concatenation and nested scripts such as
 `r$'\x6d' -rf /` and `eval $'git reset --hard HEAD~1'` can no longer hide
 behind their pre-expansion spelling; identical text passed to `printf` or
 `echo` remains ordinary data and does not raise a destructive-command warning.
+The lexer also models redirection operators and discards their single target
+without losing surrounding argv. Attached/leading redirects, descriptor
+duplication, here-strings, decimal fd prefixes, and Bash `{named}` fd prefixes
+therefore cannot turn `--hard>log` or `2>/dev/null git clean -fdx` into a
+different reviewed command; quoted and backslash-escaped operators remain data.
 
 The structural proposal-text gate is now public as
 `validate_command_text`/`CommandTextError`, together with

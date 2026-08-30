@@ -219,12 +219,18 @@ struct ShellSegment {
 
 /// A deliberately small shell lexer for warning heuristics. It is not used to
 /// authorize execution. Its job is to retain quote grouping and recognize
-/// operators without surrounding spaces, two cases where `split_whitespace`
-/// silently missed destructive commands such as `true;rm -rf "/"`.
+/// operators and redirections without surrounding spaces, cases where
+/// `split_whitespace` silently missed destructive commands such as
+/// `true;rm -rf "/"` or `git reset --hard>audit.log`.
 fn shell_segments(command: &str) -> Vec<ShellSegment> {
-    fn finish_word(word: &mut String, words: &mut Vec<String>) {
+    fn finish_word(word: &mut String, words: &mut Vec<String>, discard_word: &mut bool) {
         if !word.is_empty() {
-            words.push(std::mem::take(word));
+            if *discard_word {
+                word.clear();
+                *discard_word = false;
+            } else {
+                words.push(std::mem::take(word));
+            }
         }
     }
 
@@ -232,15 +238,43 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
         word: &mut String,
         words: &mut Vec<String>,
         segments: &mut Vec<ShellSegment>,
+        discard_word: &mut bool,
         pipe_after: bool,
     ) {
-        finish_word(word, words);
+        finish_word(word, words, discard_word);
+        // An operator without a target is malformed; do not let its pending
+        // discard consume the first word of a later shell segment.
+        *discard_word = false;
         if !words.is_empty() {
             segments.push(ShellSegment {
                 words: std::mem::take(words),
                 pipe_after,
             });
         }
+    }
+
+    fn begin_redirection(word: &mut String, words: &mut Vec<String>, discard_word: &mut bool) {
+        let named_fd = word
+            .strip_prefix('{')
+            .and_then(|name| name.strip_suffix('}'))
+            .is_some_and(|name| {
+                let mut bytes = name.bytes();
+                bytes
+                    .next()
+                    .is_some_and(|byte| byte == b'_' || byte.is_ascii_alphabetic())
+                    && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+            });
+        if !*discard_word
+            && !word.is_empty()
+            && (word.bytes().all(|byte| byte.is_ascii_digit()) || named_fd)
+        {
+            // An adjacent decimal or Bash `{name}` word is an IO-number/fd
+            // allocation prefix (`2>file`, `{log}>file`), not argv.
+            word.clear();
+        } else {
+            finish_word(word, words, discard_word);
+        }
+        *discard_word = true;
     }
 
     // Bash-compatible ANSI-C quotes are expanded before execution. Decode the
@@ -320,6 +354,7 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
     let mut segments = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
+    let mut discard_word = false;
     let mut quote = None;
     // Command substitutions execute even while surrounded by double quotes.
     // Each entry stores the closing delimiter and the quote mode to restore
@@ -344,12 +379,24 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
                 }
                 '$' if characters.peek() == Some(&'(') => {
                     characters.next();
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                     substitutions.push((')', quote));
                     quote = None;
                 }
                 '`' => {
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                     substitutions.push(('`', quote));
                     quote = None;
                 }
@@ -361,7 +408,13 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
                         .last()
                         .is_some_and(|(closing, _)| *closing == character) =>
                 {
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                     quote = substitutions.pop().and_then(|(_, quote)| quote);
                 }
                 '\'' | '"' => quote = Some(character),
@@ -382,33 +435,109 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
                         // `|&` is still a pipeline.
                         characters.next();
                     }
-                    finish_segment(&mut word, &mut words, &mut segments, !is_or);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        !is_or,
+                    );
+                }
+                '&' if characters.peek() == Some(&'>') => {
+                    characters.next();
+                    if characters.peek() == Some(&'>') {
+                        characters.next();
+                    }
+                    begin_redirection(&mut word, &mut words, &mut discard_word);
                 }
                 '&' => {
                     if characters.peek() == Some(&'&') {
                         characters.next();
                     }
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                 }
                 '$' if characters.peek() == Some(&'(') => {
                     characters.next();
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                     substitutions.push((')', quote));
                 }
                 '`' => {
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
                     substitutions.push(('`', quote));
                 }
-                ';' | '\n' | '\r' | '(' | ')' => {
-                    finish_segment(&mut word, &mut words, &mut segments, false);
+                '<' | '>' if characters.peek() == Some(&'(') => {
+                    characters.next();
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
+                    substitutions.push((')', quote));
                 }
-                character if character.is_whitespace() => finish_word(&mut word, &mut words),
+                '<' | '>' => {
+                    let first = character;
+                    let mut less_count = usize::from(first == '<');
+                    while characters
+                        .peek()
+                        .is_some_and(|next| matches!(next, '<' | '>'))
+                    {
+                        if characters.next() == Some('<') {
+                            less_count += 1;
+                        }
+                    }
+                    let redirect_suffix = characters
+                        .peek()
+                        .is_some_and(|next| matches!(next, '&' | '|'))
+                        || (less_count >= 2 && characters.peek() == Some(&'-'));
+                    if redirect_suffix {
+                        characters.next();
+                    }
+                    begin_redirection(&mut word, &mut words, &mut discard_word);
+                }
+                ';' | '\n' | '\r' | '(' | ')' => {
+                    finish_segment(
+                        &mut word,
+                        &mut words,
+                        &mut segments,
+                        &mut discard_word,
+                        false,
+                    );
+                }
+                character if character.is_whitespace() => {
+                    finish_word(&mut word, &mut words, &mut discard_word)
+                }
                 _ => word.push(character),
             },
             Some(_) => unreachable!("only shell quote characters are stored"),
         }
     }
-    finish_segment(&mut word, &mut words, &mut segments, false);
+    finish_segment(
+        &mut word,
+        &mut words,
+        &mut segments,
+        &mut discard_word,
+        false,
+    );
     segments
 }
 
@@ -1267,6 +1396,39 @@ mod tests {
             "curl https://example.invalid/x | xargs --unknown sh",
             "curl https://example.invalid/x | xargs --help sh",
             "curl https://example.invalid/x | xargs",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "false positive for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redirections_do_not_hide_the_command_or_its_fixed_arguments() {
+        for command in [
+            "rm -rf />/dev/null",
+            "git reset --hard>reset.log",
+            "2>/dev/null git clean -fdx",
+            ">/tmp/audit.log git restore src/main.rs",
+            "{audit}>/tmp/audit.log rm -rf /",
+            "exec 3>trace.log rm -rf /",
+            "git checkout 2>&1 -- src/main.rs",
+            "git push --force&>push.log origin main",
+            "rm -rf /<<<ignored",
+            "cat <(rm -rf /)",
+            "cat >(git reset --hard HEAD~1)",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "printf '%s' 'git reset --hard>log'",
+            r"printf '%s' git\ reset\ --hard\>log",
+            "echo > rm -rf /",
+            "printf '%s' '<(rm -rf /)'",
+            "cat < safe.txt",
+            r"test 2 \> file",
         ] {
             assert!(
                 is_dangerous(command).is_none(),

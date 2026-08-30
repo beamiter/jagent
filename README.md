@@ -312,7 +312,10 @@ option values, so network-controlled argv cannot hide a shell behind
 would receive without `xargs`; runtime data is not guessed.
 Classification also interprets shell ANSI-C quoted executable/script text, so
 the review warning describes the command after `$'\xNN'`, octal, or Unicode
-escape expansion rather than trusting its encoded spelling.
+escape expansion rather than trusting its encoded spelling. Attached and
+leading redirections are tokenized separately from argv—including numeric and
+`{named}` fd prefixes—so `--hard>log` or `2>/dev/null git clean -fdx` cannot
+change which command and fixed arguments receive review.
 
 Use `validate_command_text` before an integration copies a proposal into an
 approval card, persistence adapter, or review-only shell insertion. It applies

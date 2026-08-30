@@ -154,6 +154,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behind the same bounded `xargs` chain. Dispatching `rm -rf /`, destructive
   Git operations, or elevation wrappers through `xargs` no longer suppresses
   the warning, while runtime stdin content is deliberately not guessed.
+- Shell redirections are now excluded from the warning classifier's argv while
+  preserving the command on either side. Attached, leading, fd-duplication,
+  here-string, numeric-fd, and Bash `{named}`-fd forms can no longer disguise
+  `--hard`, a top-level removal target, or the real executable.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as
