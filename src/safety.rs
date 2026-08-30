@@ -4717,6 +4717,64 @@ fn sfdisk_changes_partition_table(tokens: &[String]) -> bool {
     }
 }
 
+fn cfdisk_can_write_partition_table(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut read_only = false;
+    let mut targets = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &["color", "zero", "lock", "read-only", "help", "version"],
+                ) {
+                    Some("color" | "lock") => index += 1,
+                    Some("zero") if attached.is_none() => index += 1,
+                    Some("read-only") if attached.is_none() => {
+                        read_only = true;
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'z' => {}
+                        'r' => read_only = true,
+                        // -L takes an optional attached value. If it has one,
+                        // the remainder is not another option cluster.
+                        'L' if offset + flag.len_utf8() < short.len() => break,
+                        'L' => {}
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += 1;
+        index += 1;
+    }
+
+    // With no explicit target cfdisk opens its historical default (/dev/sda).
+    // More than one target is rejected before entering the editor.
+    !read_only && targets <= 1
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5738,7 +5796,10 @@ fn dangerous_segment(
         "sfdisk" if sfdisk_changes_partition_table(selected.tokens) => {
             return Some("sfdisk changes a disk partition table");
         }
-        "cfdisk" | "parted" => {
+        "cfdisk" if cfdisk_can_write_partition_table(selected.tokens) => {
+            return Some("cfdisk can interactively change a disk partition table");
+        }
+        "parted" => {
             return Some("disk partition tools can destroy filesystem data");
         }
         "find" if effective[1..].iter().any(|token| token == "-delete") => {
@@ -7275,6 +7336,44 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "sfdisk query, no-act, incomplete or invalid argv, option value, or command-name substring was treated as a partition mutation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cfdisk_distinguishes_forced_read_only_from_interactive_writes() {
+        for command in [
+            "cfdisk",
+            "cfdisk /dev/sdb",
+            "cfdisk --zero /dev/sdb",
+            "cfdisk --lock=nonblock /dev/sdb",
+            "cfdisk --color=always /dev/sdb",
+            "cfdisk --color=--read-only",
+            "cfdisk -Lr /dev/sdb",
+            "cfdisk -- -r",
+            "env cfdisk /dev/sdb",
+            "nohup cfdisk --zero /dev/sdb",
+            "printf ignored | xargs cfdisk /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "cfdisk --read-only",
+            "cfdisk -r /dev/sdb",
+            "cfdisk -rz /dev/sdb",
+            "cfdisk -rL /dev/sdb",
+            "cfdisk --lock --read-only /dev/sdb",
+            "cfdisk --read-only -- /dev/sdb",
+            "cfdisk --help /dev/sdb",
+            "cfdisk --version /dev/sdb",
+            "cfdisk /dev/sdb /dev/sdc",
+            "cfdisk --unknown /dev/sdb",
+            "mycfdisk /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "cfdisk read-only, terminal, invalid argv, option value, or command-name substring was treated as writable partition editing for {command:?}"
             );
         }
     }
