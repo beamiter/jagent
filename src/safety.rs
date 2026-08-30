@@ -419,6 +419,11 @@ fn git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
 fn dangerous_git_push(arguments: &[String]) -> bool {
     let mut index = 0;
     let mut options = true;
+    // The first positional is the repository, not a refspec, unless --repo
+    // supplied it already.  Remote names and local paths may themselves start
+    // with '+' or ':', so treating every positional alike creates a warning
+    // for a non-forcing `git push +backup main`.
+    let mut repository_seen = false;
 
     while let Some(token) = arguments.get(index).map(String::as_str) {
         if options && token == "--" {
@@ -427,14 +432,27 @@ fn dangerous_git_push(arguments: &[String]) -> bool {
             continue;
         }
         if options && token.starts_with("--") {
-            if token.starts_with("--force") || matches!(token, "--mirror" | "--prune" | "--delete")
+            // --force-if-includes is only an additional safety check.  Git
+            // documents it as a no-op without --force-with-lease, which is
+            // independently caught below when present.
+            if token != "--force-if-includes"
+                && (token.starts_with("--force")
+                    || matches!(token, "--mirror" | "--prune" | "--delete"))
             {
                 return true;
+            }
+            if token.starts_with("--repo=") {
+                repository_seen = true;
+                index += 1;
+                continue;
             }
             let takes_value = matches!(
                 token,
                 "--repo" | "--receive-pack" | "--exec" | "--push-option"
             );
+            if token == "--repo" {
+                repository_seen = true;
+            }
             index += if takes_value { 2 } else { 1 };
             continue;
         }
@@ -457,7 +475,16 @@ fn dangerous_git_push(arguments: &[String]) -> bool {
             index += 1;
             continue;
         }
-        if token.starts_with('+') || token.starts_with(':') {
+        if !repository_seen {
+            repository_seen = true;
+            index += 1;
+            continue;
+        }
+        // A leading '+' permits a non-fast-forward update.  An empty source
+        // (`:dst`) deletes dst, except for the documented lone `:` refspec,
+        // which merely pushes matching branches under normal fast-forward
+        // rules.
+        if token.starts_with('+') || (token.starts_with(':') && token != ":") {
             return true;
         }
         index += 1;
@@ -839,9 +866,17 @@ mod tests {
         assert!(is_dangerous("git push origin +main").is_some());
         assert!(is_dangerous("git push --mirror origin").is_some());
         assert!(is_dangerous("git push --prune origin").is_some());
+        assert!(is_dangerous("git push --repo=origin +main").is_some());
+        assert!(is_dangerous("git push --repo origin :obsolete").is_some());
+        assert!(is_dangerous("git push -- origin :obsolete").is_some());
         assert!(is_dangerous("git push -o +audit origin main").is_none());
         assert!(is_dangerous("git push -o:review origin main").is_none());
         assert!(is_dangerous("git push -o -d origin main").is_none());
+        assert!(is_dangerous("git push +backup main").is_none());
+        assert!(is_dangerous("git push :backup main").is_none());
+        assert!(is_dangerous("git push origin :").is_none());
+        assert!(is_dangerous("git push --repo=origin :").is_none());
+        assert!(is_dangerous("git push --force-if-includes origin main").is_none());
         assert!(is_dangerous("systemctl reboot").is_some());
         assert!(is_dangerous("docker system prune -af").is_some());
         assert!(is_dangerous("hostname build-node").is_some());
