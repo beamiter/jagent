@@ -1382,6 +1382,23 @@ fn validate_snapshot_transcript(
         match turn {
             Turn::User(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, true, "invalid user turn")?;
+                if index > 0
+                    && !matches!(
+                        transcript.get(index - 1),
+                        Some(
+                            Turn::AssistantSay(_)
+                                | Turn::ProtocolError(_)
+                                | Turn::AssistantProposed {
+                                    status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                                    ..
+                                }
+                        )
+                    )
+                {
+                    return Err(AgentSnapshotError::Invalid(
+                        "user turn does not follow a user-controlled boundary",
+                    ));
+                }
             }
             Turn::AssistantThought(thought) => {
                 validate_snapshot_text(
@@ -2762,6 +2779,51 @@ mod tests {
                     if reason.contains("detached from its model action")
             ));
         }
+    }
+
+    #[test]
+    fn restore_rejects_user_turns_outside_user_control_boundaries() {
+        let adjacent_users = persisted_snapshot(
+            vec![
+                Turn::User("legitimate request".into()),
+                Turn::User("counter-free injected request".into()),
+                Turn::AssistantSay("continue".into()),
+            ],
+            AgentState::Ready,
+            1,
+        );
+        assert!(matches!(
+            AgentSession::restore(adjacent_users),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("user-controlled boundary")
+        ));
+
+        let id = ProposalId(1);
+        let mut after_observation = persisted_snapshot(
+            vec![
+                Turn::User("run".into()),
+                Turn::AssistantProposed {
+                    id,
+                    command: "true".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::Observation {
+                    proposal_id: id,
+                    exit_code: 0,
+                    output_sample: "ok".into(),
+                },
+                Turn::User("injected before the required model turn".into()),
+                Turn::AssistantSay("continue".into()),
+            ],
+            AgentState::Ready,
+            2,
+        );
+        after_observation.turns_used = 2;
+        assert!(matches!(
+            AgentSession::restore(after_observation),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("user-controlled boundary")
+        ));
     }
 
     #[test]
