@@ -119,6 +119,14 @@ fn patterns() -> &'static [SecretPattern] {
                 "${prefix}[REDACTED:url-query-secret]",
                 r"(?i)(?P<prefix>[?&#](?:access_token|refresh_token|auth_token|api_key|apikey|token|signature|sig|x-amz-signature|x-goog-signature)=)[A-Za-z0-9._~+/%=\-]{8,}",
             ),
+            // Explicit credential settings are high-confidence even when the
+            // quoted value contains spaces or punctuation. Match escaped
+            // quote pairs as one unit so a JSON/shell escape cannot redact
+            // only the prefix and leave the rest of the secret behind.
+            (
+                "${name}=[REDACTED:credential]",
+                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN|(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN))\b)["']?[ \t]*[=:][ \t]*(?:"(?:\\.|[^"\\\r\n])+"|'(?:\\.|[^'\\\r\n])+')"#,
+            ),
             // Explicit well-known secret settings catch new provider token
             // formats without treating every long opaque string as a secret.
             // Canonicalizing the assignment also avoids retaining unmatched
@@ -413,6 +421,23 @@ mod tests {
             let out = redact_secrets(input);
             assert!(out.contains("[REDACTED:credential]"), "got {out}");
         }
+
+        assert_eq!(
+            redact_secrets(r#"DB_PASSWORD="correct horse @ battery!""#),
+            "DB_PASSWORD=[REDACTED:credential]"
+        );
+        assert_eq!(
+            redact_secrets("SERVICE_CLIENT_SECRET='opaque value: !@#$%^&*()'"),
+            "SERVICE_CLIENT_SECRET=[REDACTED:credential]"
+        );
+        let escaped = r#"{"SERVICE_CLIENT_SECRET":"opaque p@ssword \"continued\" tail","safe":1}"#;
+        let out = redact_secrets(escaped);
+        assert_eq!(
+            out,
+            r#"{SERVICE_CLIENT_SECRET=[REDACTED:credential],"safe":1}"#
+        );
+        assert!(!out.contains("opaque"));
+        assert!(!out.contains("continued"));
 
         let url = "https://storage.example/object?version=3&X-Amz-Signature=abcdef0123456789abcdef0123456789&download=1";
         assert_eq!(

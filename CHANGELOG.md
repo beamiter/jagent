@@ -151,6 +151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can no longer disguise the executable in forms such as
   `$'\x72\x6d' -rf /` or hide a destructive `eval`/`sh -c` script, while the
   same spelling passed as ordinary data remains unflagged.
+- High-confidence setting redaction now consumes complete single- or
+  double-quoted credential values, including whitespace, punctuation, and
+  escaped quotes. Explicit `*_PASSWORD`, `*_SECRET`, and provider-token labels
+  no longer leak a suffix merely because the secret is not base64-shaped.
 
 - The invisible/bidirectional character set that gates every model-proposed
   command, provider model name, endpoint URL, and generated header value now

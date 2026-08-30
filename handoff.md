@@ -273,6 +273,13 @@ paths, and snapshot restoration. Review cards and shell insertion adapters can
 now call the same contract instead of hard-coding 16 KiB and rebuilding the
 control/invisible checks; passing it still never authorizes execution.
 
+The redactor now treats an explicitly labeled, quoted credential as one value
+rather than applying the old base64-like alphabet to it. Shell/JSON/TOML forms
+such as `DB_PASSWORD="correct horse @ battery!"` and values containing escaped
+quotes are removed through the closing delimiter, so punctuation cannot leave
+a secret suffix in AI-bound context. Unquoted opaque strings remain on the
+conservative format-specific path.
+
 ## Remaining integration boundaries
 
 `jagent` remains sans-IO. It now validates the request value's URL/body/header

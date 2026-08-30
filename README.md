@@ -330,6 +330,11 @@ Success is a display/transport invariant, not execution authorization.
 | `redact` | Conservative high-confidence secret scrubbing; the borrowing API is `redact_secrets_cow`. |
 | `safety` | Non-authorizing destructive-command warnings. |
 
+Secret-setting redaction is label-aware: quoted password, secret, API-key, and
+token values are removed as complete values even when they contain spaces,
+punctuation, or escaped quote characters. Unlabeled opaque strings remain
+untouched to avoid erasing ordinary hashes and identifiers.
+
 `validate_no_duplicate_members` exposes the same allocation-light recursive
 JSON preflight used by these wire decoders. Integrations can apply it to other
 already byte-bounded JSON trust boundaries before their own typed decode,
