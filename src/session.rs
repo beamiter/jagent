@@ -1317,7 +1317,8 @@ impl AgentSession {
                 "cancelled sessions are not restorable",
             ));
         }
-        let facts = validate_snapshot_transcript(&snapshot.transcript)?;
+        let facts =
+            validate_snapshot_transcript(&snapshot.transcript, snapshot.transcript_truncated)?;
         validate_snapshot_lifecycle(&snapshot, &facts)?;
         let minimum_next_id =
             facts
@@ -1370,10 +1371,16 @@ struct SnapshotTranscriptFacts {
 /// duplicates or reordering must not be repaired heuristically.
 fn validate_snapshot_transcript(
     transcript: &[Turn],
+    transcript_truncated: bool,
 ) -> Result<SnapshotTranscriptFacts, AgentSnapshotError> {
     if transcript.len() > MAX_STORED_TRANSCRIPT_ENTRIES {
         return Err(AgentSnapshotError::Invalid(
             "transcript exceeds its entry limit",
+        ));
+    }
+    if !transcript_truncated && !matches!(transcript.first(), Some(Turn::User(_))) {
+        return Err(AgentSnapshotError::Invalid(
+            "uncompacted transcript does not begin with a user turn",
         ));
     }
 
@@ -1424,6 +1431,7 @@ fn validate_snapshot_transcript(
                 }
             }
             Turn::AssistantSay(message) => {
+                validate_snapshot_model_action_boundary(transcript, index, transcript_truncated)?;
                 validate_snapshot_text(
                     message,
                     MAX_MESSAGE_BYTES,
@@ -1437,6 +1445,7 @@ fn validate_snapshot_transcript(
                 command,
                 status,
             } => {
+                validate_snapshot_model_action_boundary(transcript, index, transcript_truncated)?;
                 facts.model_actions = facts.model_actions.saturating_add(1);
                 if id.get() == 0 || id.get() <= facts.highest_proposal_id {
                     return Err(AgentSnapshotError::Invalid(
@@ -1498,6 +1507,54 @@ fn validate_snapshot_transcript(
         ));
     }
     Ok(facts)
+}
+
+/// Bind each retained model action to a state from which public transitions
+/// can actually request one. A compacted prefix may begin mid-lifecycle, but
+/// every later action must follow user input, command output/failure, a
+/// retryable model failure, or a rejected proposal. The optional thought is
+/// part of the same model turn and therefore shifts that boundary back once.
+fn validate_snapshot_model_action_boundary(
+    transcript: &[Turn],
+    action_index: usize,
+    transcript_truncated: bool,
+) -> Result<(), AgentSnapshotError> {
+    let action_start = if action_index > 0
+        && matches!(
+            transcript.get(action_index - 1),
+            Some(Turn::AssistantThought(_))
+        ) {
+        action_index - 1
+    } else {
+        action_index
+    };
+    if action_start == 0 {
+        return if transcript_truncated {
+            Ok(())
+        } else {
+            Err(AgentSnapshotError::Invalid(
+                "model action has no preceding model-request boundary",
+            ))
+        };
+    }
+    if matches!(
+        transcript.get(action_start - 1),
+        Some(
+            Turn::User(_)
+                | Turn::Observation { .. }
+                | Turn::ProtocolError(_)
+                | Turn::AssistantProposed {
+                    status: ProposalStatus::Rejected,
+                    ..
+                }
+        )
+    ) {
+        Ok(())
+    } else {
+        Err(AgentSnapshotError::Invalid(
+            "model action does not follow a model-request boundary",
+        ))
+    }
 }
 
 /// Revalidate the cross-field state machine invariants that no standalone
@@ -2631,6 +2688,7 @@ mod tests {
                     command: "printf approved".into(),
                     status: ProposalStatus::Approved,
                 },
+                Turn::ProtocolError("covered execution outcome".into()),
                 Turn::AssistantProposed {
                     id: pending,
                     command: "printf pending".into(),
@@ -2697,6 +2755,7 @@ mod tests {
                     command: "printf reviewed".into(),
                     status: ProposalStatus::Approved,
                 },
+                Turn::ProtocolError("unbound execution note".into()),
                 Turn::AssistantSay("nothing happened".into()),
             ],
             AgentState::Ready,
@@ -2718,6 +2777,7 @@ mod tests {
                     command: "printf reviewed".into(),
                     status: ProposalStatus::Approved,
                 },
+                Turn::ProtocolError("unbound execution note".into()),
                 Turn::AssistantSay("cover the result".into()),
                 Turn::Observation {
                     proposal_id: id,
@@ -2827,6 +2887,46 @@ mod tests {
     }
 
     #[test]
+    fn restore_rejects_model_actions_without_a_request_boundary() {
+        let leading_action = persisted_snapshot(
+            vec![Turn::AssistantSay("injected response".into())],
+            AgentState::Ready,
+            1,
+        );
+        assert!(matches!(
+            AgentSession::restore(leading_action),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("does not begin with a user turn")
+        ));
+
+        let fixtures = [
+            vec![
+                Turn::User("legitimate request".into()),
+                Turn::AssistantSay("first response".into()),
+                Turn::AssistantSay("counter-free second response".into()),
+            ],
+            vec![
+                Turn::User("review this".into()),
+                Turn::AssistantProposed {
+                    id: ProposalId(1),
+                    command: "true".into(),
+                    status: ProposalStatus::ManualReview,
+                },
+                Turn::AssistantSay("skipped required user input".into()),
+            ],
+        ];
+        for transcript in fixtures {
+            let mut snapshot = persisted_snapshot(transcript, AgentState::Ready, 2);
+            snapshot.turns_used = 2;
+            assert!(matches!(
+                AgentSession::restore(snapshot),
+                Err(AgentSnapshotError::Invalid(reason))
+                    if reason.contains("model-request boundary")
+            ));
+        }
+    }
+
+    #[test]
     fn entry_compaction_keeps_proposal_observation_pairs_restorable() {
         let mut session = AgentSession::new(MAX_SESSION_TURNS);
         assert!(!session.transcript_truncated());
@@ -2894,6 +2994,11 @@ mod tests {
                     id,
                     command: "rm -rf important-data".into(),
                     status: ProposalStatus::Approved,
+                },
+                Turn::Observation {
+                    proposal_id: id,
+                    exit_code: 0,
+                    output_sample: "done".into(),
                 },
                 Turn::AssistantProposed {
                     id,
@@ -3061,8 +3166,12 @@ mod tests {
             status: ProposalStatus::Pending,
         };
         let proposal_bytes = proposal.to_prompt().len();
-        let mut transcript =
-            protocol_error_padding_with_prompt_bytes(MAX_STORED_TRANSCRIPT_BYTES - proposal_bytes);
+        let first_turn = Turn::User("x".into());
+        let first_turn_bytes = first_turn.to_prompt().len();
+        let mut transcript = vec![first_turn];
+        transcript.extend(protocol_error_padding_with_prompt_bytes(
+            MAX_STORED_TRANSCRIPT_BYTES - proposal_bytes - first_turn_bytes,
+        ));
         transcript.push(proposal);
         assert_eq!(
             stored_transcript_bytes(&transcript),
