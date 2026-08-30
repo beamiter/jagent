@@ -268,7 +268,10 @@ Python 2, and PHP, matching the terminal family's correction guard rather than
 leaving the shared warning as the narrower copy. A bounded `xargs` dispatcher
 walk consumes GNU/POSIX and common BSD option values before inspecting the
 fixed child command, closing `curl | xargs sh` without treating replacement or
-count values such as `-I sh` / `-n sh` as executables.
+count values such as `-I sh` / `-n sh` as executables. The same bounded walk
+applies ordinary destructive-command classification to fixed child argv, so
+`xargs rm -rf /` and nested destructive Git/elevation forms cannot hide behind
+the dispatcher; values supplied only at runtime remain outside the heuristic.
 The lexer now also decodes Bash-compatible ANSI-C quote escapes before applying
 those warnings. Executable concatenation and nested scripts such as
 `r$'\x6d' -rf /` and `eval $'git reset --hard HEAD~1'` can no longer hide

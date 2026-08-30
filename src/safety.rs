@@ -176,7 +176,9 @@ fn is_dangerous_inner(command: &str, depth: usize) -> Option<&'static str> {
             .iter()
             .map(|word| word.to_ascii_lowercase())
             .collect();
-        if let Some(reason) = dangerous_segment(&normalized_words, depth) {
+        if let Some(reason) =
+            dangerous_segment_with_dispatch(&segment.words, &normalized_words, depth)
+        {
             return Some(reason);
         }
         // Track the whole pipeline, not only the immediately adjacent stage.
@@ -1041,6 +1043,33 @@ fn xargs_dispatched_command(tokens: &[String]) -> Option<&[String]> {
     Some(&tokens[index..])
 }
 
+/// Inspect the fixed utility behind a bounded chain of `xargs` dispatchers.
+/// Pipeline data can append arguments at runtime, but every fixed destructive
+/// argument remains reviewable here and must not be hidden by the dispatcher.
+fn dangerous_segment_with_dispatch(
+    original: &[String],
+    normalized: &[String],
+    depth: usize,
+) -> Option<&'static str> {
+    if let Some(reason) = dangerous_segment(normalized, depth) {
+        return Some(reason);
+    }
+    if depth >= 4 {
+        return None;
+    }
+
+    let effective = effective_command(original);
+    if effective.first().map(|token| command_name(token)) != Some("xargs") {
+        return None;
+    }
+    let dispatched = xargs_dispatched_command(effective)?;
+    let normalized_dispatched: Vec<String> = dispatched
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect();
+    dangerous_segment_with_dispatch(dispatched, &normalized_dispatched, depth + 1)
+}
+
 fn is_interpreter(tokens: &[String]) -> bool {
     let mut effective = effective_command(tokens);
     // A bounded dispatcher walk keeps the classifier allocation-free and
@@ -1285,6 +1314,33 @@ mod tests {
             "xargs --version sh",
         ] {
             assert_eq!(command(input), None, "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn xargs_dispatchers_do_not_hide_fixed_destructive_commands() {
+        for command in [
+            "printf ignored | xargs rm -rf /",
+            "find cache -print | xargs git clean -fdx",
+            "printf service | xargs sudo systemctl restart",
+            "printf ref | env nohup xargs -0 xargs -- git reset --hard HEAD~1",
+            "printf old | xargs -P4 git push --delete origin old",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "printf rm | xargs -I rm printf '%s'",
+            "printf sh | xargs -n sh printf '%s'",
+            "printf x | xargs echo 'rm -rf /'",
+            "printf x | xargs git status",
+            "printf x | xargs --unknown rm -rf /",
+            "printf x | xargs",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "false positive for {command:?}"
+            );
         }
     }
 

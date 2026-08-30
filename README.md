@@ -307,7 +307,9 @@ pipeline through intermediate filters before an interpreter, rather than
 assuming one benign-looking stage makes downloaded bytes trustworthy. It also
 looks through a bounded chain of `xargs` dispatchers while consuming their
 option values, so network-controlled argv cannot hide a shell behind
-`xargs -0/-n/-I`.
+`xargs -0/-n/-I`. The same dispatcher walk reviews its fixed child argv, so
+`xargs rm -rf /` or a nested destructive Git command retains the warning it
+would receive without `xargs`; runtime data is not guessed.
 Classification also interprets shell ANSI-C quoted executable/script text, so
 the review warning describes the command after `$'\xNN'`, octal, or Unicode
 escape expansion rather than trusting its encoded spelling.
