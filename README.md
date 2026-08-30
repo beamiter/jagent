@@ -316,6 +316,14 @@ escape expansion rather than trusting its encoded spelling. Attached and
 leading redirections are tokenized separately from argv—including numeric and
 `{named}` fd prefixes—so `--hard>log` or `2>/dev/null git clean -fdx` cannot
 change which command and fixed arguments receive review.
+GNU `env -S` / `--split-string` wrappers are decoded with their own whitespace,
+quote, comment, and escape grammar before the same review. Generated argv is
+combined with trailing argv and bounded through nested wrappers; unique GNU
+long-option abbreviations are resolved too. `${NAME}` expansion receives an
+explicit warning because runtime state can change the executable after review,
+while malformed variable names and the command-incompatible `--null` form stay
+inert. Exceeding either dispatcher budget also warns instead of silently
+treating the hidden child as safe.
 
 Use `validate_command_text` before an integration copies a proposal into an
 approval card, persistence adapter, or review-only shell insertion. It applies

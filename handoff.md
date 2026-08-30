@@ -282,6 +282,15 @@ without losing surrounding argv. Attached/leading redirects, descriptor
 duplication, here-strings, decimal fd prefixes, and Bash `{named}` fd prefixes
 therefore cannot turn `--hard>log` or `2>/dev/null git clean -fdx` into a
 different reviewed command; quoted and backslash-escaped operators remain data.
+GNU `env -S` is an argv dispatcher, not an ordinary ignored option. Its own
+quote, whitespace, comment, escape, and `\_` rules are decoded before fixed
+child argv and any trailing arguments re-enter the bounded warning recursion.
+Unique GNU long-option abbreviations resolve before option values are consumed.
+Malformed carriers—including invalid variable names and `--null` combined with
+a command—remain non-executable; `${NAME}` produces a static warning because
+environment-dependent executable text cannot be reviewed exactly. Both env and
+xargs recursion budgets fail closed with a static warning once further child
+argv can no longer be classified within the bounded walk.
 
 The structural proposal-text gate is now public as
 `validate_command_text`/`CommandTextError`, together with

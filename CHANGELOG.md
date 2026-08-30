@@ -158,6 +158,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preserving the command on either side. Attached, leading, fd-duplication,
   here-string, numeric-fd, and Bash `{named}`-fd forms can no longer disguise
   `--hard`, a top-level removal target, or the real executable.
+- GNU `env -S` / `--split-string` carriers are now decoded with env's argument
+  grammar and combined with trailing argv before destructive/interpreter
+  classification. Unique long-option abbreviations are resolved, nested split
+  options are bounded, and malformed variable names or `--null` plus a command
+  remain inert. `${NAME}` expansion warns instead of guessing runtime bytes;
+  exceeding the env/xargs dispatcher review budget now warns fail-closed.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as
