@@ -2901,6 +2901,13 @@ fn is_dangerous_rm_target(target: &str) -> bool {
                 .is_some_and(|tail| matches!(*tail, "*" | ".*"))
 }
 
+fn is_privilege_dispatcher(command: &str) -> bool {
+    matches!(
+        command,
+        "sudo" | "sudoedit" | "doas" | "pkexec" | "su" | "runuser" | "run0" | "gosu" | "su-exec"
+    )
+}
+
 fn dangerous_segment(
     original: &[String],
     normalized: &[String],
@@ -2919,7 +2926,7 @@ fn dangerous_segment(
     let effective = &normalized[skipped..];
     let command = effective.first().map(|token| command_name(token))?;
 
-    if matches!(command, "sudo" | "doas" | "pkexec") {
+    if is_privilege_dispatcher(command) {
         return Some("uses elevated privileges");
     }
     if has_recursive_rm_dangerous_target(effective) {
@@ -3747,7 +3754,7 @@ fn is_interpreter(tokens: &[String]) -> bool {
         };
         if effective
             .first()
-            .is_some_and(|token| matches!(command_name(token), "sudo" | "doas" | "pkexec"))
+            .is_some_and(|token| is_privilege_dispatcher(command_name(token)))
         {
             effective = &effective[1..];
             while effective
@@ -3884,6 +3891,40 @@ mod tests {
         assert!(is_dangerous("git -C repo status").is_none());
         assert!(is_dangerous("hostname").is_none());
         assert!(is_dangerous("date -u").is_none());
+    }
+
+    #[test]
+    fn privilege_switching_dispatchers_always_require_review() {
+        for command in [
+            "su",
+            "su root",
+            "/usr/bin/su -c 'id' root",
+            "runuser -u root id",
+            "sudoedit /etc/hosts",
+            "run0 id",
+            "gosu root id",
+            "su-exec root id",
+            "env su nobody",
+            "nohup runuser -u root id",
+            "printf x | xargs sudoedit /etc/hosts",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "sum artifact.bin",
+            "sushi --version",
+            "sudoeditor notes.txt",
+            "runusers report.txt",
+            "echo su root",
+            "printf run0",
+            "printf gosu",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "privilege dispatcher substring matched {command:?}"
+            );
+        }
     }
 
     #[test]
