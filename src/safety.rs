@@ -4414,6 +4414,118 @@ fn wipefs_erases_signatures(tokens: &[String]) -> bool {
     erase && !no_act && targets > 0
 }
 
+fn fdisk_edits_partition_table(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut query = false;
+    let mut targets = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "sector-size",
+                        "protect-boot",
+                        "compatibility",
+                        "color",
+                        "list",
+                        "list-details",
+                        "noauto-pt",
+                        "output",
+                        "type",
+                        "units",
+                        "getsz",
+                        "bytes",
+                        "lock",
+                        "wipe",
+                        "wipe-partitions",
+                        "cylinders",
+                        "heads",
+                        "sectors",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some(
+                        "sector-size" | "output" | "type" | "wipe" | "wipe-partitions"
+                        | "cylinders" | "heads" | "sectors",
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("compatibility" | "color" | "units" | "lock") => index += 1,
+                    Some("list" | "list-details" | "getsz") if attached.is_none() => {
+                        query = true;
+                        index += 1;
+                    }
+                    Some("protect-boot" | "noauto-pt" | "bytes") if attached.is_none() => {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'B' | 'n' => {}
+                        'l' | 'x' | 's' => query = true,
+                        'b' | 'o' | 't' | 'w' | 'W' | 'C' | 'H' | 'S' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        // These getopt optional values are accepted only as
+                        // the remainder of the same short-option token.
+                        'c' | 'L' | 'u' => break,
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += usize::from(!option.is_empty());
+        index += 1;
+    }
+
+    !query && targets > 0
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5429,7 +5541,10 @@ fn dangerous_segment(
         "wipefs" if wipefs_erases_signatures(selected.tokens) => {
             return Some("wipefs can erase filesystem signatures");
         }
-        "fdisk" | "sfdisk" | "cfdisk" | "parted" => {
+        "fdisk" if fdisk_edits_partition_table(selected.tokens) => {
+            return Some("fdisk can change a disk partition table");
+        }
+        "sfdisk" | "cfdisk" | "parted" => {
             return Some("disk partition tools can destroy filesystem data");
         }
         "find" if effective[1..].iter().any(|token| token == "-delete") => {
@@ -6866,6 +6981,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "wipefs query, no-act, incomplete or invalid argv, option value, or command-name substring was treated as erasure for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fdisk_distinguishes_partition_listing_from_interactive_editing() {
+        for command in [
+            "fdisk /dev/sdb",
+            "fdisk --wipe always /dev/sdb",
+            "fdisk -w always --lock=nonblock /dev/sdb",
+            "fdisk --bytes /dev/sdb",
+            "fdisk --output Device,Start /dev/sdb",
+            "fdisk --type --list /dev/sdb",
+            "fdisk -t -l /dev/sdb",
+            "fdisk -- -l",
+            "env fdisk /dev/sdb",
+            "nohup fdisk --protect-boot /dev/sdb",
+            "printf ignored | xargs fdisk /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "fdisk -l",
+            "fdisk --list /dev/sdb /dev/sdc",
+            "fdisk -x /dev/sdb",
+            "fdisk --list-details --bytes /dev/sdb",
+            "fdisk -s /dev/sdb",
+            "fdisk -lw always /dev/sdb",
+            "fdisk --list --wipe always /dev/sdb",
+            "fdisk --help /dev/sdb",
+            "fdisk --version /dev/sdb",
+            "fdisk",
+            "fdisk --wipe always",
+            "fdisk --type --list",
+            "fdisk --unknown /dev/sdb",
+            "myfdisk /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "fdisk list/getsz, terminal, incomplete or invalid argv, option value, or command-name substring was treated as partition editing for {command:?}"
             );
         }
     }
