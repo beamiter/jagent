@@ -5026,6 +5026,64 @@ fn mkfs_frontend_formats(tokens: &[String]) -> bool {
     builder_arguments > 0 && verbose < 2
 }
 
+fn mke2fs_formats(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut dry_run = false;
+    let mut positionals = 0usize;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            // mke2fs has no long options; getopt rejects them before opening a
+            // device. In particular, --help and --version are terminal errors.
+            if argument.starts_with("--") {
+                return false;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'n' => dry_run = true,
+                        'V' => return false,
+                        'c' | 'j' | 'q' | 'v' | 'D' | 'F' | 'K' | 'S' => {}
+                        'b' | 'd' | 'e' | 'g' | 'i' | 'l' | 'm' | 'o' | 'r' | 's' | 't' | 'C'
+                        | 'E' | 'G' | 'I' | 'J' | 'L' | 'M' | 'N' | 'O' | 'R' | 'T' | 'U' | 'z' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += usize::from(!argument.is_empty());
+        if positionals > 2 {
+            return false;
+        }
+        index += 1;
+    }
+
+    positionals > 0 && !dry_run
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6222,7 +6280,15 @@ fn dangerous_segment(
     if command == "mkfs" && mkfs_frontend_formats(selected.tokens) {
         return Some("mkfs formats a filesystem");
     }
-    if command.starts_with("mkfs.") && mkfs_backend_formats(selected.tokens) {
+    if matches!(command, "mke2fs" | "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4")
+        && mke2fs_formats(selected.tokens)
+    {
+        return Some("mkfs formats a filesystem");
+    }
+    if command.starts_with("mkfs.")
+        && !matches!(command, "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4")
+        && mkfs_backend_formats(selected.tokens)
+    {
         return Some("mkfs formats a filesystem");
     }
     if command == "dd"
@@ -8049,6 +8115,48 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "mkfs terminal, frontend dry-run, incomplete argv, or command-name substring was treated as formatting for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ext_mkfs_distinguishes_no_action_from_filesystem_creation() {
+        for command in [
+            "mkfs.ext2 /dev/sdb",
+            "mkfs.ext3 -j /dev/sdb",
+            "mkfs.ext4 -F /dev/sdb",
+            "mkfs.ext4 -L data /dev/sdb",
+            "mkfs.ext4 -L -n /dev/sdb",
+            "mkfs.ext4 -N 1024 /dev/sdb",
+            "mkfs.ext4 /dev/sdb 1024",
+            "mkfs.ext4 -- /dev/sdb",
+            "mkfs.ext4 -- -n",
+            "mke2fs /dev/sdb",
+            "mke2fs -t ext4 /dev/sdb",
+            "env mke2fs /dev/sdb",
+            "printf ignored | xargs mke2fs /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mkfs.ext4 -n /dev/sdb",
+            "mkfs.ext4 -Fn /dev/sdb",
+            "mkfs.ext4 -nF /dev/sdb",
+            "mkfs.ext4 -nL data /dev/sdb",
+            "mkfs.ext4 /dev/sdb -n",
+            "mkfs.ext4 -V /dev/sdb",
+            "mkfs.ext4",
+            "mkfs.ext4 -n",
+            "mkfs.ext4 -L data",
+            "mkfs.ext4 -b /dev/sdb",
+            "mkfs.ext4 -Z /dev/sdb",
+            "mkfs.ext4 --help /dev/sdb",
+            "mke2fs -n /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "ext mkfs dry-run, terminal, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
             );
         }
     }
