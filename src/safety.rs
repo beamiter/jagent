@@ -3318,6 +3318,460 @@ fn start_stop_daemon_dispatch(tokens: &[String]) -> StartStopDispatch<'_> {
     }
 }
 
+/// Resolve the signal spellings accepted by the common Linux process tools.
+/// `Some(false)` is the special signal-zero permission/existence query,
+/// `Some(true)` is a signal that can affect a process, and `None` is a literal
+/// spelling that the utility rejects before it can act. Shell expansions stay
+/// conservative because their runtime value is not available to this review.
+fn is_dynamic_shell_value(value: &str) -> bool {
+    value
+        .bytes()
+        .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b']' | b'{' | b'}'))
+}
+
+fn parsed_signal_delivers(value: &str) -> Option<bool> {
+    if is_dynamic_shell_value(value) {
+        return Some(true);
+    }
+
+    let lowercase = value.to_ascii_lowercase();
+    let signal = lowercase.strip_prefix("sig").unwrap_or(&lowercase);
+    let number = signal.strip_prefix('+').unwrap_or(signal);
+    if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) {
+        let number = number.parse::<u8>().ok()?;
+        return (number <= 64).then_some(number != 0);
+    }
+    if signal == "exit" {
+        // Bash's kill builtin accepts EXIT as its signal-zero pseudo-name.
+        return Some(false);
+    }
+    if matches!(signal, "rtmin" | "rtmax") {
+        return Some(true);
+    }
+    if let Some(offset) = signal
+        .strip_prefix("rtmin+")
+        .or_else(|| signal.strip_prefix("rtmax-"))
+    {
+        return (!offset.is_empty()
+            && offset.bytes().all(|byte| byte.is_ascii_digit())
+            && offset.parse::<u8>().is_ok_and(|offset| offset <= 30))
+        .then_some(true);
+    }
+    matches!(
+        signal,
+        "hup"
+            | "int"
+            | "quit"
+            | "ill"
+            | "trap"
+            | "abrt"
+            | "iot"
+            | "emt"
+            | "bus"
+            | "fpe"
+            | "kill"
+            | "usr1"
+            | "segv"
+            | "usr2"
+            | "pipe"
+            | "alrm"
+            | "term"
+            | "stkflt"
+            | "chld"
+            | "cld"
+            | "cont"
+            | "stop"
+            | "tstp"
+            | "ttin"
+            | "ttou"
+            | "urg"
+            | "xcpu"
+            | "xfsz"
+            | "vtalrm"
+            | "prof"
+            | "winch"
+            | "poll"
+            | "io"
+            | "pwr"
+            | "sys"
+            | "info"
+            | "lost"
+            | "thr"
+            | "unused"
+    )
+    .then_some(true)
+}
+
+fn valid_signal_queue_value(value: &str) -> bool {
+    is_dynamic_shell_value(value) || value.parse::<i32>().is_ok()
+}
+
+fn kill_delivers_signal(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut targets = 0usize;
+    let mut delivers = true;
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &["signal", "queue", "list", "table", "help", "version"],
+                ) {
+                    Some("signal") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        let Some(next) = parsed_signal_delivers(value) else {
+                            return false;
+                        };
+                        delivers = next;
+                    }
+                    Some("queue") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if !valid_signal_queue_value(value) {
+                            return false;
+                        }
+                    }
+                    Some("list" | "table" | "help" | "version") => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+                if let Some(next) = parsed_signal_delivers(short) {
+                    delivers = next;
+                    index += 1;
+                    continue;
+                }
+                index += 1;
+                let Some((offset, flag)) = short.char_indices().next() else {
+                    return false;
+                };
+                match flag {
+                    's' | 'n' => {
+                        let value_start = offset + flag.len_utf8();
+                        let value = if value_start < short.len() {
+                            &short[value_start..]
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        let Some(next) = parsed_signal_delivers(value) else {
+                            return false;
+                        };
+                        delivers = next;
+                    }
+                    'q' => {
+                        let value_start = offset + flag.len_utf8();
+                        let value = if value_start < short.len() {
+                            &short[value_start..]
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if !valid_signal_queue_value(value) {
+                            return false;
+                        }
+                    }
+                    'l' | 'L' | 'h' | 'V' => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+        }
+        targets += 1;
+        index += 1;
+    }
+    targets > 0 && delivers
+}
+
+fn pkill_delivers_signal(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut patterns = 0usize;
+    let mut delivers = true;
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "require-handler",
+                        "queue",
+                        "echo",
+                        "count",
+                        "full",
+                        "pgroup",
+                        "group",
+                        "ignore-case",
+                        "newest",
+                        "oldest",
+                        "older",
+                        "parent",
+                        "session",
+                        "signal",
+                        "terminal",
+                        "euid",
+                        "uid",
+                        "exact",
+                        "pidfile",
+                        "logpidfile",
+                        "runstates",
+                        "ignore-ancestors",
+                        "cgroup",
+                        "ns",
+                        "nslist",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("signal") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        let Some(next) = parsed_signal_delivers(value) else {
+                            return false;
+                        };
+                        delivers = next;
+                    }
+                    Some(
+                        flag @ ("queue" | "pgroup" | "group" | "older" | "parent" | "session"
+                        | "terminal" | "euid" | "uid" | "pidfile" | "runstates" | "cgroup"
+                        | "ns" | "nslist"),
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() || (flag == "queue" && !valid_signal_queue_value(value))
+                        {
+                            return false;
+                        }
+                    }
+                    Some(
+                        "require-handler" | "echo" | "count" | "full" | "ignore-case" | "newest"
+                        | "oldest" | "exact" | "logpidfile" | "ignore-ancestors",
+                    ) if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+                if let Some(next) = parsed_signal_delivers(short) {
+                    delivers = next;
+                    index += 1;
+                    continue;
+                }
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'q' | 'g' | 'G' | 'O' | 'P' | 's' | 't' | 'u' | 'U' | 'F' | 'r' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() || (flag == 'q' && !valid_signal_queue_value(value))
+                            {
+                                return false;
+                            }
+                            break;
+                        }
+                        'H' | 'e' | 'c' | 'f' | 'i' | 'n' | 'o' | 'x' | 'L' | 'A' => {}
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        patterns += 1;
+        if patterns > 1 {
+            return false;
+        }
+        index += 1;
+    }
+    patterns == 1 && delivers
+}
+
+fn killall_delivers_signal(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut names = 0usize;
+    let mut delivers = true;
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "exact",
+                        "ignore-case",
+                        "process-group",
+                        "younger-than",
+                        "older-than",
+                        "interactive",
+                        "list",
+                        "quiet",
+                        "regexp",
+                        "signal",
+                        "user",
+                        "verbose",
+                        "version",
+                        "wait",
+                        "ns",
+                        "context",
+                        "help",
+                    ],
+                ) {
+                    Some("signal") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        let Some(next) = parsed_signal_delivers(value) else {
+                            return false;
+                        };
+                        delivers = next;
+                    }
+                    Some("younger-than" | "older-than" | "user" | "ns" | "context") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some(
+                        "exact" | "ignore-case" | "process-group" | "interactive" | "quiet"
+                        | "regexp" | "verbose" | "wait",
+                    ) if attached.is_none() => index += 1,
+                    Some("list" | "version" | "help") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+                if let Some(next) = parsed_signal_delivers(short) {
+                    delivers = next;
+                    index += 1;
+                    continue;
+                }
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'y' | 'o' | 's' | 'u' | 'n' | 'Z' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if flag == 's' {
+                                let Some(next) = parsed_signal_delivers(value) else {
+                                    return false;
+                                };
+                                delivers = next;
+                            }
+                            break;
+                        }
+                        'e' | 'I' | 'g' | 'i' | 'q' | 'r' | 'v' | 'w' => {}
+                        'l' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        names += 1;
+        index += 1;
+    }
+    names > 0 && delivers
+}
+
 fn dangerous_segment(
     original: &[String],
     normalized: &[String],
@@ -3367,6 +3821,14 @@ fn dangerous_segment(
             }
             StartStopDispatch::Invalid | StartStopDispatch::NoAction => return None,
         }
+    }
+    if match command {
+        "kill" => kill_delivers_signal(selected.tokens),
+        "pkill" => pkill_delivers_signal(selected.tokens),
+        "killall" => killall_delivers_signal(selected.tokens),
+        _ => false,
+    } {
+        return Some("sends signals that can terminate or disrupt processes");
     }
     if has_recursive_rm_dangerous_target(effective) {
         return Some("recursive rm against a top-level, home, or current-directory path");
@@ -4500,6 +4962,67 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "start-stop-daemon metadata or dry-run argv was treated as an action for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_signal_commands_distinguish_delivery_from_queries() {
+        for command in [
+            "kill 1234",
+            "kill -9 1234",
+            "kill -s TERM 1234",
+            "kill -n 15 -- -1",
+            "kill -s $SIGNAL 1234",
+            "/usr/bin/kill --signal KILL 1234",
+            "pkill critical-service",
+            "pkill -9 -f worker",
+            "pkill -H -q 7 worker",
+            "pkill --signal=TERM --exact daemon",
+            "killall critical-service",
+            "killall -s KILL worker",
+            "killall --younger-than 1h -I worker",
+            "env killall --signal TERM daemon",
+            "nohup pkill -HUP service",
+            "printf x | xargs kill -TERM 1234",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "kill -0 1234",
+            "kill -s 0 1234",
+            "kill --signal=0 1234",
+            "kill -l 9",
+            "kill -L",
+            "kill --help 1234",
+            "kill --version 1234",
+            "kill -s EXIT 1234",
+            "kill -s BOGUS 1234",
+            "kill --queue= 1234",
+            "kill",
+            "pkill -0 critical-service",
+            "pkill --signal 0 daemon",
+            "pkill --signal BOGUS daemon",
+            "pkill --queue nope daemon",
+            "pkill --help daemon",
+            "pkill --version daemon",
+            "pkill --exact",
+            "pkill worker extra-pattern",
+            "pkill",
+            "killall -0 critical-service",
+            "killall --signal 0 worker",
+            "killall --signal BOGUS worker",
+            "killall --user= worker",
+            "killall --list worker",
+            "killall --version worker",
+            "killer 1234",
+            "pkiller daemon",
+            "killalliance worker",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "signal query, terminal form, or name substring was treated as delivery for {command:?}"
             );
         }
     }
