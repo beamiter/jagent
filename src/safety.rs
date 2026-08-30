@@ -4050,6 +4050,258 @@ fn swapoff_changes_state(tokens: &[String]) -> bool {
     all || explicit_spec || specs > 0
 }
 
+fn cryptsetup_changes_state(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut test_args = false;
+    let mut test_passphrase = false;
+    let mut sets_uuid = false;
+    let mut positionals = Vec::new();
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (name, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match name {
+                    "active-name"
+                    | "align-payload"
+                    | "cipher"
+                    | "device-size"
+                    | "external-tokens-path"
+                    | "hash"
+                    | "header"
+                    | "header-backup-file"
+                    | "hotzone-size"
+                    | "integrity"
+                    | "iter-time"
+                    | "json-file"
+                    | "key-description"
+                    | "key-file"
+                    | "key-size"
+                    | "key-slot"
+                    | "keyfile-offset"
+                    | "keyfile-size"
+                    | "keyslot-cipher"
+                    | "keyslot-key-size"
+                    | "label"
+                    | "link-vk-to-keyring"
+                    | "luks2-keyslots-size"
+                    | "luks2-metadata-size"
+                    | "new-keyfile"
+                    | "new-keyfile-offset"
+                    | "new-keyfile-size"
+                    | "new-key-slot"
+                    | "new-token-id"
+                    | "offset"
+                    | "pbkdf"
+                    | "pbkdf-force-iterations"
+                    | "pbkdf-memory"
+                    | "pbkdf-parallel"
+                    | "priority"
+                    | "progress-frequency"
+                    | "reduce-device-size"
+                    | "resilience"
+                    | "resilience-hash"
+                    | "sector-size"
+                    | "size"
+                    | "skip"
+                    | "subsystem"
+                    | "timeout"
+                    | "token-id"
+                    | "token-type"
+                    | "tries"
+                    | "type"
+                    | "uuid"
+                    | "veracrypt-pim"
+                    | "volume-key-file"
+                    | "volume-key-keyring"
+                    | "block-size"
+                    | "dump-volume-key-file"
+                    | "master-key-file" => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        sets_uuid |= name == "uuid";
+                    }
+                    "test-args" if attached.is_none() => {
+                        test_args = true;
+                        index += 1;
+                    }
+                    "test-passphrase" if attached.is_none() => {
+                        test_passphrase = true;
+                        index += 1;
+                    }
+                    "allow-discards"
+                    | "batch-mode"
+                    | "cancel-deferred"
+                    | "debug"
+                    | "debug-json"
+                    | "decrypt"
+                    | "deferred"
+                    | "disable-blkid"
+                    | "disable-external-tokens"
+                    | "disable-keyring"
+                    | "disable-locks"
+                    | "disable-veracrypt"
+                    | "dump-json-metadata"
+                    | "dump-volume-key"
+                    | "encrypt"
+                    | "force-password"
+                    | "force-offline-reencrypt"
+                    | "hw-opal"
+                    | "hw-opal-factory-reset"
+                    | "hw-opal-only"
+                    | "init-only"
+                    | "integrity-legacy-padding"
+                    | "integrity-no-journal"
+                    | "integrity-no-wipe"
+                    | "iv-large-sectors"
+                    | "keep-key"
+                    | "perf-no_read_workqueue"
+                    | "perf-no_write_workqueue"
+                    | "perf-same_cpu_crypt"
+                    | "perf-submit_from_crypt_cpus"
+                    | "persistent"
+                    | "progress-json"
+                    | "readonly"
+                    | "refresh"
+                    | "resume-only"
+                    | "serialize-memory-hard-pbkdf"
+                    | "shared"
+                    | "token-only"
+                    | "token-replace"
+                    | "tcrypt-backup"
+                    | "tcrypt-hidden"
+                    | "tcrypt-system"
+                    | "unbound"
+                    | "use-random"
+                    | "use-urandom"
+                    | "veracrypt"
+                    | "veracrypt-query-pim"
+                    | "verbose"
+                    | "verify-passphrase"
+                    | "new"
+                    | "use-directio"
+                    | "use-fsync"
+                    | "write-log"
+                    | "dump-master-key"
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                    }
+                    "help" | "usage" | "version" if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'q' | 'r' | 'v' | 'y' | 'N' => {}
+                        'c' | 'h' | 'I' | 'i' | 'd' | 's' | 'S' | 'l' | 'o' | 'b' | 'p' | 't'
+                        | 'T' | 'M' | 'B' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        '?' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals.push(option);
+        index += 1;
+    }
+
+    if test_args {
+        return false;
+    }
+    let Some((&action, arguments)) = positionals.split_first() else {
+        return false;
+    };
+    let open_action = matches!(
+        action,
+        "open"
+            | "create"
+            | "plainOpen"
+            | "luksOpen"
+            | "loopaesOpen"
+            | "tcryptOpen"
+            | "bitlkOpen"
+            | "fvault2Open"
+    );
+    if open_action {
+        return !test_passphrase && !arguments.is_empty();
+    }
+    if matches!(
+        action,
+        "close"
+            | "remove"
+            | "plainClose"
+            | "luksClose"
+            | "loopaesClose"
+            | "tcryptClose"
+            | "bitlkClose"
+            | "fvault2Close"
+            | "resize"
+            | "refresh"
+            | "repair"
+            | "reencrypt"
+            | "erase"
+            | "luksErase"
+            | "convert"
+            | "config"
+            | "luksFormat"
+            | "luksAddKey"
+            | "luksRemoveKey"
+            | "luksChangeKey"
+            | "luksConvertKey"
+            | "luksSuspend"
+            | "luksResume"
+            | "luksHeaderBackup"
+            | "luksHeaderRestore"
+    ) {
+        return !arguments.is_empty();
+    }
+    if action == "luksKillSlot" {
+        return arguments.len() >= 2;
+    }
+    if action == "luksUUID" {
+        return sets_uuid && !arguments.is_empty();
+    }
+    action == "token" && arguments.len() >= 2 && matches!(arguments[0], "add" | "remove" | "import")
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -4624,6 +4876,9 @@ fn dangerous_segment(
     }
     if command == "swapoff" && swapoff_changes_state(selected.tokens) {
         return Some("swapoff disables active swap storage");
+    }
+    if command == "cryptsetup" && cryptsetup_changes_state(selected.tokens) {
+        return Some("cryptsetup changes encrypted-volume or mapper state");
     }
     if match command {
         "kill" => kill_delivers_signal(selected.tokens),
@@ -6022,6 +6277,62 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "swap summary, terminal form, invalid argv, or name substring was treated as a state change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cryptsetup_distinguishes_volume_mutations_from_inspection() {
+        for command in [
+            "cryptsetup open /dev/sdb1 secure-data",
+            "cryptsetup close secure-data",
+            "cryptsetup resize secure-data",
+            "cryptsetup repair /dev/sdb1",
+            "cryptsetup reencrypt /dev/sdb1",
+            "cryptsetup erase /dev/sdb1",
+            "cryptsetup convert /dev/sdb1",
+            "cryptsetup config /dev/sdb1 --label=archive",
+            "cryptsetup luksFormat /dev/sdb1",
+            "cryptsetup luksAddKey /dev/sdb1 new.key",
+            "cryptsetup luksRemoveKey /dev/sdb1 old.key",
+            "cryptsetup luksKillSlot /dev/sdb1 1",
+            "cryptsetup --uuid=1234-5678 luksUUID /dev/sdb1",
+            "cryptsetup luksSuspend secure-data",
+            "cryptsetup luksResume secure-data",
+            "cryptsetup luksHeaderRestore /dev/sdb1 --header-backup-file=header.bin",
+            "cryptsetup token import /dev/sdb1 --json-file=token.json",
+            "cryptsetup token remove /dev/sdb1 --token-id=1",
+            "cryptsetup --test-passphrase luksFormat /dev/sdb1",
+            "env cryptsetup luksOpen /dev/sdb1 secure-data",
+            "nohup cryptsetup luksClose secure-data",
+            "printf x | xargs cryptsetup erase /dev/sdb1",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "cryptsetup status secure-data",
+            "cryptsetup benchmark",
+            "cryptsetup isLuks /dev/sdb1",
+            "cryptsetup luksDump /dev/sdb1",
+            "cryptsetup tcryptDump /dev/sdb1",
+            "cryptsetup luksUUID /dev/sdb1",
+            "cryptsetup token export /dev/sdb1",
+            "cryptsetup --test-args luksFormat /dev/sdb1",
+            "cryptsetup --test-passphrase open /dev/sdb1 secure-data",
+            "cryptsetup --help luksFormat /dev/sdb1",
+            "cryptsetup --version erase /dev/sdb1",
+            "cryptsetup open",
+            "cryptsetup luksKillSlot /dev/sdb1",
+            "cryptsetup token import",
+            "cryptsetup --cipher luksFormat status secure-data",
+            "cryptsetup -h luksFormat status secure-data",
+            "cryptsetup --unknown luksFormat /dev/sdb1",
+            "cryptsettings luksFormat /dev/sdb1",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "cryptsetup inspection, validation, invalid argv, option value, or name substring was treated as mutation for {command:?}"
             );
         }
     }
