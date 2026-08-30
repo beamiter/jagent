@@ -2994,6 +2994,314 @@ fn is_dangerous_rm_target(target: &str) -> bool {
                 .is_some_and(|tail| matches!(*tail, "*" | ".*"))
 }
 
+#[derive(Clone, Copy)]
+struct ChmodModeEffects {
+    broad: bool,
+    sets_id: bool,
+}
+
+fn chmod_mode_effects(mode: &str) -> Option<ChmodModeEffects> {
+    fn numeric_effects(operator: Option<char>, digits: &str) -> Option<ChmodModeEffects> {
+        if digits.is_empty() || !digits.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+            return None;
+        }
+        let value = u32::from_str_radix(digits, 8).ok()?;
+        if value > 0o7777 {
+            return None;
+        }
+        let permissions = value & 0o777;
+        let broad = match operator {
+            None | Some('=') => permissions & 0o022 != 0 || permissions & 0o700 == 0,
+            Some('+') => permissions & 0o022 != 0,
+            Some('-') => permissions & 0o700 == 0o700,
+            _ => return None,
+        };
+        let sets_id = !matches!(operator, Some('-')) && value & 0o6000 != 0;
+        Some(ChmodModeEffects { broad, sets_id })
+    }
+
+    if mode.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
+        return numeric_effects(None, mode);
+    }
+    if let Some((operator, digits)) = mode
+        .chars()
+        .next()
+        .filter(|operator| matches!(operator, '+' | '-' | '='))
+        .map(|operator| (operator, &mode[operator.len_utf8()..]))
+        .filter(|(_, digits)| digits.bytes().all(|byte| matches!(byte, b'0'..=b'7')))
+    {
+        return numeric_effects(Some(operator), digits);
+    }
+
+    let mut group_write = false;
+    let mut other_write = false;
+    let mut owner_locked = false;
+    let mut user_set_id = false;
+    let mut group_set_id = false;
+    for clause in mode.split(',') {
+        if clause.is_empty() {
+            return None;
+        }
+        if let Some((operator, digits)) = clause
+            .chars()
+            .next()
+            .filter(|operator| matches!(operator, '+' | '-' | '='))
+            .map(|operator| (operator, &clause[operator.len_utf8()..]))
+            .filter(|(_, digits)| {
+                !digits.is_empty() && digits.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+            })
+        {
+            let value = u32::from_str_radix(digits, 8).ok()?;
+            if value > 0o7777 {
+                return None;
+            }
+            match operator {
+                '+' => {
+                    group_write |= value & 0o020 != 0;
+                    other_write |= value & 0o002 != 0;
+                    owner_locked &= value & 0o700 == 0;
+                    user_set_id |= value & 0o4000 != 0;
+                    group_set_id |= value & 0o2000 != 0;
+                }
+                '-' => {
+                    group_write &= value & 0o020 == 0;
+                    other_write &= value & 0o002 == 0;
+                    owner_locked |= value & 0o700 == 0o700;
+                    user_set_id &= value & 0o4000 == 0;
+                    group_set_id &= value & 0o2000 == 0;
+                }
+                '=' => {
+                    group_write = value & 0o020 != 0;
+                    other_write = value & 0o002 != 0;
+                    owner_locked = value & 0o700 == 0;
+                    user_set_id = value & 0o4000 != 0;
+                    group_set_id = value & 0o2000 != 0;
+                }
+                _ => unreachable!("the operator was filtered above"),
+            }
+            continue;
+        }
+        let bytes = clause.as_bytes();
+        let mut index = 0usize;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| matches!(byte, b'u' | b'g' | b'o' | b'a'))
+        {
+            index += 1;
+        }
+        let who = &clause[..index];
+        let affects_owner = who.is_empty() || who.contains(['u', 'a']);
+        let affects_group = who.is_empty() || who.contains(['g', 'a']);
+        let affects_other = who.is_empty() || who.contains(['o', 'a']);
+        let mut operations = 0usize;
+
+        while index < bytes.len() {
+            let operator = bytes[index] as char;
+            if !matches!(operator, '+' | '-' | '=') {
+                return None;
+            }
+            index += 1;
+            let permission_start = index;
+            while bytes
+                .get(index)
+                .is_some_and(|byte| !matches!(byte, b'+' | b'-' | b'='))
+            {
+                index += 1;
+            }
+            let permissions = &clause[permission_start..index];
+            let copies_class = permissions.len() == 1
+                && permissions
+                    .bytes()
+                    .all(|byte| matches!(byte, b'u' | b'g' | b'o'));
+            if !copies_class
+                && !permissions
+                    .bytes()
+                    .all(|byte| matches!(byte, b'r' | b'w' | b'x' | b'X' | b's' | b't'))
+            {
+                return None;
+            }
+
+            let writes = permissions.contains('w') || copies_class;
+            for state in [
+                affects_group.then_some(&mut group_write),
+                affects_other.then_some(&mut other_write),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                match operator {
+                    '+' if writes => *state = true,
+                    '=' => *state = writes,
+                    '-' if permissions.contains('w') => *state = false,
+                    _ => {}
+                }
+            }
+            if affects_owner {
+                let provides_owner_access = permissions
+                    .bytes()
+                    .any(|byte| matches!(byte, b'r' | b'w' | b'x' | b'X'));
+                match operator {
+                    '=' => owner_locked = copies_class || !provides_owner_access,
+                    '+' if provides_owner_access => owner_locked = false,
+                    '-' if [b'r', b'w', b'x']
+                        .iter()
+                        .all(|permission| permissions.as_bytes().contains(permission)) =>
+                    {
+                        owner_locked = true;
+                    }
+                    _ => {}
+                }
+            }
+            for state in [
+                affects_owner.then_some(&mut user_set_id),
+                affects_group.then_some(&mut group_set_id),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                match operator {
+                    '+' if permissions.contains('s') => *state = true,
+                    '=' => *state = permissions.contains('s'),
+                    '-' if permissions.contains('s') => *state = false,
+                    _ => {}
+                }
+            }
+            operations += 1;
+        }
+        if operations == 0 {
+            return None;
+        }
+    }
+
+    Some(ChmodModeEffects {
+        broad: group_write || other_write || owner_locked,
+        sets_id: user_set_id || group_set_id,
+    })
+}
+
+fn chmod_changes_sensitive_permissions(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut recursive = false;
+    let mut preserve_root = false;
+    let mut reference = false;
+    let mut dash_mode = false;
+    let mut positionals = Vec::new();
+
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "changes",
+                        "silent",
+                        "quiet",
+                        "verbose",
+                        "no-preserve-root",
+                        "preserve-root",
+                        "reference",
+                        "recursive",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("reference") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() || dash_mode {
+                            return false;
+                        }
+                        reference = true;
+                    }
+                    Some("recursive") if attached.is_none() => {
+                        recursive = true;
+                        index += 1;
+                    }
+                    Some("preserve-root") if attached.is_none() => {
+                        preserve_root = true;
+                        index += 1;
+                    }
+                    Some("no-preserve-root") if attached.is_none() => {
+                        preserve_root = false;
+                        index += 1;
+                    }
+                    Some("changes" | "silent" | "quiet" | "verbose") if attached.is_none() => {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+                if flags
+                    .chars()
+                    .all(|flag| matches!(flag, 'c' | 'f' | 'v' | 'R'))
+                {
+                    recursive |= flags.contains('R');
+                    index += 1;
+                    continue;
+                }
+                if positionals.is_empty() && !reference && chmod_mode_effects(token).is_some() {
+                    dash_mode = true;
+                    positionals.push(token);
+                    index += 1;
+                    continue;
+                }
+                return false;
+            }
+        }
+        positionals.push(token);
+        index += 1;
+    }
+
+    let (mode, targets): (Option<ChmodModeEffects>, &[&str]) = if reference {
+        (None, &positionals)
+    } else {
+        let Some((mode, targets)) = positionals.split_first() else {
+            return false;
+        };
+        let Some(mode) = chmod_mode_effects(mode) else {
+            return false;
+        };
+        (Some(mode), targets)
+    };
+    if targets.is_empty() {
+        return false;
+    }
+    if mode.is_some_and(|mode| mode.sets_id) {
+        return true;
+    }
+    let broad = reference || recursive || mode.is_some_and(|mode| mode.broad);
+    broad
+        && targets.iter().any(|target| {
+            let protected_root = preserve_root
+                && recursive
+                && target.starts_with('/')
+                && target
+                    .split('/')
+                    .all(|component| component.is_empty() || component == ".");
+            !protected_root && is_dangerous_rm_target(target)
+        })
+}
+
 fn is_privilege_dispatcher(command: &str) -> bool {
     matches!(
         command,
@@ -7652,14 +7960,13 @@ fn dangerous_segment(
     if command == "dd" && dd_writes_raw_device(selected.tokens) {
         return Some("dd writes raw bytes to a device");
     }
-    if matches!(command, "chmod" | "chown" | "chgrp")
+    if command == "chmod" && chmod_changes_sensitive_permissions(selected.tokens) {
+        return Some("chmod can broadly alter permissions or enable set-id execution");
+    }
+    if matches!(command, "chown" | "chgrp")
         && effective[1..]
             .iter()
             .any(|token| is_dangerous_rm_target(token))
-        && (command != "chmod"
-            || effective[1..]
-                .iter()
-                .any(|token| token.trim_start_matches('0') == "777"))
     {
         return Some("permission changes against a top-level or home path");
     }
@@ -9354,6 +9661,72 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "parted query, terminal, invalid argv, command parameter, or command-name substring was treated as partition mutation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chmod_parses_modes_options_targets_and_set_id_effects() {
+        for command in [
+            "chmod 0777 /etc",
+            "chmod a+rwx /etc",
+            "chmod o+w /",
+            "chmod ugo=rwx ~/",
+            "chmod 000 /etc",
+            "chmod u-rwx /etc",
+            "chmod -R 755 /etc",
+            "chmod --recursive u=rwX .",
+            "chmod -R -w /",
+            "chmod --preserve-root -R 755 /etc",
+            "chmod --preserve-root --no-preserve-root -R 755 /",
+            "chmod --reference=/tmp/template /etc",
+            "chmod 4755 ./helper",
+            "chmod u+s ./helper",
+            "chmod g+s /tmp/teamdir",
+            "chmod o-w,o+w /etc",
+            "chmod u-s,u+s ./helper",
+            "chmod -0022,+0022 /etc",
+            "chmod -6000,+6000 ./helper",
+            "env chmod o+w /etc",
+            "nohup chmod -R 755 /etc",
+            "printf ignored | xargs chmod 4755 ./helper",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "chmod 755 /etc",
+            "chmod u=rwX /etc",
+            "chmod go-w /etc",
+            "chmod a+r /etc",
+            "chmod 0600 ~/.ssh/key",
+            "chmod u-s ./helper",
+            "chmod u+s,u-s ./helper",
+            "chmod o+w,o-w /etc",
+            "chmod u=,u+r /etc",
+            "chmod +0022,-0022 /etc",
+            "chmod +6000,-6000 ./helper",
+            "chmod =0755,+6000,-6000 /etc",
+            "chmod 1755 /tmp/project",
+            "chmod --reference=/ /tmp/file",
+            "chmod --reference / /tmp/file",
+            "chmod -R 755 /tmp/project",
+            "chmod --preserve-root -R 755 /",
+            "chmod --no-preserve-root --preserve-root -R 755 /./",
+            "chmod --help 0777 /etc",
+            "chmod --version -R /etc",
+            "chmod 0777",
+            "chmod --reference=/tmp/template",
+            "chmod --reference",
+            "chmod 999 /etc",
+            "chmod u+q /etc",
+            "chmod --preserve-root=yes 0777 /etc",
+            "chmod 0777 -- /tmp/file",
+            "chmodder 0777 /etc",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "chmod narrowing, terminal, invalid, incomplete, option-value or ordinary target argv was treated as a sensitive permission change for {command:?}"
             );
         }
     }
