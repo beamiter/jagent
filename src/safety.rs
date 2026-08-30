@@ -5364,6 +5364,51 @@ fn mkfs_fat_formats(tokens: &[String]) -> bool {
     }
 }
 
+fn dd_writes_raw_device(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut output = None;
+    let mut count_zero = false;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && matches!(argument, "--help" | "--version") {
+            return false;
+        }
+        if options && argument.starts_with("--") {
+            return false;
+        }
+
+        let Some((name, value)) = argument.split_once('=') else {
+            return false;
+        };
+        if value.is_empty() {
+            return false;
+        }
+        match name {
+            "of" => output = Some(value),
+            "count" => {
+                // GNU dd accepts richer suffix and product syntax. Only the
+                // unambiguously valid all-zero decimal subset is exempted;
+                // unfamiliar spellings remain conservatively write-capable.
+                count_zero = value.bytes().all(|byte| byte == b'0');
+            }
+            "bs" | "cbs" | "ibs" | "if" | "iflag" | "obs" | "oflag" | "seek" | "oseek" | "skip"
+            | "iseek" | "status" | "conv" => {}
+            _ => return false,
+        }
+        index += 1;
+    }
+
+    output.is_some_and(|output| {
+        !count_zero && (output.starts_with("/dev/") || output.starts_with("\\\\.\\"))
+    })
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6592,13 +6637,7 @@ fn dangerous_segment(
     {
         return Some("mkfs formats a filesystem");
     }
-    if command == "dd"
-        && effective[1..].iter().any(|token| {
-            token
-                .strip_prefix("of=")
-                .is_some_and(|output| output.starts_with("/dev/") || output.starts_with("\\\\.\\"))
-        })
-    {
+    if command == "dd" && dd_writes_raw_device(selected.tokens) {
         return Some("dd writes raw bytes to a device");
     }
     if matches!(command, "chmod" | "chown" | "chgrp")
@@ -8747,12 +8786,42 @@ mod tests {
 
     #[test]
     fn dd_detection_matches_the_command_not_substrings() {
-        assert!(is_dangerous("dd if=/dev/zero of=/dev/sda").is_some());
-        assert!(is_dangerous("sudo dd if=image.iso of=/dev/sdb bs=4M").is_some());
-        assert!(is_dangerous("dd\tif=/dev/zero\tof=/dev/sda").is_some());
-        // Substrings of other words must not trip the heuristic.
-        assert!(is_dangerous("echo \"add of=/dev/null\"").is_none());
-        assert!(is_dangerous("grep -r 'dd of=/dev/' docs").is_none());
+        for command in [
+            "dd if=/dev/zero of=/dev/sda",
+            "dd of=/dev/sdb bs=4M count=1",
+            "dd count=0 count=1 of=/dev/sdb",
+            "dd -- of=/dev/sdb count=1",
+            "dd\tif=/dev/zero\tof=/dev/sda",
+            "sudo dd if=image.iso of=/dev/sdb bs=4M",
+            "env dd if=image.iso of=/dev/sdb",
+            "nohup dd if=image.iso of=/dev/sdb",
+            "busybox dd if=image.iso of=/dev/sdb",
+            "printf ignored | xargs dd of=/dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "dd --help of=/dev/sdb",
+            "dd of=/dev/sdb --version",
+            "dd of=/dev/sdb count=0",
+            "dd count=1 of=/dev/sdb count=00",
+            "dd of=/tmp/disk.img count=1",
+            "dd if=/dev/zero count=1",
+            "dd of=/dev/sdb count=",
+            "dd output=/dev/sdb",
+            "dd of /dev/sdb",
+            "dd -- --help of=/dev/sdb",
+            "dd of=/dev/sdb of=/tmp/disk.img",
+            "echo \"add of=/dev/null\"",
+            "grep -r 'dd of=/dev/' docs",
+            "adder of=/dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "dd terminal, zero-count, non-device, invalid, overridden output, or command-name substring was treated as a raw device write for {command:?}"
+            );
+        }
     }
 
     #[test]
