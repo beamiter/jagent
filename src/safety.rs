@@ -3852,6 +3852,204 @@ fn losetup_changes_mapping(tokens: &[String]) -> bool {
     }
 }
 
+fn valid_swap_discard_policy(value: &str) -> bool {
+    is_dynamic_shell_value(value)
+        || value
+            .split(',')
+            .all(|policy| matches!(policy, "once" | "pages"))
+}
+
+fn swapon_changes_state(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut query = false;
+    let mut all = false;
+    let mut explicit_spec = false;
+    let mut specs = 0usize;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "all",
+                        "discard",
+                        "ifexists",
+                        "fixpgsz",
+                        "options",
+                        "priority",
+                        "summary",
+                        "fstab",
+                        "show",
+                        "noheadings",
+                        "raw",
+                        "bytes",
+                        "verbose",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("all") if attached.is_none() => {
+                        all = true;
+                        index += 1;
+                    }
+                    Some("discard")
+                        if attached.is_none()
+                            || attached.is_some_and(valid_swap_discard_policy) =>
+                    {
+                        index += 1;
+                    }
+                    Some("options" | "priority" | "fstab") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("summary") if attached.is_none() => {
+                        query = true;
+                        index += 1;
+                    }
+                    Some("show") => {
+                        query = true;
+                        index += 1;
+                    }
+                    Some("ifexists" | "fixpgsz" | "noheadings" | "raw" | "bytes" | "verbose")
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => all = true,
+                        's' => query = true,
+                        'e' | 'f' | 'v' => {}
+                        'd' => {
+                            let value_start = offset + flag.len_utf8();
+                            if value_start < short.len()
+                                && !valid_swap_discard_policy(&short[value_start..])
+                            {
+                                return false;
+                            }
+                            break;
+                        }
+                        'o' | 'p' | 'T' | 'L' | 'U' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            explicit_spec |= matches!(flag, 'L' | 'U');
+                            break;
+                        }
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        specs += 1;
+        index += 1;
+    }
+    !query && (all || explicit_spec || specs > 0)
+}
+
+fn swapoff_changes_state(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut all = false;
+    let mut explicit_spec = false;
+    let mut specs = 0usize;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(spelling, &["all", "verbose", "help", "version"]) {
+                    Some("all") if attached.is_none() => {
+                        all = true;
+                        index += 1;
+                    }
+                    Some("verbose") if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => all = true,
+                        'v' => {}
+                        'L' | 'U' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            explicit_spec = true;
+                            break;
+                        }
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        specs += 1;
+        index += 1;
+    }
+    all || explicit_spec || specs > 0
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -4420,6 +4618,12 @@ fn dangerous_segment(
     }
     if command == "losetup" && losetup_changes_mapping(selected.tokens) {
         return Some("losetup changes loop-device mappings");
+    }
+    if command == "swapon" && swapon_changes_state(selected.tokens) {
+        return Some("swapon enables or reinitializes swap storage");
+    }
+    if command == "swapoff" && swapoff_changes_state(selected.tokens) {
+        return Some("swapoff disables active swap storage");
     }
     if match command {
         "kill" => kill_delivers_signal(selected.tokens),
@@ -5774,6 +5978,50 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "losetup query, terminal form, invalid argv, or name substring was treated as a mapping change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_tools_distinguish_activation_from_summary_queries() {
+        for command in [
+            "swapon /swapfile",
+            "swapon -a",
+            "swapon -L swapdata",
+            "swapon --priority 10 /swapfile",
+            "swapon --raw /swapfile",
+            "env swapon -U 1234-5678",
+            "printf x | xargs swapon /swapfile",
+            "swapoff /swapfile",
+            "swapoff -a",
+            "swapoff -L swapdata",
+            "nohup swapoff -U 1234-5678",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "swapon",
+            "swapon -s",
+            "swapon --show",
+            "swapon --show /swapfile",
+            "swapon --summary -a",
+            "swapon /swapfile --show=NAME,TYPE",
+            "swapon --help /swapfile",
+            "swapon --version -a",
+            "swapon --priority",
+            "swapon --unknown /swapfile",
+            "swapoff",
+            "swapoff -v",
+            "swapoff --help /swapfile",
+            "swapoff --version -a",
+            "swapoff -L",
+            "swapoff --unknown /swapfile",
+            "swapoffs -a",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "swap summary, terminal form, invalid argv, or name substring was treated as a state change for {command:?}"
             );
         }
     }
