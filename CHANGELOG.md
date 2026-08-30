@@ -155,6 +155,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   double-quoted credential values, including whitespace, punctuation, and
   escaped quotes. Explicit `*_PASSWORD`, `*_SECRET`, and provider-token labels
   no longer leak a suffix merely because the secret is not base64-shaped.
+- Unquoted credential settings now accept punctuation and backslash-escaped
+  bytes behind explicit labels, and generic `*_SECRET` / `*_TOKEN` names use
+  the same redaction path. Shell operators and structured-data closers remain
+  boundaries so adjacent commands and fields stay available to the model.
 
 - The invisible/bidirectional character set that gates every model-proposed
   command, provider model name, endpoint URL, and generated header value now

@@ -332,8 +332,10 @@ Success is a display/transport invariant, not execution authorization.
 
 Secret-setting redaction is label-aware: quoted password, secret, API-key, and
 token values are removed as complete values even when they contain spaces,
-punctuation, or escaped quote characters. Unlabeled opaque strings remain
-untouched to avoid erasing ordinary hashes and identifiers.
+punctuation, or escaped quote characters. Unquoted labeled values also accept
+punctuation and backslash-escaped bytes; whitespace, structured-data closers,
+and unescaped shell operators remain value boundaries. Unlabeled opaque
+strings remain untouched to avoid erasing ordinary hashes and identifiers.
 
 `validate_no_duplicate_members` exposes the same allocation-light recursive
 JSON preflight used by these wire decoders. Integrations can apply it to other

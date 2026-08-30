@@ -125,7 +125,7 @@ fn patterns() -> &'static [SecretPattern] {
             // only the prefix and leave the rest of the secret behind.
             (
                 "${name}=[REDACTED:credential]",
-                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN|(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN))\b)["']?[ \t]*[=:][ \t]*(?:"(?:\\.|[^"\\\r\n])+"|'(?:\\.|[^'\\\r\n])+')"#,
+                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN|(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN)|[A-Z][A-Z0-9_]*_(?:SECRET|TOKEN))\b)["']?[ \t]*[=:][ \t]*(?:"(?:\\.|[^"\\\r\n])+"|'(?:\\.|[^'\\\r\n])+')"#,
             ),
             // Explicit well-known secret settings catch new provider token
             // formats without treating every long opaque string as a secret.
@@ -133,11 +133,11 @@ fn patterns() -> &'static [SecretPattern] {
             // quote characters from JSON, YAML, or shell syntax.
             (
                 "${name}=[REDACTED:credential]",
-                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN)\b)["']?[ \t]*[=:][ \t]*["']?[A-Za-z0-9._~+/=\-]{16,}["']?"#,
+                r#"(?i)["']?(?P<name>\b(?:AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|GITLAB_TOKEN|SLACK_TOKEN|NPM_TOKEN|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY|AZURE_CLIENT_SECRET|CLOUDFLARE_API_TOKEN)\b)["']?[ \t]*[=:][ \t]*(?:\\[^\r\n]|[^\s"'\\,;|&<>(){}\[\]]){16,}"#,
             ),
             (
                 "${name}=[REDACTED:credential]",
-                r#"(?i)["']?(?P<name>\b(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN)\b)["']?[ \t]*[=:][ \t]*["']?[A-Za-z0-9._~+/=\-]{8,}["']?"#,
+                r#"(?i)["']?(?P<name>\b(?:(?:[A-Z][A-Z0-9_]*_)?(?:PASSWORD|PASSWD|CLIENT_SECRET|SECRET_KEY|API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|PRIVATE_TOKEN)|[A-Z][A-Z0-9_]*_(?:SECRET|TOKEN))\b)["']?[ \t]*[=:][ \t]*(?:\\[^\r\n]|[^\s"'\\,;|&<>(){}\[\]]){8,}"#,
             ),
             // A password embedded in URI userinfo. Preserve the scheme and
             // username as useful context, but remove everything between the
@@ -446,6 +446,40 @@ mod tests {
         );
         let fragment = "https://app.example/#access_token=opaque-token-value-123456&state=ok";
         assert!(redact_secrets(fragment).contains("#access_token=[REDACTED:url-query-secret]"));
+    }
+
+    #[test]
+    fn redacts_unquoted_punctuated_and_escaped_secret_settings() {
+        for (input, expected) in [
+            (
+                "DB_PASSWORD=p@ss:w0rd!#2026",
+                "DB_PASSWORD=[REDACTED:credential]",
+            ),
+            (
+                "DEPLOY_TOKEN=a+b=c/@d?e%f",
+                "DEPLOY_TOKEN=[REDACTED:credential]",
+            ),
+            (
+                r"SERVICE_SECRET=opaque\ value\;stillsecret ; printf keep",
+                "SERVICE_SECRET=[REDACTED:credential] ; printf keep",
+            ),
+            (
+                "DB_PASSWORD=abcdefgh; printf keep",
+                "DB_PASSWORD=[REDACTED:credential]; printf keep",
+            ),
+        ] {
+            assert_eq!(redact_secrets(input), expected);
+        }
+
+        // Generic prose and a short placeholder remain visible. The broader
+        // value alphabet only activates behind an explicit credential label.
+        for safe in [
+            "punctuation p@ss:w0rd!#2026 in an example",
+            "DATABASE_URL=postgres://db.internal/app",
+            "DB_PASSWORD=example",
+        ] {
+            assert_eq!(redact_secrets(safe), safe);
+        }
     }
 
     #[test]

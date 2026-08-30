@@ -10,6 +10,13 @@ new integrations can bind request preparation, response decoding, and session
 ingestion to one `AgentProtocol` and receive machine-readable history
 transformation reports.
 
+High-confidence setting redaction now treats explicit `*_SECRET` and
+`*_TOKEN` names like the existing password/API-key families. Its unquoted
+value scanner accepts punctuation and backslash-escaped bytes while stopping
+at whitespace, shell operators, and structured-data closers, so realistic
+`.env` and command output no longer expose a suffix without swallowing an
+adjacent command or JSON/YAML field.
+
 The high-level history window is now a release-mode postcondition as well as a
 debug invariant: if a provider builder omits any turn after
 `bound_history_*_with_report` has already produced the canonical window,
