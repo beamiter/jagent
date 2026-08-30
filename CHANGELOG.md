@@ -140,6 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shell pipeline instead of checking only the adjacent stage, so filters such
   as `tee` or `sed` cannot hide a later interpreter. The stdin-interpreter set
   now also covers `ash`, the C-shell family, `python2`, and `php`.
+- Destructive-command warnings now decode shell ANSI-C quoting before
+  classification. Hex, octal, and Unicode escapes or concatenated quote parts
+  can no longer disguise the executable in forms such as
+  `$'\x72\x6d' -rf /` or hide a destructive `eval`/`sh -c` script, while the
+  same spelling passed as ordinary data remains unflagged.
 
 - The invisible/bidirectional character set that gates every model-proposed
   command, provider model name, endpoint URL, and generated header value now

@@ -305,6 +305,9 @@ execution, and command-text heuristics cannot prove what a configured shell,
 alias, function, or helper will do. Its network-content warning follows a
 pipeline through intermediate filters before an interpreter, rather than
 assuming one benign-looking stage makes downloaded bytes trustworthy.
+Classification also interprets shell ANSI-C quoted executable/script text, so
+the review warning describes the command after `$'\xNN'`, octal, or Unicode
+escape expansion rather than trusting its encoded spelling.
 
 ## High-level modules
 

