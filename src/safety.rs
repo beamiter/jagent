@@ -5724,6 +5724,196 @@ fn hostname_family_changes_name(tokens: &[String], command: &str) -> bool {
     boot || mode != HostnameMode::Query && (file || positionals == 1)
 }
 
+fn find_deletes_paths(tokens: &[String]) -> bool {
+    const ONE_VALUE: &[&str] = &[
+        "-amin",
+        "-anewer",
+        "-atime",
+        "-cmin",
+        "-cnewer",
+        "-context",
+        "-ctime",
+        "-files0-from",
+        "-fls",
+        "-fprint",
+        "-fprint0",
+        "-fstype",
+        "-gid",
+        "-group",
+        "-ilname",
+        "-iname",
+        "-inum",
+        "-ipath",
+        "-iregex",
+        "-iwholename",
+        "-links",
+        "-lname",
+        "-maxdepth",
+        "-mindepth",
+        "-mmin",
+        "-mtime",
+        "-name",
+        "-newer",
+        "-path",
+        "-perm",
+        "-printf",
+        "-regex",
+        "-regextype",
+        "-samefile",
+        "-size",
+        "-type",
+        "-uid",
+        "-used",
+        "-user",
+        "-wholename",
+        "-xtype",
+    ];
+    const NO_VALUE: &[&str] = &[
+        "-daystart",
+        "-depth",
+        "-empty",
+        "-executable",
+        "-false",
+        "-follow",
+        "-ignore_readdir_race",
+        "-ls",
+        "-mount",
+        "-nogroup",
+        "-noignore_readdir_race",
+        "-noleaf",
+        "-nouser",
+        "-nowarn",
+        "-print",
+        "-print0",
+        "-prune",
+        "-quit",
+        "-readable",
+        "-true",
+        "-warn",
+        "-writable",
+        "-xdev",
+    ];
+
+    let mut index = 1usize;
+    let mut expression_started = false;
+    let mut need_operand = true;
+    let mut parentheses = 0usize;
+    let mut delete = false;
+
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if matches!(token, "--help" | "--version" | "-help" | "-version") {
+            return false;
+        }
+        if !expression_started {
+            if token == "--" || matches!(token, "-H" | "-L" | "-P") {
+                index += 1;
+                continue;
+            }
+            if token == "-D" {
+                if tokens.get(index + 1).is_none() {
+                    return false;
+                }
+                index += 2;
+                continue;
+            }
+            if token.starts_with("-D") && token.len() > 2
+                || token.starts_with("-O") && token.len() > 2
+            {
+                index += 1;
+                continue;
+            }
+            if !token.starts_with('-') && !matches!(token, "!" | "(" | ")" | ",") {
+                index += 1;
+                continue;
+            }
+        }
+
+        match token {
+            "!" | "-not" => {
+                expression_started = true;
+                need_operand = true;
+                index += 1;
+            }
+            "(" => {
+                expression_started = true;
+                parentheses += 1;
+                need_operand = true;
+                index += 1;
+            }
+            ")" => {
+                if !expression_started || need_operand || parentheses == 0 {
+                    return false;
+                }
+                parentheses -= 1;
+                need_operand = false;
+                index += 1;
+            }
+            "-a" | "-and" | "-o" | "-or" | "," => {
+                if !expression_started || need_operand {
+                    return false;
+                }
+                need_operand = true;
+                index += 1;
+            }
+            "-delete" => {
+                expression_started = true;
+                need_operand = false;
+                delete = true;
+                index += 1;
+            }
+            "-fprintf" => {
+                if tokens.get(index + 2).is_none() {
+                    return false;
+                }
+                expression_started = true;
+                need_operand = false;
+                index += 3;
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let command_start = index + 1;
+                let mut end = command_start;
+                while tokens
+                    .get(end)
+                    .is_some_and(|token| !matches!(token.as_str(), ";" | "+"))
+                {
+                    end += 1;
+                }
+                let Some(terminator) = tokens.get(end).map(String::as_str) else {
+                    return false;
+                };
+                if end == command_start
+                    || terminator == "+" && tokens.get(end - 1).map(String::as_str) != Some("{}")
+                {
+                    return false;
+                }
+                expression_started = true;
+                need_operand = false;
+                index = end + 1;
+            }
+            _ if ONE_VALUE.contains(&token)
+                || token
+                    .strip_prefix("-newer")
+                    .is_some_and(|suffix| suffix.len() == 2) =>
+            {
+                if tokens.get(index + 1).is_none() {
+                    return false;
+                }
+                expression_started = true;
+                need_operand = false;
+                index += 2;
+            }
+            _ if NO_VALUE.contains(&token) => {
+                expression_started = true;
+                need_operand = false;
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+
+    delete && expression_started && !need_operand && parentheses == 0
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6997,7 +7187,7 @@ fn dangerous_segment(
         "parted" if parted_changes_partition_table(selected.tokens) => {
             return Some("parted can change a disk partition table");
         }
-        "find" if effective[1..].iter().any(|token| token == "-delete") => {
+        "find" if find_deletes_paths(selected.tokens) => {
             return Some("find -delete permanently removes matched paths");
         }
         "rsync"
@@ -9239,6 +9429,49 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "hostname-family query, terminal, incomplete, invalid, or command-name substring was treated as a name change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_delete_is_recognized_only_as_an_expression_action() {
+        for command in [
+            "find . -delete",
+            "find . -name '*.tmp' -delete",
+            "find . ! -delete",
+            "find . \\( -delete \\)",
+            "find . -delete -print",
+            "find . -exec echo '{}' \\; -delete",
+            "env find . -delete",
+            "nohup find . -delete",
+            "printf ignored | xargs find . -delete",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "find --help . -delete",
+            "find --version . -delete",
+            "find -D -delete .",
+            "find . -name -delete",
+            "find . -iname -delete",
+            "find . -path -delete",
+            "find . -regex -delete",
+            "find . -lname -delete",
+            "find . -printf -delete",
+            "find . -fprint -delete",
+            "find . -fprintf output.txt -delete",
+            "find . -exec echo -delete '{}' \\;",
+            "find . -execdir echo -delete '{}' +",
+            "find . -ok echo -delete '{}' \\;",
+            "find . -delete=now",
+            "find . -unknown -delete",
+            "find . -delete -name",
+            "finder . -delete",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "find terminal, value, child argv, incomplete, invalid, or command-name substring was treated as a delete action for {command:?}"
             );
         }
     }
