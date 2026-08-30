@@ -265,6 +265,14 @@ those warnings. Executable concatenation and nested scripts such as
 behind their pre-expansion spelling; identical text passed to `printf` or
 `echo` remains ordinary data and does not raise a destructive-command warning.
 
+The structural proposal-text gate is now public as
+`validate_command_text`/`CommandTextError`, together with
+`MAX_COMMAND_BYTES`. It returns the exact input without trimming and is the
+single implementation used by response parsing, edited approval/manual-review
+paths, and snapshot restoration. Review cards and shell insertion adapters can
+now call the same contract instead of hard-coding 16 KiB and rebuilding the
+control/invisible checks; passing it still never authorizes execution.
+
 ## Remaining integration boundaries
 
 `jagent` remains sans-IO. It now validates the request value's URL/body/header

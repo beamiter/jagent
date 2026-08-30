@@ -17,8 +17,9 @@
 //!   commands; approval returns an [`session::ApprovedCommand`] value to the
 //!   caller, and nothing in this crate can execute it.
 //! - [`safety`] — recognizable-danger warnings, the shared
+//!   [`safety::validate_command_text`] boundary and
 //!   [`safety::is_unsafe_invisible_char`] predicate that every integration
-//!   should reuse rather than copy, and a retired auto-approval compatibility
+//!   should reuse rather than copy, plus a retired auto-approval compatibility
 //!   hook that always fails closed.
 //! - [`provider`] — provider-neutral chat request construction (Anthropic /
 //!   OpenAI-compatible / Ollama) returning [`provider::BuiltRequest`] data
@@ -90,7 +91,10 @@ pub use provider::{
 };
 pub use redact::{redact_secrets, redact_secrets_cow};
 pub use response::{AgentResponse, AgentStream};
-pub use safety::{is_auto_approvable, is_dangerous, is_unsafe_invisible_char};
+pub use safety::{
+    is_auto_approvable, is_dangerous, is_unsafe_invisible_char, validate_command_text,
+    CommandTextError, MAX_COMMAND_BYTES,
+};
 pub use session::{
     AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
     CommandExecutionFailure, CommandExecutionOutcome, ModelOutcome, ParseError, PendingProposal,

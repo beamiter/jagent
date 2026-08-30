@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added `validate_command_text`, `CommandTextError`, and the public
+  `MAX_COMMAND_BYTES` ceiling so terminals and shells can share the exact
+  bounded, nonempty, single-line, control-free, visually unambiguous command
+  contract used by model parsing, editing, and snapshot restoration. The API
+  returns the original slice without normalization and does not imply that a
+  structurally valid command is safe to execute.
 - Exported `is_unsafe_invisible_char` so integrations can apply the crate's own
   invisible/bidirectional rule instead of re-deriving it. It is the only such
   check on a model-proposed command, and while it was crate-private every

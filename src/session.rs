@@ -4,7 +4,7 @@
 //! value to the caller; this module has no PTY, shell, process, or UI access and
 //! therefore cannot execute a command by itself.
 
-use crate::safety::{is_dangerous, is_unsafe_invisible_char, MAX_COMMAND_BYTES};
+use crate::safety::{is_dangerous, validate_command_text, CommandTextError, MAX_COMMAND_BYTES};
 use crate::text::elide_middle;
 use crate::tools::{
     AgentProtocol, ToolResponse, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_NAME_BYTES, TOOL_DONE,
@@ -352,25 +352,21 @@ fn reject_unexpected(
 }
 
 fn validate_command(command: &str) -> Result<(), ParseError> {
-    if command.len() > MAX_COMMAND_BYTES {
-        return Err(ParseError::FieldTooLarge("command"));
-    }
-    if command.contains(['\r', '\n']) {
-        return Err(ParseError::InvalidCommand(
-            "must be exactly one visible line".into(),
-        ));
-    }
-    if command.chars().any(char::is_control) {
-        return Err(ParseError::InvalidCommand(
-            "contains a control character".into(),
-        ));
-    }
-    if command.chars().any(is_unsafe_invisible_char) {
-        return Err(ParseError::InvalidCommand(
-            "contains an invisible or bidirectional formatting character".into(),
-        ));
-    }
-    Ok(())
+    validate_command_text(command)
+        .map(|_| ())
+        .map_err(|error| match error {
+            CommandTextError::TooLarge => ParseError::FieldTooLarge("command"),
+            CommandTextError::Empty => ParseError::EmptyField("command"),
+            CommandTextError::LineBreak => {
+                ParseError::InvalidCommand("must be exactly one visible line".into())
+            }
+            CommandTextError::ControlCharacter => {
+                ParseError::InvalidCommand("contains a control character".into())
+            }
+            CommandTextError::VisualSpoof => ParseError::InvalidCommand(
+                "contains an invisible or bidirectional formatting character".into(),
+            ),
+        })
 }
 
 /// Allocation-free state atom used by the bounded snapshot schema.
@@ -893,9 +889,6 @@ impl AgentSession {
         edited_command: impl Into<String>,
     ) -> Result<ApprovedCommand, SessionError> {
         let command = edited_command.into();
-        if command.trim().is_empty() {
-            return Err(SessionError::Protocol(ParseError::EmptyField("command")));
-        }
         validate_command(&command).map_err(SessionError::Protocol)?;
         self.approve_inner(id, Some(command))
     }
@@ -1004,9 +997,6 @@ impl AgentSession {
         self.check_not_cancelled()?;
         self.expect_pending_proposal(id, "move a proposal to manual review")?;
         let edited_command = edited_command.into();
-        if edited_command.trim().is_empty() {
-            return Err(SessionError::Protocol(ParseError::EmptyField("command")));
-        }
         validate_command(&edited_command).map_err(SessionError::Protocol)?;
         let turn = self.pending_proposal_mut(id)?;
         let Turn::AssistantProposed {
@@ -1421,7 +1411,7 @@ fn validate_snapshot_transcript(
                         "proposal ids are zero, duplicated, or out of order",
                     ));
                 }
-                if command.trim().is_empty() || validate_command(command).is_err() {
+                if validate_command(command).is_err() {
                     return Err(AgentSnapshotError::Invalid(
                         "proposal command violates its safety bounds",
                     ));

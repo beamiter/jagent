@@ -1,7 +1,74 @@
 //! Command risk heuristics. Nothing here authorizes or blocks execution; the
 //! integration's approval UI decides what to do with a warning.
 
-pub(crate) const MAX_COMMAND_BYTES: usize = 16 * 1024;
+use std::fmt;
+
+/// Maximum encoded size of one model-proposed or user-edited command.
+///
+/// This is public so approval cards, prompt-insertion paths, and persisted
+/// session adapters can enforce the exact same ceiling before copying text.
+pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
+
+/// Why command text cannot cross the shared review boundary.
+///
+/// Passing this structural check does not make a command safe or suitable for
+/// execution. It only proves that the exact bounded, single-line spelling can
+/// be displayed and handed back without hidden terminal or bidi semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandTextError {
+    Empty,
+    TooLarge,
+    LineBreak,
+    ControlCharacter,
+    VisualSpoof,
+}
+
+impl fmt::Display for CommandTextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => formatter.write_str("the command is empty"),
+            Self::TooLarge => write!(
+                formatter,
+                "the command exceeds the {MAX_COMMAND_BYTES}-byte review limit"
+            ),
+            Self::LineBreak => formatter.write_str("the command must be exactly one visible line"),
+            Self::ControlCharacter => {
+                formatter.write_str("the command contains a control character")
+            }
+            Self::VisualSpoof => formatter.write_str(
+                "the command contains an invisible or bidirectional formatting character",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CommandTextError {}
+
+/// Validate the shared, non-authorizing command-text contract.
+///
+/// The returned slice is the caller's exact input; this function never trims
+/// or normalizes the bytes an approval UI is expected to show. Use
+/// [`is_dangerous`] separately for heuristic warnings, and still require an
+/// explicit review decision for every accepted value.
+pub fn validate_command_text(command: &str) -> Result<&str, CommandTextError> {
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(CommandTextError::TooLarge);
+    }
+    if command.trim().is_empty() {
+        return Err(CommandTextError::Empty);
+    }
+    if command.contains(['\r', '\n']) {
+        return Err(CommandTextError::LineBreak);
+    }
+    if command.chars().any(char::is_control) {
+        return Err(CommandTextError::ControlCharacter);
+    }
+    if command.chars().any(is_unsafe_invisible_char) {
+        return Err(CommandTextError::VisualSpoof);
+    }
+    Ok(command)
+}
 
 /// Characters that can visually reorder or hide text without being classified
 /// as control characters by [`char::is_control`]. A review-first approval card
@@ -937,6 +1004,34 @@ fn is_interpreter(tokens: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_command_text_contract_is_exact_bounded_and_non_normalizing() {
+        let spaced = "  printf reviewed  ";
+        assert_eq!(validate_command_text(spaced), Ok(spaced));
+        assert!(validate_command_text(&"x".repeat(MAX_COMMAND_BYTES)).is_ok());
+        assert_eq!(
+            validate_command_text(&"x".repeat(MAX_COMMAND_BYTES + 1)),
+            Err(CommandTextError::TooLarge)
+        );
+        assert_eq!(validate_command_text("  "), Err(CommandTextError::Empty));
+        assert_eq!(
+            validate_command_text("printf one\nprintf two"),
+            Err(CommandTextError::LineBreak)
+        );
+        assert_eq!(
+            validate_command_text("printf\tvalue"),
+            Err(CommandTextError::ControlCharacter)
+        );
+        assert_eq!(
+            validate_command_text("printf safe\u{e0000}"),
+            Err(CommandTextError::VisualSpoof)
+        );
+
+        let shared: fn(&str) -> Result<&str, CommandTextError> = crate::validate_command_text;
+        assert_eq!(shared("pwd"), Ok("pwd"));
+        assert_eq!(crate::MAX_COMMAND_BYTES, MAX_COMMAND_BYTES);
+    }
 
     #[test]
     fn dangerous_patterns_are_flagged() {

@@ -309,6 +309,12 @@ Classification also interprets shell ANSI-C quoted executable/script text, so
 the review warning describes the command after `$'\xNN'`, octal, or Unicode
 escape expansion rather than trusting its encoded spelling.
 
+Use `validate_command_text` before an integration copies a proposal into an
+approval card, persistence adapter, or review-only shell insertion. It applies
+the same public `MAX_COMMAND_BYTES` ceiling and exact single-line/control/bidi
+contract as the session parser, while returning the original slice unchanged.
+Success is a display/transport invariant, not execution authorization.
+
 ## High-level modules
 
 | Module | Responsibility |
