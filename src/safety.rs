@@ -5084,6 +5084,84 @@ fn mke2fs_formats(tokens: &[String]) -> bool {
     positionals > 0 && !dry_run
 }
 
+fn mkfs_xfs_formats(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut no_modify = false;
+    let mut positionals = 0usize;
+    let mut implicit_data_target = false;
+
+    while let Some(argument) = tokens.get(index).map(String::as_str) {
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            // mkfs.xfs exposes only short options. Unknown long options and
+            // their following operands are rejected during getopt parsing.
+            if argument.starts_with("--") {
+                return false;
+            }
+            if let Some(short) = argument.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'N' => no_modify = true,
+                        'V' => return false,
+                        'C' | 'f' | 'K' | 'q' => {}
+                        'b' | 'c' | 'd' | 'i' | 'l' | 'L' | 'm' | 'n' | 'p' | 'r' | 's' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            if flag == 'c' {
+                                let Some(path) = value.strip_prefix("options=") else {
+                                    return false;
+                                };
+                                if path.is_empty() {
+                                    return false;
+                                }
+                                // A configuration file can provide data.name,
+                                // so its contents are an implicit target.
+                                implicit_data_target = true;
+                            } else if flag == 'd' {
+                                for suboption in value.split(',') {
+                                    if let Some(path) = suboption.strip_prefix("name=") {
+                                        if path.is_empty() {
+                                            return false;
+                                        }
+                                        implicit_data_target = true;
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += usize::from(!argument.is_empty());
+        if positionals > 1 {
+            return false;
+        }
+        index += 1;
+    }
+
+    !no_modify && (positionals == 1 || implicit_data_target)
+}
+
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
     let mut has_argument = false;
     for argument in &tokens[1..] {
@@ -6285,8 +6363,14 @@ fn dangerous_segment(
     {
         return Some("mkfs formats a filesystem");
     }
+    if command == "mkfs.xfs" && mkfs_xfs_formats(selected.tokens) {
+        return Some("mkfs formats a filesystem");
+    }
     if command.starts_with("mkfs.")
-        && !matches!(command, "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4")
+        && !matches!(
+            command,
+            "mkfs.ext2" | "mkfs.ext3" | "mkfs.ext4" | "mkfs.xfs"
+        )
         && mkfs_backend_formats(selected.tokens)
     {
         return Some("mkfs formats a filesystem");
@@ -8157,6 +8241,48 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "ext mkfs dry-run, terminal, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn xfs_mkfs_distinguishes_no_modify_from_filesystem_creation() {
+        for command in [
+            "mkfs.xfs /dev/sdb",
+            "mkfs.xfs -f /dev/sdb",
+            "mkfs.xfs -L data /dev/sdb",
+            "mkfs.xfs -L -N /dev/sdb",
+            "mkfs.xfs -n size=4096 /dev/sdb",
+            "mkfs.xfs -d name=/dev/sdb",
+            "mkfs.xfs -dname=/dev/sdb",
+            "mkfs.xfs -c options=mkfs.ini",
+            "mkfs.xfs -C /dev/sdb",
+            "mkfs.xfs -- /dev/sdb",
+            "env mkfs.xfs /dev/sdb",
+            "printf ignored | xargs mkfs.xfs /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mkfs.xfs -N /dev/sdb",
+            "mkfs.xfs -Nf /dev/sdb",
+            "mkfs.xfs -fN /dev/sdb",
+            "mkfs.xfs /dev/sdb -N",
+            "mkfs.xfs -N -d name=/dev/sdb",
+            "mkfs.xfs -N -c options=mkfs.ini",
+            "mkfs.xfs -V /dev/sdb",
+            "mkfs.xfs",
+            "mkfs.xfs -L data",
+            "mkfs.xfs -d size=1g",
+            "mkfs.xfs -d name=",
+            "mkfs.xfs -n /dev/sdb",
+            "mkfs.xfs -Z /dev/sdb",
+            "mkfs.xfs --help /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "XFS no-modify, terminal, incomplete, or invalid argv was treated as filesystem creation for {command:?}"
             );
         }
     }
