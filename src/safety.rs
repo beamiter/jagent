@@ -4925,6 +4925,91 @@ fn parted_changes_partition_table(tokens: &[String]) -> bool {
     false
 }
 
+fn truncate_changes_file_length(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut has_size_source = false;
+    let mut targets = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "no-create",
+                        "io-blocks",
+                        "reference",
+                        "size",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("reference" | "size") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        has_size_source = true;
+                    }
+                    Some("no-create" | "io-blocks") if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'c' | 'o' => {}
+                        'r' | 's' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            has_size_source = true;
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += usize::from(!option.is_empty());
+        index += 1;
+    }
+
+    has_size_source && targets > 0
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5936,7 +6021,10 @@ fn dangerous_segment(
         {
             return Some("date --set changes the system clock");
         }
-        "truncate" | "shred" => return Some("can irreversibly destroy file contents"),
+        "truncate" if truncate_changes_file_length(selected.tokens) => {
+            return Some("truncate can irreversibly change file contents");
+        }
+        "shred" => return Some("can irreversibly destroy file contents"),
         "wipefs" if wipefs_erases_signatures(selected.tokens) => {
             return Some("wipefs can erase filesystem signatures");
         }
@@ -7594,6 +7682,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "parted query, terminal, invalid argv, command parameter, or command-name substring was treated as partition mutation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncate_requires_a_size_source_and_file_operand() {
+        for command in [
+            "truncate --size 0 important.db",
+            "truncate -s0 important.db",
+            "truncate --size +1MiB image.raw",
+            "truncate --reference template.img target.img",
+            "truncate -r template.img target.img",
+            "truncate --no-create -s 0 existing.db",
+            "truncate --io-blocks --size 1 disk.img",
+            "truncate -cos1 disk.img",
+            "truncate -s0 -- -s",
+            "env truncate -s 0 important.db",
+            "nohup truncate --reference template target",
+            "printf ignored | xargs truncate -s0 important.db",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "truncate --help -s 0 important.db",
+            "truncate --version important.db",
+            "truncate",
+            "truncate important.db",
+            "truncate --no-create important.db",
+            "truncate --size 0",
+            "truncate --reference template.img",
+            "truncate -r template.img -s 0",
+            "truncate --size",
+            "truncate --reference",
+            "truncate -- -s",
+            "truncate --unknown -s 0 important.db",
+            "truncater -s 0 important.db",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "truncate terminal, incomplete or invalid argv, option value, or command-name substring was treated as content destruction for {command:?}"
             );
         }
     }
