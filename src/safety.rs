@@ -5010,6 +5010,127 @@ fn truncate_changes_file_length(tokens: &[String]) -> bool {
     has_size_source && targets > 0
 }
 
+fn shred_changes_file_contents(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut iterations_zero = false;
+    let mut size_zero = false;
+    let mut remove = false;
+    let mut zero_pass = false;
+    let mut targets = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "force",
+                        "iterations",
+                        "random-source",
+                        "size",
+                        "remove",
+                        "verbose",
+                        "exact",
+                        "zero",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some(resolved @ ("iterations" | "random-source" | "size")) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        if resolved == "iterations" {
+                            let Ok(iterations) = value.parse::<u64>() else {
+                                return false;
+                            };
+                            iterations_zero = iterations == 0;
+                        } else if resolved == "size" {
+                            size_zero = value == "0";
+                        }
+                    }
+                    Some("remove") => {
+                        if attached
+                            .is_some_and(|mode| !matches!(mode, "unlink" | "wipe" | "wipesync"))
+                        {
+                            return false;
+                        }
+                        remove = true;
+                        index += 1;
+                    }
+                    Some("zero") if attached.is_none() => {
+                        zero_pass = true;
+                        index += 1;
+                    }
+                    Some("force" | "verbose" | "exact") if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'f' | 'v' | 'x' => {}
+                        'u' => remove = true,
+                        'z' => zero_pass = true,
+                        'n' | 's' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            if flag == 'n' {
+                                let Ok(iterations) = value.parse::<u64>() else {
+                                    return false;
+                                };
+                                iterations_zero = iterations == 0;
+                            } else {
+                                size_zero = value == "0";
+                            }
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += usize::from(!option.is_empty());
+        index += 1;
+    }
+
+    targets > 0 && (remove || !size_zero && (!iterations_zero || zero_pass))
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -6024,7 +6145,9 @@ fn dangerous_segment(
         "truncate" if truncate_changes_file_length(selected.tokens) => {
             return Some("truncate can irreversibly change file contents");
         }
-        "shred" => return Some("can irreversibly destroy file contents"),
+        "shred" if shred_changes_file_contents(selected.tokens) => {
+            return Some("shred can irreversibly destroy file contents");
+        }
         "wipefs" if wipefs_erases_signatures(selected.tokens) => {
             return Some("wipefs can erase filesystem signatures");
         }
@@ -7723,6 +7846,53 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "truncate terminal, incomplete or invalid argv, option value, or command-name substring was treated as content destruction for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shred_requires_an_effective_overwrite_or_removal_and_target() {
+        for command in [
+            "shred secret.txt",
+            "shred --iterations 1 secret.txt",
+            "shred -n1 secret.txt",
+            "shred --size 1MiB disk.img",
+            "shred --random-source random.bin secret.txt",
+            "shred --random-source --help secret.txt",
+            "shred --remove secret.txt",
+            "shred --remove=unlink secret.txt",
+            "shred -n0 -u secret.txt",
+            "shred -n0 --zero secret.txt",
+            "shred -s0 --remove secret.txt",
+            "shred -- -n",
+            "env shred secret.txt",
+            "nohup shred -n1 secret.txt",
+            "printf ignored | xargs shred secret.txt",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "shred --help secret.txt",
+            "shred --version secret.txt",
+            "shred",
+            "shred --iterations 1",
+            "shred --size 1MiB",
+            "shred --random-source random.bin",
+            "shred -n0 secret.txt",
+            "shred -n 0 -s1 secret.txt",
+            "shred -s0 secret.txt",
+            "shred -n1 --size=0 secret.txt",
+            "shred -n0 -z -s0 secret.txt",
+            "shred -n --remove secret.txt",
+            "shred --iterations invalid secret.txt",
+            "shred --remove=invalid secret.txt",
+            "shred --unknown secret.txt",
+            "shredder secret.txt",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "shred terminal, no-op, incomplete or invalid argv, option value, or command-name substring was treated as content destruction for {command:?}"
             );
         }
     }
