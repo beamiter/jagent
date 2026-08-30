@@ -3397,6 +3397,276 @@ fn capsh_dispatch(tokens: &[String]) -> CapshDispatch<'_> {
     CapshDispatch::NoShell
 }
 
+fn mount_changes_topology(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut fake = false;
+    let mut all = false;
+    let mut explicit_endpoint = false;
+    let mut positionals = 0usize;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "all",
+                        "no-canonicalize",
+                        "fake",
+                        "fork",
+                        "fstab",
+                        "internal-only",
+                        "show-labels",
+                        "mkdir",
+                        "no-mtab",
+                        "options-mode",
+                        "options-source",
+                        "options-source-force",
+                        "onlyonce",
+                        "options",
+                        "test-opts",
+                        "read-only",
+                        "types",
+                        "source",
+                        "target",
+                        "target-prefix",
+                        "verbose",
+                        "rw",
+                        "read-write",
+                        "namespace",
+                        "label",
+                        "uuid",
+                        "bind",
+                        "move",
+                        "rbind",
+                        "make-shared",
+                        "make-slave",
+                        "make-private",
+                        "make-unbindable",
+                        "make-rshared",
+                        "make-rslave",
+                        "make-rprivate",
+                        "make-runbindable",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("all") if attached.is_none() => {
+                        all = true;
+                        index += 1;
+                    }
+                    Some("fake") if attached.is_none() => {
+                        fake = true;
+                        index += 1;
+                    }
+                    Some(
+                        flag @ ("fstab" | "options-mode" | "options-source" | "options"
+                        | "test-opts" | "types" | "source" | "target" | "target-prefix"
+                        | "namespace" | "label" | "uuid"),
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                        explicit_endpoint |= matches!(flag, "source" | "target" | "label" | "uuid");
+                    }
+                    Some("mkdir") if !attached.is_some_and(str::is_empty) => index += 1,
+                    Some(
+                        "no-canonicalize"
+                        | "fork"
+                        | "internal-only"
+                        | "show-labels"
+                        | "no-mtab"
+                        | "options-source-force"
+                        | "onlyonce"
+                        | "read-only"
+                        | "verbose"
+                        | "rw"
+                        | "read-write"
+                        | "bind"
+                        | "move"
+                        | "rbind"
+                        | "make-shared"
+                        | "make-slave"
+                        | "make-private"
+                        | "make-unbindable"
+                        | "make-rshared"
+                        | "make-rslave"
+                        | "make-rprivate"
+                        | "make-runbindable",
+                    ) if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => all = true,
+                        'f' => fake = true,
+                        'c' | 'F' | 'i' | 'l' | 'n' | 'r' | 'v' | 'w' | 'B' | 'M' | 'R' => {}
+                        'm' => {
+                            // GNU mount's optional mkdir mode is attached to
+                            // -m; a following argv remains a mount operand.
+                            break;
+                        }
+                        'T' | 'o' | 'O' | 't' | 'N' | 'L' | 'U' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            explicit_endpoint |= matches!(flag, 'L' | 'U');
+                            break;
+                        }
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        index += 1;
+    }
+    !fake && (all || explicit_endpoint || positionals > 0)
+}
+
+fn umount_changes_topology(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut fake = false;
+    let mut all = false;
+    let mut targets = 0usize;
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "all",
+                        "all-targets",
+                        "no-canonicalize",
+                        "detach-loop",
+                        "fake",
+                        "force",
+                        "internal-only",
+                        "no-mtab",
+                        "lazy",
+                        "test-opts",
+                        "recursive",
+                        "read-only",
+                        "types",
+                        "verbose",
+                        "quiet",
+                        "namespace",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("all") if attached.is_none() => {
+                        all = true;
+                        index += 1;
+                    }
+                    Some("fake") if attached.is_none() => {
+                        fake = true;
+                        index += 1;
+                    }
+                    Some("test-opts" | "types" | "namespace") => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some(
+                        "all-targets" | "no-canonicalize" | "detach-loop" | "force"
+                        | "internal-only" | "no-mtab" | "lazy" | "recursive" | "read-only"
+                        | "verbose" | "quiet",
+                    ) if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' => all = true,
+                        'c' | 'd' | 'f' | 'i' | 'n' | 'l' | 'R' | 'r' | 'v' | 'q' | 'A' => {}
+                        'O' | 't' | 'N' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        'h' | 'V' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        targets += 1;
+        index += 1;
+    }
+    !fake && (all || targets > 0)
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -3956,6 +4226,12 @@ fn dangerous_segment(
             }
             CapshDispatch::Invalid | CapshDispatch::NoShell => return None,
         }
+    }
+    if command == "mount" && mount_changes_topology(selected.tokens) {
+        return Some("mount changes mounted filesystem topology");
+    }
+    if command == "umount" && umount_changes_topology(selected.tokens) {
+        return Some("umount detaches mounted filesystems");
     }
     if match command {
         "kill" => kill_delivers_signal(selected.tokens),
@@ -5220,6 +5496,51 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "capsh metadata, invalid argv, or a non-interpreter child was treated as dangerous for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mount_tools_distinguish_topology_changes_from_queries_and_dry_runs() {
+        for command in [
+            "mount /dev/sdb1 /mnt/data",
+            "mount /mnt/data",
+            "mount -a",
+            "mount --bind /srv/data /mnt/data",
+            "mount --make-private /mnt/data",
+            "env mount --target /mnt/data",
+            "printf x | xargs mount --move /old /new",
+            "umount /mnt/data",
+            "umount -a -t nfs",
+            "umount -af",
+            "umount --all-targets /dev/loop0",
+            "nohup umount -l /mnt/data",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "mount",
+            "mount -l",
+            "mount -t ext4",
+            "mount --help /dev/sdb1 /mnt/data",
+            "mount --version /mnt/data",
+            "mount --fake /dev/sdb1 /mnt/data",
+            "mount -fa",
+            "mount --unknown /dev/sdb1 /mnt/data",
+            "mount -o",
+            "umount",
+            "umount --help /mnt/data",
+            "umount --fake /mnt/data",
+            "umount -a --fake",
+            "umount --types",
+            "mountpoint /mnt/data",
+            "findmnt /mnt/data",
+            "remount /mnt/data",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "mount query, dry-run, invalid argv, or command-name substring was treated as a topology change for {command:?}"
             );
         }
     }
