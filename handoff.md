@@ -301,6 +301,11 @@ BusyBox's smaller env applet, and xargs therefore do not reinterpret `command`,
 nested external wrappers; fixed fetchers still propagate the network warning.
 For both env variants, `--` ends options but intentionally leaves subsequent
 `NAME=VALUE` operands active before the executable is selected.
+The initial shell-prefix selector now records when `exec` or an external
+`nohup`/`timeout`/`nice`/GNU-time carrier crosses into direct argv. It no longer
+replays shell assignments, reserved words, or builtins after that boundary.
+Bare Bash `time` is handled before the boundary so `time command ...` retains
+its keyword semantics; command-resolved and path-qualified time stay external.
 
 The structural proposal-text gate is now public as
 `validate_command_text`/`CommandTextError`, together with

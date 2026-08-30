@@ -335,6 +335,11 @@ interpreted a second time. BusyBox `env` uses its smaller applet grammar, while
 GNU-only `-S` remains invalid there. The same context-aware dispatcher walk
 follows a fixed `curl`/`wget` child across a pipeline without treating an
 uppercase or non-existent wrapper name as a network fetch.
+Top-level external `nohup`, `timeout`, `nice`, GNU `time`, and `exec` children
+also retain direct argv, so assignment-looking words and shell builtins are not
+reparsed. A bare Bash `time` keyword remains shell syntax, including a following
+`command`/`builtin`, while an explicit or command-resolved `time` executable
+keeps its child direct.
 
 Use `validate_command_text` before an integration copies a proposal into an
 approval card, persistence adapter, or review-only shell insertion. It applies

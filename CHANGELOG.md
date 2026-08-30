@@ -173,6 +173,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assignments, `command`, and `eval` are no longer reparsed after dispatch.
   Fixed network fetchers remain visible across the same bounded walk, and `--`
   correctly ends env options without disabling following `NAME=VALUE` operands.
+- Top-level external execution wrappers and `exec` now preserve direct child
+  argv instead of reapplying shell assignments, reserved words, or builtin
+  prefixes. Bare Bash `time` remains a shell pipeline keyword; command-resolved
+  or path-qualified GNU `time` remains an external wrapper.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as
