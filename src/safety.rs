@@ -4302,6 +4302,237 @@ fn cryptsetup_changes_state(tokens: &[String]) -> bool {
     action == "token" && arguments.len() >= 2 && matches!(arguments[0], "add" | "remove" | "import")
 }
 
+fn systemctl_disrupts_state(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut dry_run = false;
+    let mut marked = false;
+    let mut positionals = Vec::new();
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "help",
+                        "version",
+                        "system",
+                        "user",
+                        "host",
+                        "machine",
+                        "type",
+                        "state",
+                        "failed",
+                        "property",
+                        "all",
+                        "full",
+                        "recursive",
+                        "reverse",
+                        "with-dependencies",
+                        "job-mode",
+                        "show-transaction",
+                        "show-types",
+                        "value",
+                        "check-inhibitors",
+                        "kill-whom",
+                        "kill-value",
+                        "signal",
+                        "what",
+                        "now",
+                        "dry-run",
+                        "quiet",
+                        "no-warn",
+                        "wait",
+                        "no-block",
+                        "no-wall",
+                        "no-reload",
+                        "legend",
+                        "no-pager",
+                        "no-ask-password",
+                        "global",
+                        "runtime",
+                        "force",
+                        "preset-mode",
+                        "root",
+                        "image",
+                        "image-policy",
+                        "lines",
+                        "output",
+                        "firmware-setup",
+                        "boot-loader-menu",
+                        "boot-loader-entry",
+                        "plain",
+                        "timestamp",
+                        "read-only",
+                        "mkdir",
+                        "marked",
+                        "drop-in",
+                        "when",
+                    ],
+                ) {
+                    Some(
+                        "host" | "machine" | "type" | "state" | "property" | "job-mode"
+                        | "check-inhibitors" | "kill-whom" | "kill-value" | "signal" | "what"
+                        | "legend" | "preset-mode" | "root" | "image" | "image-policy" | "lines"
+                        | "output" | "boot-loader-menu" | "boot-loader-entry" | "timestamp"
+                        | "drop-in" | "when",
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("dry-run") if attached.is_none() => {
+                        dry_run = true;
+                        index += 1;
+                    }
+                    Some("marked") if attached.is_none() => {
+                        marked = true;
+                        index += 1;
+                    }
+                    Some(
+                        "system" | "user" | "failed" | "all" | "full" | "recursive" | "reverse"
+                        | "with-dependencies" | "show-transaction" | "show-types" | "value" | "now"
+                        | "quiet" | "no-warn" | "wait" | "no-block" | "no-wall" | "no-reload"
+                        | "no-pager" | "no-ask-password" | "global" | "runtime" | "force"
+                        | "firmware-setup" | "plain" | "read-only" | "mkdir",
+                    ) if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'a' | 'l' | 'r' | 'T' | 'i' | 'q' | 'f' => {}
+                        'H' | 'M' | 't' | 'p' | 'P' | 's' | 'n' | 'o' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        'h' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals.push(option);
+        index += 1;
+    }
+
+    let Some((&verb, arguments)) = positionals.split_first() else {
+        return false;
+    };
+    let system_action = matches!(
+        verb,
+        "default"
+            | "rescue"
+            | "emergency"
+            | "halt"
+            | "poweroff"
+            | "reboot"
+            | "kexec"
+            | "soft-reboot"
+            | "exit"
+            | "suspend"
+            | "hibernate"
+            | "hybrid-sleep"
+            | "suspend-then-hibernate"
+    );
+    if system_action {
+        return !dry_run;
+    }
+    if matches!(
+        verb,
+        "preset-all"
+            | "reset-failed"
+            | "cancel"
+            | "import-environment"
+            | "daemon-reload"
+            | "daemon-reexec"
+            | "switch-root"
+    ) {
+        return true;
+    }
+    if matches!(verb, "log-level" | "log-target" | "service-watchdogs") {
+        return !arguments.is_empty();
+    }
+    if matches!(verb, "service-log-level" | "service-log-target") {
+        return arguments.len() >= 2;
+    }
+    if matches!(verb, "set-property" | "bind" | "mount-image") {
+        return arguments.len() >= 2;
+    }
+    if matches!(verb, "add-wants" | "add-requires") {
+        return arguments.len() >= 2;
+    }
+    let marked_action = marked
+        && matches!(
+            verb,
+            "reload" | "restart" | "try-restart" | "reload-or-restart" | "try-reload-or-restart"
+        );
+    marked_action
+        || !arguments.is_empty()
+            && matches!(
+                verb,
+                "start"
+                    | "stop"
+                    | "reload"
+                    | "restart"
+                    | "try-restart"
+                    | "reload-or-restart"
+                    | "try-reload-or-restart"
+                    | "isolate"
+                    | "kill"
+                    | "clean"
+                    | "freeze"
+                    | "thaw"
+                    | "enable"
+                    | "disable"
+                    | "reenable"
+                    | "preset"
+                    | "mask"
+                    | "unmask"
+                    | "link"
+                    | "revert"
+                    | "edit"
+                    | "set-default"
+                    | "set-environment"
+                    | "unset-environment"
+            )
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -4957,15 +5188,8 @@ fn dangerous_segment(
         "reboot" | "shutdown" | "poweroff" | "halt" => {
             return Some("can stop or restart the system");
         }
-        "systemctl"
-            if effective[1..].iter().any(|token| {
-                matches!(
-                    token.as_str(),
-                    "reboot" | "poweroff" | "halt" | "stop" | "restart" | "disable" | "mask"
-                )
-            }) =>
-        {
-            return Some("systemctl can stop or disrupt system services");
+        "systemctl" if systemctl_disrupts_state(selected.tokens) => {
+            return Some("systemctl changes or disrupts system or service state");
         }
         "service"
             if effective[1..]
@@ -6333,6 +6557,71 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "cryptsetup inspection, validation, invalid argv, option value, or name substring was treated as mutation for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systemctl_parses_global_option_values_before_classifying_verbs() {
+        for command in [
+            "systemctl start jagent.service",
+            "systemctl stop jagent.service",
+            "systemctl reload-or-restart jagent.service",
+            "systemctl isolate rescue.target",
+            "systemctl --signal KILL kill jagent.service",
+            "systemctl clean jagent.service",
+            "systemctl enable --now jagent.service",
+            "systemctl mask jagent.service",
+            "systemctl preset-all",
+            "systemctl reset-failed",
+            "systemctl cancel",
+            "systemctl daemon-reload",
+            "systemctl daemon-reexec",
+            "systemctl set-environment MODE=maintenance",
+            "systemctl log-level debug",
+            "systemctl service-log-level jagent.service debug",
+            "systemctl reboot",
+            "systemctl --dry-run stop jagent.service",
+            "systemctl --when now reboot",
+            "systemctl --marked restart",
+            "systemctl -sKILL kill jagent.service",
+            "systemctl restart --no-block jagent.service",
+            "systemctl -- restart jagent.service",
+            "systemctl switch-root /new-root",
+            "env systemctl disable jagent.service",
+            "nohup systemctl suspend",
+            "printf x | xargs systemctl restart jagent.service",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "systemctl status jagent.service",
+            "systemctl is-active jagent.service",
+            "systemctl --host stop status",
+            "systemctl --type restart list-units",
+            "systemctl --property reboot show jagent.service",
+            "systemctl --root stop list-unit-files",
+            "systemctl --user status jagent.service",
+            "systemctl --dry-run reboot",
+            "systemctl --dry-run poweroff",
+            "systemctl --marked status jagent.service",
+            "systemctl -Hstop status",
+            "systemctl --signal=restart status jagent.service",
+            "systemctl status restart",
+            "systemctl --help restart jagent.service",
+            "systemctl --version stop jagent.service",
+            "systemctl",
+            "systemctl log-level",
+            "systemctl service-log-level jagent.service",
+            "systemctl service-watchdogs",
+            "systemctl --host",
+            "systemctl --unknown restart jagent.service",
+            "systemcontroller restart jagent.service",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemctl query, dry-run, invalid argv, option value, or name substring was treated as a disruptive verb for {command:?}"
             );
         }
     }
