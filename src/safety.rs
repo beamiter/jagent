@@ -4526,6 +4526,197 @@ fn fdisk_edits_partition_table(tokens: &[String]) -> bool {
     !query && targets > 0
 }
 
+fn sfdisk_changes_partition_table(tokens: &[String]) -> bool {
+    #[derive(Clone, Copy)]
+    enum Mode {
+        Write,
+        Activate,
+        Query,
+        Reorder,
+        Delete,
+        PartField,
+        DiskId,
+        Relocate,
+    }
+
+    let mut index = 1usize;
+    let mut options = true;
+    let mut mode = Mode::Write;
+    let mut no_act = false;
+    let mut positionals = 0usize;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                match unique_long_option(
+                    spelling,
+                    &[
+                        "activate",
+                        "dump",
+                        "json",
+                        "backup-pt-sectors",
+                        "show-geometry",
+                        "list",
+                        "list-free",
+                        "reorder",
+                        "show-size",
+                        "list-types",
+                        "verify",
+                        "delete",
+                        "part-label",
+                        "part-type",
+                        "part-uuid",
+                        "part-attrs",
+                        "disk-id",
+                        "relocate",
+                        "append",
+                        "backup",
+                        "bytes",
+                        "move-data",
+                        "move-use-fsync",
+                        "force",
+                        "color",
+                        "lock",
+                        "partno",
+                        "no-act",
+                        "no-reread",
+                        "no-tell-kernel",
+                        "backup-file",
+                        "output",
+                        "quiet",
+                        "wipe",
+                        "wipe-partitions",
+                        "label",
+                        "label-nested",
+                        "show-pt-geometry",
+                        "Linux",
+                        "unit",
+                        "help",
+                        "version",
+                    ],
+                ) {
+                    Some("activate") if attached.is_none() => {
+                        mode = Mode::Activate;
+                        index += 1;
+                    }
+                    Some(
+                        "dump" | "json" | "backup-pt-sectors" | "show-geometry" | "list"
+                        | "list-free" | "show-size" | "list-types" | "verify" | "show-pt-geometry",
+                    ) if attached.is_none() => {
+                        mode = Mode::Query;
+                        index += 1;
+                    }
+                    Some("reorder") if attached.is_none() => {
+                        mode = Mode::Reorder;
+                        index += 1;
+                    }
+                    Some("delete") if attached.is_none() => {
+                        mode = Mode::Delete;
+                        index += 1;
+                    }
+                    Some("part-label" | "part-type" | "part-uuid" | "part-attrs")
+                        if attached.is_none() =>
+                    {
+                        mode = Mode::PartField;
+                        index += 1;
+                    }
+                    Some("disk-id") if attached.is_none() => {
+                        mode = Mode::DiskId;
+                        index += 1;
+                    }
+                    Some("relocate") if attached.is_none() => {
+                        mode = Mode::Relocate;
+                        index += 1;
+                    }
+                    Some(
+                        "partno" | "backup-file" | "output" | "wipe" | "wipe-partitions" | "label"
+                        | "label-nested" | "unit",
+                    ) => {
+                        index += 1;
+                        let value = if let Some(value) = attached {
+                            value
+                        } else {
+                            let Some(value) = tokens.get(index).map(String::as_str) else {
+                                return false;
+                            };
+                            index += 1;
+                            value
+                        };
+                        if value.is_empty() {
+                            return false;
+                        }
+                    }
+                    Some("move-data" | "color" | "lock") => index += 1,
+                    Some("no-act") if attached.is_none() => {
+                        no_act = true;
+                        index += 1;
+                    }
+                    Some(
+                        "append" | "backup" | "bytes" | "move-use-fsync" | "force" | "no-reread"
+                        | "no-tell-kernel" | "quiet" | "Linux",
+                    ) if attached.is_none() => index += 1,
+                    Some("help" | "version") if attached.is_none() => return false,
+                    _ => return false,
+                }
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for (offset, flag) in short.char_indices() {
+                    match flag {
+                        'A' => mode = Mode::Activate,
+                        'd' | 'J' | 'B' | 'g' | 'l' | 'F' | 's' | 'T' | 'V' | 'G' => {
+                            mode = Mode::Query;
+                        }
+                        'r' => mode = Mode::Reorder,
+                        'a' | 'b' | 'f' | 'q' | 'L' => {}
+                        'n' => no_act = true,
+                        'N' | 'O' | 'o' | 'w' | 'W' | 'X' | 'Y' | 'u' => {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
+                                    return false;
+                                };
+                                index += 1;
+                                value
+                            };
+                            if value.is_empty() {
+                                return false;
+                            }
+                            break;
+                        }
+                        'h' | 'v' => return false,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        index += 1;
+    }
+
+    if no_act {
+        return false;
+    }
+    match mode {
+        Mode::Write | Mode::Reorder | Mode::Delete => positionals >= 1,
+        Mode::Activate | Mode::DiskId | Mode::Relocate => positionals >= 2,
+        Mode::PartField => positionals >= 3,
+        Mode::Query => false,
+    }
+}
+
 fn systemctl_disrupts_state(tokens: &[String]) -> bool {
     let mut index = 1usize;
     let mut options = true;
@@ -5544,7 +5735,10 @@ fn dangerous_segment(
         "fdisk" if fdisk_edits_partition_table(selected.tokens) => {
             return Some("fdisk can change a disk partition table");
         }
-        "sfdisk" | "cfdisk" | "parted" => {
+        "sfdisk" if sfdisk_changes_partition_table(selected.tokens) => {
+            return Some("sfdisk changes a disk partition table");
+        }
+        "cfdisk" | "parted" => {
             return Some("disk partition tools can destroy filesystem data");
         }
         "find" if effective[1..].iter().any(|token| token == "-delete") => {
@@ -7022,6 +7216,65 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "fdisk list/getsz, terminal, incomplete or invalid argv, option value, or command-name substring was treated as partition editing for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sfdisk_distinguishes_queries_dry_runs_and_partition_mutations() {
+        for command in [
+            "sfdisk /dev/sdb",
+            "sfdisk --append /dev/sdb",
+            "sfdisk --delete /dev/sdb",
+            "sfdisk --reorder /dev/sdb",
+            "sfdisk -A /dev/sdb 1",
+            "sfdisk --activate /dev/sdb 1 2",
+            "sfdisk --part-label /dev/sdb 1 data",
+            "sfdisk --part-type /dev/sdb 1 linux",
+            "sfdisk --part-uuid /dev/sdb 1 1234",
+            "sfdisk --part-attrs /dev/sdb 1 RequiredPartition",
+            "sfdisk --disk-id /dev/sdb 1234",
+            "sfdisk --relocate gpt-bak-std /dev/sdb",
+            "sfdisk --partno --delete /dev/sdb",
+            "sfdisk -- -d",
+            "env sfdisk --delete /dev/sdb",
+            "nohup sfdisk --reorder /dev/sdb",
+            "printf ignored | xargs sfdisk --delete /dev/sdb",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "sfdisk -d /dev/sdb",
+            "sfdisk --json /dev/sdb",
+            "sfdisk --backup-pt-sectors /dev/sdb",
+            "sfdisk --show-geometry /dev/sdb",
+            "sfdisk --list /dev/sdb /dev/sdc",
+            "sfdisk --list-free /dev/sdb",
+            "sfdisk --show-size /dev/sdb",
+            "sfdisk --list-types",
+            "sfdisk --verify /dev/sdb",
+            "sfdisk --activate /dev/sdb",
+            "sfdisk --part-label /dev/sdb 1",
+            "sfdisk --part-type /dev/sdb 1",
+            "sfdisk --part-uuid /dev/sdb 1",
+            "sfdisk --part-attrs /dev/sdb 1",
+            "sfdisk --disk-id /dev/sdb",
+            "sfdisk --no-act /dev/sdb",
+            "sfdisk -n --delete /dev/sdb",
+            "sfdisk --no-act --reorder /dev/sdb",
+            "sfdisk --output --delete --list /dev/sdb",
+            "sfdisk --help --delete /dev/sdb",
+            "sfdisk --version /dev/sdb",
+            "sfdisk",
+            "sfdisk --delete",
+            "sfdisk --part-label /dev/sdb",
+            "sfdisk --unknown /dev/sdb",
+            "mysfdisk --delete /dev/sdb",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "sfdisk query, no-act, incomplete or invalid argv, option value, or command-name substring was treated as a partition mutation for {command:?}"
             );
         }
     }
