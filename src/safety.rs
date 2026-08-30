@@ -4556,6 +4556,139 @@ fn service_changes_state(tokens: &[String]) -> bool {
         .is_some_and(|action| action.as_str() != "status")
 }
 
+fn shutdown_stops_system(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut positionals = 0usize;
+    let mut selects_action = false;
+    let mut warning_only = false;
+    let mut cancel = false;
+    let mut show = false;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                let Some(option) = unique_long_option(
+                    spelling,
+                    &["help", "halt", "poweroff", "reboot", "no-wall", "show"],
+                ) else {
+                    return false;
+                };
+                if attached.is_some() {
+                    return false;
+                }
+                match option {
+                    "help" => return false,
+                    "halt" | "poweroff" | "reboot" => selects_action = true,
+                    "show" => show = true,
+                    "no-wall" => {}
+                    _ => unreachable!("shutdown option list is exhaustive"),
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for flag in short.chars() {
+                    match flag {
+                        'H' | 'P' | 'r' | 'h' => selects_action = true,
+                        'k' => warning_only = true,
+                        'c' => cancel = true,
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        positionals += 1;
+        index += 1;
+    }
+
+    if show && !selects_action && !warning_only && !cancel && positionals == 0 {
+        return false;
+    }
+    if cancel && !selects_action && !warning_only && !show && positionals == 0 {
+        return false;
+    }
+    !(warning_only && !selects_action && !cancel && !show)
+}
+
+fn halt_compat_stops_system(tokens: &[String]) -> bool {
+    let mut index = 1usize;
+    let mut options = true;
+    let mut wtmp_only = false;
+    let mut selects_action = false;
+
+    while let Some(option) = tokens.get(index).map(String::as_str) {
+        if options && option == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options {
+            if let Some(long) = option.strip_prefix("--") {
+                let (spelling, attached) = long
+                    .split_once('=')
+                    .map_or((long, None), |(name, value)| (name, Some(value)));
+                let Some(option) = unique_long_option(
+                    spelling,
+                    &[
+                        "help",
+                        "halt",
+                        "poweroff",
+                        "reboot",
+                        "force",
+                        "wtmp-only",
+                        "no-wtmp",
+                        "no-sync",
+                        "no-wall",
+                    ],
+                ) else {
+                    return false;
+                };
+                if attached.is_some() {
+                    return false;
+                }
+                match option {
+                    "help" => return false,
+                    "halt" | "poweroff" | "reboot" | "force" => selects_action = true,
+                    "wtmp-only" => wtmp_only = true,
+                    "no-wtmp" | "no-sync" | "no-wall" => {}
+                    _ => unreachable!("halt compatibility option list is exhaustive"),
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty()) {
+                index += 1;
+                for flag in short.chars() {
+                    match flag {
+                        'p' | 'f' => selects_action = true,
+                        'w' => wtmp_only = true,
+                        'd' | 'n' => {}
+                        _ => return false,
+                    }
+                }
+                continue;
+            }
+        }
+        // `reboot` accepts an optional firmware argument and compatibility
+        // implementations vary for the aliases. A positional never turns a
+        // stopping invocation into a documented query mode.
+        index += 1;
+    }
+
+    !wtmp_only || selects_action
+}
+
 /// Resolve the signal spellings accepted by the common Linux process tools.
 /// `Some(false)` is the special signal-zero permission/existence query,
 /// `Some(true)` is a signal that can affect a process, and `None` is a literal
@@ -5208,7 +5341,10 @@ fn dangerous_segment(
         {
             return Some("terraform can remove managed infrastructure");
         }
-        "reboot" | "shutdown" | "poweroff" | "halt" => {
+        "shutdown" if shutdown_stops_system(selected.tokens) => {
+            return Some("shutdown can stop or restart the system");
+        }
+        "reboot" | "poweroff" | "halt" if halt_compat_stops_system(selected.tokens) => {
             return Some("can stop or restart the system");
         }
         "systemctl" if systemctl_disrupts_state(selected.tokens) => {
@@ -6682,6 +6818,52 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "service query, incomplete argv, terminal option, or command-name substring was treated as a state change for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shutdown_compatibility_commands_distinguish_non_stopping_modes() {
+        for command in [
+            "shutdown",
+            "shutdown now",
+            "shutdown -r +5 rolling reboot",
+            "shutdown --halt 23:00",
+            "shutdown --no-wall +1",
+            "reboot",
+            "reboot -f",
+            "reboot --reboot",
+            "poweroff",
+            "poweroff -p",
+            "halt",
+            "halt --poweroff",
+            "env shutdown now",
+            "nohup reboot",
+            "printf ignored | xargs shutdown now",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "shutdown --help",
+            "shutdown --help now",
+            "shutdown --show",
+            "shutdown -k now maintenance only",
+            "shutdown -c",
+            "shutdown --unknown now",
+            "reboot --help",
+            "reboot --help -f",
+            "reboot -w",
+            "reboot --wtmp-only",
+            "halt -wd",
+            "poweroff --wtmp-only --no-wall",
+            "poweroff --unknown",
+            "rebooter",
+            "shutdown-notifier now",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "help, query, warning-only, wtmp-only, invalid argv, or command-name substring was treated as a system stop for {command:?}"
             );
         }
     }
