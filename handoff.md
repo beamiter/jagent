@@ -16,6 +16,15 @@ debug invariant: if a provider builder omits any turn after
 `prepare_agent_request` fails closed. This keeps the preparation report and the
 encoded request truthful if the two JSON-wire budgets ever drift.
 
+Snapshot restoration now owns the complete retained lifecycle rather than
+validating its atoms independently. Resumable approval and execution states
+must name the final proposal, turn counters and terminal states must agree with
+the retained history, observations must immediately follow their approved
+proposal, and every approved proposal must retain either that observation or
+the exact proposal-bound execution-failure/unknown-result diagnostic. This
+centralizes the invariant previously audited again by terminal consumers and
+prevents persisted text from covering the command an approval UI may act on.
+
 Untrusted action/response JSON now has one interpretation across the complete
 and streaming paths. A shared allocation-light preflight rejects duplicate
 object members recursively before the ordinary `Value` decoder retains a
@@ -241,8 +250,9 @@ consumer migration details.
 6. Encoded response frames and action objects reject duplicate JSON members
    recursively; no parser-specific first/last-value choice may select an
    action or completion state.
-7. Restore continues to validate proposal ordering, lifecycle, observation
-   binding, active state, and transcript budgets before making a session live.
+7. Restore validates proposal ordering, adjacent execution outcomes, model-turn
+   accounting, final-turn state binding, and transcript budgets before making
+   a session live.
 
 ## Remaining integration boundaries
 

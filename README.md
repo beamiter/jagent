@@ -292,8 +292,10 @@ subset and may omit a usable mode; it never invents a crossed combination.
    closing tag.
 5. Every proposal requires explicit approval. `is_auto_approvable` remains as
    a compatibility hook and always returns `false`.
-6. Snapshot restore revalidates transcript bounds, command shape, active
-   state, strictly increasing proposal IDs, and pending approval bindings.
+6. Snapshot restore revalidates transcript bounds, command shape, model-turn
+   accounting, strictly increasing proposal IDs, final-turn state bindings,
+   and the adjacent proposal/observation lifecycle. Persisted text cannot
+   cover an older approval card or erase an approved command's outcome.
 7. Native tool calls are withheld by the low-level stream parser until their
    enclosing response completes. Token-limited output is never promoted to an
    action.

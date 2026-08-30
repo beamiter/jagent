@@ -234,6 +234,11 @@ When `session.snapshot()` returns a value, serialize it with `to_json` and
 store it with integration-owned permissions and atomic replacement. Restore
 untrusted bytes only through `AgentSessionSnapshot::from_json`, followed by
 `AgentSession::restore`; both encoded and semantic bounds are checked.
+Semantic restoration also binds resumable states to the final retained turn,
+checks model-turn accounting, and requires every approved proposal to retain
+an adjacent observation or the exact proposal-bound execution-failure note.
+Do not treat `AgentState`, `ProposalStatus`, or a decoded transcript turn as a
+validated session on its own.
 
 Use the session's `cancellation_token` to let long-running transport and
 executor work observe cancellation. Calling `session.cancel()` changes the

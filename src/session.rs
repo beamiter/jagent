@@ -1328,32 +1328,7 @@ impl AgentSession {
             ));
         }
         let facts = validate_snapshot_transcript(&snapshot.transcript)?;
-        match snapshot.state {
-            AgentState::AwaitingApproval { proposal_id }
-                if facts.pending_proposal != Some(proposal_id) =>
-            {
-                return Err(AgentSnapshotError::Invalid(
-                    "approval state does not identify the pending proposal",
-                ));
-            }
-            AgentState::AwaitingObservation { proposal_id }
-                if facts.pending_proposal.is_some()
-                    || facts.proposal_statuses.get(&proposal_id)
-                        != Some(&ProposalStatus::Approved)
-                    || facts.observed_proposals.contains(&proposal_id) =>
-            {
-                return Err(AgentSnapshotError::Invalid(
-                    "observation state does not identify one unobserved approved proposal",
-                ));
-            }
-            AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => {}
-            _ if facts.pending_proposal.is_some() => {
-                return Err(AgentSnapshotError::Invalid(
-                    "pending proposal exists outside approval state",
-                ));
-            }
-            _ => {}
-        }
+        validate_snapshot_lifecycle(&snapshot, &facts)?;
         let minimum_next_id =
             facts
                 .highest_proposal_id
@@ -1392,9 +1367,11 @@ impl AgentSession {
 #[derive(Debug, Default)]
 struct SnapshotTranscriptFacts {
     highest_proposal_id: u64,
-    pending_proposal: Option<ProposalId>,
-    proposal_statuses: HashMap<ProposalId, ProposalStatus>,
+    pending_proposal: Option<(ProposalId, usize)>,
+    proposal_statuses: HashMap<ProposalId, (ProposalStatus, usize)>,
     observed_proposals: HashSet<ProposalId>,
+    model_actions: u32,
+    protocol_errors: u32,
 }
 
 /// Validate every invariant that public session transitions establish before
@@ -1411,7 +1388,7 @@ fn validate_snapshot_transcript(
     }
 
     let mut facts = SnapshotTranscriptFacts::default();
-    for turn in transcript {
+    for (index, turn) in transcript.iter().enumerate() {
         match turn {
             Turn::User(message) => {
                 validate_snapshot_text(message, MAX_MESSAGE_BYTES, true, "invalid user turn")?;
@@ -1431,12 +1408,14 @@ fn validate_snapshot_transcript(
                     true,
                     "invalid assistant message",
                 )?;
+                facts.model_actions = facts.model_actions.saturating_add(1);
             }
             Turn::AssistantProposed {
                 id,
                 command,
                 status,
             } => {
+                facts.model_actions = facts.model_actions.saturating_add(1);
                 if id.get() == 0 || id.get() <= facts.highest_proposal_id {
                     return Err(AgentSnapshotError::Invalid(
                         "proposal ids are zero, duplicated, or out of order",
@@ -1448,9 +1427,9 @@ fn validate_snapshot_transcript(
                     ));
                 }
                 facts.highest_proposal_id = id.get();
-                facts.proposal_statuses.insert(*id, *status);
+                facts.proposal_statuses.insert(*id, (*status, index));
                 if *status == ProposalStatus::Pending
-                    && facts.pending_proposal.replace(*id).is_some()
+                    && facts.pending_proposal.replace((*id, index)).is_some()
                 {
                     return Err(AgentSnapshotError::Invalid(
                         "snapshot contains multiple pending proposals",
@@ -1467,11 +1446,16 @@ fn validate_snapshot_transcript(
                         "observation violates its safety bounds",
                     ));
                 }
-                if facts.proposal_statuses.get(proposal_id) != Some(&ProposalStatus::Approved)
-                    || !facts.observed_proposals.insert(*proposal_id)
-                {
+                let approved_immediately_before = facts
+                    .proposal_statuses
+                    .get(proposal_id)
+                    .is_some_and(|(status, proposal_index)| {
+                        *status == ProposalStatus::Approved
+                            && proposal_index.checked_add(1) == Some(index)
+                    });
+                if !approved_immediately_before || !facts.observed_proposals.insert(*proposal_id) {
                     return Err(AgentSnapshotError::Invalid(
-                        "observation does not identify one previously unobserved approved proposal",
+                        "observation does not immediately follow one previously unobserved approved proposal",
                     ));
                 }
             }
@@ -1482,6 +1466,7 @@ fn validate_snapshot_transcript(
                     false,
                     "protocol error exceeds its safety bound",
                 )?;
+                facts.protocol_errors = facts.protocol_errors.saturating_add(1);
             }
         }
     }
@@ -1491,6 +1476,176 @@ fn validate_snapshot_transcript(
         ));
     }
     Ok(facts)
+}
+
+/// Revalidate the cross-field state machine invariants that no standalone
+/// decoded [`AgentState`], [`ProposalStatus`], or transcript turn can prove.
+///
+/// In particular, the final retained turn must be the one the resumable state
+/// names, the model-turn counter must be possible for the retained history,
+/// and every approved proposal must have an adjacent recorded outcome. Without
+/// these checks a syntactically valid persisted document could cover an older
+/// approval card with newer text or silently erase what happened after a
+/// reviewed command was handed to the integration.
+fn validate_snapshot_lifecycle(
+    snapshot: &AgentSessionSnapshot,
+    facts: &SnapshotTranscriptFacts,
+) -> Result<(), AgentSnapshotError> {
+    if snapshot.turns_used < facts.model_actions
+        || (!snapshot.transcript_truncated
+            && snapshot.turns_used > facts.model_actions.saturating_add(facts.protocol_errors))
+    {
+        return Err(AgentSnapshotError::Invalid(
+            "turn counter is inconsistent with the transcript",
+        ));
+    }
+
+    let final_index = snapshot
+        .transcript
+        .len()
+        .checked_sub(1)
+        .ok_or(AgentSnapshotError::Invalid("empty transcript"))?;
+    let final_turn = &snapshot.transcript[final_index];
+
+    // A resumable approval/execution state must bind to the final card. Merely
+    // finding the same id somewhere in history is insufficient: newer turns
+    // would make the visible transcript disagree with the action being
+    // authorized or normalized.
+    match snapshot.state {
+        AgentState::AwaitingApproval { proposal_id }
+            if facts.pending_proposal == Some((proposal_id, final_index)) => {}
+        AgentState::AwaitingApproval { .. } => {
+            return Err(AgentSnapshotError::Invalid(
+                "approval state does not identify the final pending proposal",
+            ));
+        }
+        AgentState::AwaitingObservation { proposal_id }
+            if facts.pending_proposal.is_none()
+                && facts.proposal_statuses.get(&proposal_id)
+                    == Some(&(ProposalStatus::Approved, final_index))
+                && !facts.observed_proposals.contains(&proposal_id) => {}
+        AgentState::AwaitingObservation { .. } => {
+            return Err(AgentSnapshotError::Invalid(
+                "observation state does not identify the final unobserved approved proposal",
+            ));
+        }
+        _ if facts.pending_proposal.is_some() => {
+            return Err(AgentSnapshotError::Invalid(
+                "pending proposal exists outside approval state",
+            ));
+        }
+        _ => {}
+    }
+
+    let final_state_is_valid = match snapshot.state {
+        AgentState::Ready => {
+            snapshot.turns_used < snapshot.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::AwaitingModel => {
+            snapshot.turns_used < snapshot.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::User(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected,
+                            ..
+                        }
+                )
+        }
+        // Both in-flight states were bound to the final turn above.
+        AgentState::AwaitingApproval { .. } | AgentState::AwaitingObservation { .. } => true,
+        AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
+        AgentState::TurnLimitReached => {
+            snapshot.turns_used == snapshot.max_turns
+                && matches!(
+                    final_turn,
+                    Turn::AssistantSay(_)
+                        | Turn::ProtocolError(_)
+                        | Turn::Observation { .. }
+                        | Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                            ..
+                        }
+                )
+        }
+        AgentState::Cancelled => false,
+    };
+    if !final_state_is_valid {
+        return Err(AgentSnapshotError::Invalid(
+            "session state does not match the final transcript turn or turn budget",
+        ));
+    }
+
+    for (proposal_id, (status, index)) in &facts.proposal_statuses {
+        if *status != ProposalStatus::Approved || facts.observed_proposals.contains(proposal_id) {
+            continue;
+        }
+        let is_current_execution = matches!(
+            snapshot.state,
+            AgentState::AwaitingObservation {
+                proposal_id: current
+            } if current == *proposal_id
+        );
+        if !is_current_execution
+            && !is_documented_execution_result(snapshot.transcript.get(index + 1), *proposal_id)
+        {
+            return Err(AgentSnapshotError::Invalid(
+                "approved proposal execution lifecycle is inconsistent",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_documented_execution_result(turn: Option<&Turn>, proposal_id: ProposalId) -> bool {
+    let Some(Turn::ProtocolError(message)) = turn else {
+        return false;
+    };
+    let proposal_id = proposal_id.get();
+
+    // Snapshot schema version 1 spans both spellings. The older form is kept
+    // for compatibility; new sessions emit the proposal-bound diagnostic form.
+    if message
+        == &format!(
+            "the application exited before proposal #{proposal_id}'s output was observed; its \
+             result is unknown"
+        )
+        || message
+            == &format!(
+                "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{proposal_id} has an unknown result: the \
+                 application exited before its output was observed; no normal exit status was \
+                 available"
+            )
+    {
+        return true;
+    }
+
+    ["failed to start", "timed out", "was cancelled"]
+        .into_iter()
+        .any(|failure| {
+            let prefix = format!(
+                "{COMMAND_EXECUTION_DIAGNOSTIC_PREFIX}{proposal_id} {failure}; no normal exit \
+                 status was available"
+            );
+            if message == &format!("{prefix}.") {
+                return true;
+            }
+            let detail_prefix = format!("{prefix}. Untrusted diagnostic or partial output:\n");
+            message.strip_prefix(&detail_prefix).is_some_and(|detail| {
+                !detail.trim().is_empty() && detail.len() <= MAX_OBSERVATION_BYTES
+            })
+        })
 }
 
 fn validate_snapshot_text(
@@ -2446,7 +2601,7 @@ mod tests {
     fn restore_rejects_awaiting_observation_with_a_pending_proposal() {
         let approved = ProposalId(1);
         let pending = ProposalId(2);
-        let snapshot = persisted_snapshot(
+        let mut snapshot = persisted_snapshot(
             vec![
                 Turn::User("inspect".into()),
                 Turn::AssistantProposed {
@@ -2465,11 +2620,115 @@ mod tests {
             },
             3,
         );
+        // Keep the independent model-turn counter valid so this fixture
+        // isolates the conflicting active proposal lifecycles.
+        snapshot.turns_used = 2;
 
         assert!(matches!(
             AgentSession::restore(snapshot),
             Err(AgentSnapshotError::Invalid(reason))
                 if reason.contains("unobserved approved proposal")
+        ));
+    }
+
+    #[test]
+    fn restore_binds_resumable_state_to_the_final_transcript_turn() {
+        let mut session = AgentSession::new(10);
+        session.submit_user("inspect").unwrap();
+        let _pending = accept_run_proposal(&mut session, "printf reviewed");
+        let mut covered = session.snapshot().unwrap();
+
+        // The id and Pending status still agree with AwaitingApproval, but a
+        // newer turn covers the card. Restoring this shape would let an
+        // integration authorize history rather than the visible final turn.
+        covered
+            .transcript
+            .push(Turn::ProtocolError("cover the approval card".into()));
+        assert!(matches!(
+            AgentSession::restore(covered),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("final pending proposal")
+        ));
+
+        let mut completed = AgentSession::new(10);
+        completed.submit_user("run").unwrap();
+        let id = accept_run_proposal(&mut completed, "true");
+        let _approved = completed.approve(id).unwrap();
+        completed.observe(id, 0, "ok").unwrap();
+        let mut completed = completed.snapshot().unwrap();
+        completed.state = AgentState::Completed;
+        assert!(matches!(
+            AgentSession::restore(completed),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("final transcript turn")
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_erased_or_reordered_approved_command_outcomes() {
+        let id = ProposalId(1);
+        let erased = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantProposed {
+                    id,
+                    command: "printf reviewed".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::AssistantSay("nothing happened".into()),
+            ],
+            AgentState::Ready,
+            2,
+        );
+        let mut erased = erased;
+        erased.turns_used = 2;
+        assert!(matches!(
+            AgentSession::restore(erased),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("execution lifecycle")
+        ));
+
+        let reordered = persisted_snapshot(
+            vec![
+                Turn::User("inspect".into()),
+                Turn::AssistantProposed {
+                    id,
+                    command: "printf reviewed".into(),
+                    status: ProposalStatus::Approved,
+                },
+                Turn::AssistantSay("cover the result".into()),
+                Turn::Observation {
+                    proposal_id: id,
+                    exit_code: 0,
+                    output_sample: "ok".into(),
+                },
+            ],
+            AgentState::AwaitingModel,
+            2,
+        );
+        let mut reordered = reordered;
+        reordered.turns_used = 2;
+        assert!(matches!(
+            AgentSession::restore(reordered),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("immediately follow")
+        ));
+    }
+
+    #[test]
+    fn restore_rejects_an_impossible_model_turn_counter() {
+        let mut session = AgentSession::new(10);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "true");
+        let _approved = session.approve(id).unwrap();
+        session.observe(id, 0, "ok").unwrap();
+        let mut snapshot = session.snapshot().unwrap();
+        snapshot.turns_used = 0;
+
+        assert!(matches!(
+            AgentSession::restore(snapshot),
+            Err(AgentSnapshotError::Invalid(reason))
+                if reason.contains("turn counter")
         ));
     }
 

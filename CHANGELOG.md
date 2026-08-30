@@ -87,6 +87,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Snapshot restoration now binds approval and in-flight execution states to
+  the final retained proposal, validates model-turn accounting and terminal
+  state shape, and requires an approved command's observation to be adjacent
+  (or its exact proposal-bound execution-failure diagnostic to be retained).
+  A syntactically valid persisted transcript can no longer cover an older
+  approval card with newer text, reorder an observation, or silently erase an
+  approved command's outcome.
+
 - Rejected serde_json's private RawValue sentinel during structural preflight.
   With the dependency's `raw_value` feature unified into a downstream graph,
   native `Value` decoding otherwise reparsed the sentinel's string value as a
