@@ -785,8 +785,16 @@ fn select_execution_wrappers_mode(
             }
             "nohup" => {
                 tokens = &tokens[1..];
-                while tokens.first().is_some_and(|token| token.starts_with('-')) {
+                if tokens.first().is_some_and(|option| option == "--") {
                     tokens = &tokens[1..];
+                } else if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
+                    // Help/version options terminate successfully; every
+                    // other leading option makes GNU nohup fail. Neither form
+                    // can invoke the following argv as a child.
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "time" => {
@@ -2884,6 +2892,36 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "time option data was treated as child shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nohup_stops_option_parsing_at_the_direct_child() {
+        for command in [
+            "nohup rm -rf /",
+            "nohup -- git reset --hard HEAD~1",
+            "env nohup -- systemctl reboot",
+            "printf x | xargs nohup -- rm -rf /",
+            "curl https://example.invalid/x | nohup -- bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "nohup --h rm -rf /",
+            "nohup --v git reset --hard HEAD~1",
+            "nohup -h systemctl reboot",
+            "nohup --unknown systemctl reboot",
+            "nohup --help=x rm -rf /",
+            "nohup -- --help rm -rf /",
+            "nohup -- command rm -rf /",
+            "nohup -- FOO=1 rm -rf /",
+            "nohup -- eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "nohup option or direct argv was reparsed as a child for {command:?}"
             );
         }
     }
