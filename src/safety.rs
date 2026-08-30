@@ -6073,7 +6073,43 @@ fn find_child_removes_match(tokens: &[String]) -> bool {
     inner(tokens, 0)
 }
 
-fn rsync_removes_files(tokens: &[String]) -> bool {
+#[derive(Default)]
+struct RsyncRemoteEffects {
+    destination_delete: bool,
+    delete_missing: bool,
+    remove_source: bool,
+    delete_limit_blocks: bool,
+    no_change: bool,
+}
+
+fn apply_rsync_remote_option(value: &str, effects: &mut RsyncRemoteEffects) {
+    let (name, attached) = value.strip_prefix("--").map_or((value, None), |option| {
+        option
+            .split_once('=')
+            .map_or((option, None), |(name, value)| (name, Some(value)))
+    });
+    match name {
+        "del" | "delete" | "delete-before" | "delete-during" | "delete-delay" | "delete-after"
+        | "delete-excluded"
+            if attached.is_none() =>
+        {
+            effects.destination_delete = true;
+        }
+        "delete-missing-args" if attached.is_none() => effects.delete_missing = true,
+        "remove-source-files" if attached.is_none() => effects.remove_source = true,
+        "dry-run" | "list-only" | "-n" if attached.is_none() => effects.no_change = true,
+        "max-delete" => {
+            if let Some(limit) = attached.and_then(|limit| limit.parse::<i128>().ok()) {
+                if limit >= -1 {
+                    effects.delete_limit_blocks = limit <= 0;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn rsync_has_destructive_mode(tokens: &[String]) -> bool {
     const NO_VALUE: &[&str] = &[
         "verbose",
         "quiet",
@@ -6267,6 +6303,8 @@ fn rsync_removes_files(tokens: &[String]) -> bool {
     let mut remove_source = false;
     let mut delete_limit_blocks = false;
     let mut no_change = false;
+    let mut read_batch = false;
+    let mut remote = RsyncRemoteEffects::default();
 
     while let Some(token) = tokens.get(index).map(String::as_str) {
         if options && token == "--" {
@@ -6302,6 +6340,12 @@ fn rsync_removes_files(tokens: &[String]) -> bool {
                     if name == "only-write-batch" {
                         no_change = true;
                     }
+                    if name == "read-batch" {
+                        read_batch = true;
+                    }
+                    if name == "remote-option" {
+                        apply_rsync_remote_option(value, &mut remote);
+                    }
                     continue;
                 }
                 if !NO_VALUE.contains(&name) || attached.is_some() {
@@ -6334,14 +6378,21 @@ fn rsync_removes_files(tokens: &[String]) -> bool {
                         'n' => no_change = true,
                         'V' => return false,
                         'B' | 'e' | '@' | 'T' | 'f' | 'M' => {
-                            if offset + flag.len_utf8() == short.len() {
-                                let Some(value) = tokens.get(index) else {
+                            let value_start = offset + flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                &short[value_start..]
+                            } else {
+                                let Some(value) = tokens.get(index).map(String::as_str) else {
                                     return false;
                                 };
                                 if value.is_empty() {
                                     return false;
                                 }
                                 index += 1;
+                                value
+                            };
+                            if flag == 'M' {
+                                apply_rsync_remote_option(value, &mut remote);
                             }
                             break;
                         }
@@ -6359,11 +6410,15 @@ fn rsync_removes_files(tokens: &[String]) -> bool {
         index += 1;
     }
 
+    let local_removal = remove_source
+        || !delete_limit_blocks && (delete_missing || destination_delete && (recursive || dirs));
+    let remote_removal = !remote.no_change
+        && (remote.remove_source
+            || !remote.delete_limit_blocks
+                && (remote.delete_missing || remote.destination_delete && (recursive || dirs)));
+
     !no_change
-        && positionals >= 2
-        && (remove_source
-            || !delete_limit_blocks
-                && (delete_missing || destination_delete && (recursive || dirs)))
+        && (read_batch && positionals == 1 || positionals >= 2 && (local_removal || remote_removal))
 }
 
 fn mkfs_backend_formats(tokens: &[String]) -> bool {
@@ -7664,8 +7719,8 @@ fn dangerous_segment(
         "parted" if parted_changes_partition_table(selected.tokens) => {
             return Some("parted can change a disk partition table");
         }
-        "rsync" if rsync_removes_files(selected.tokens) => {
-            return Some("rsync can remove source or destination files");
+        "rsync" if rsync_has_destructive_mode(selected.tokens) => {
+            return Some("rsync can remove or batch-overwrite source or destination files");
         }
         "dropdb" => return Some("dropdb permanently removes a database"),
         "helm" if subcommand_is(effective, &["uninstall", "delete"]) => {
@@ -10055,6 +10110,41 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "rsync dry-run, terminal, invalid, incomplete, bounded or positional argv was treated as effective deletion for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rsync_classifies_batch_replay_and_remote_only_deletion_options() {
+        for command in [
+            "rsync --read-batch=changes.batch dst/",
+            "rsync --read-batch changes.batch --max-delete=0 dst/",
+            "rsync -a -M--delete src/ host:dst/",
+            "rsync -a --remote-option=--delete-after src/ host:dst/",
+            "rsync --remote-option --delete-missing-args missing host:dst/",
+            "rsync -M --remove-source-files host:src/file dst/",
+            "rsync -a -M--delete -M--max-delete=1 src/ host:dst/",
+            "env rsync --read-batch=changes.batch dst/",
+            "printf ignored | xargs rsync -a -M--delete src/ host:dst/",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "rsync --read-batch=changes.batch",
+            "rsync --read-batch=changes.batch dst/ extra",
+            "rsync -n --read-batch=changes.batch dst/",
+            "rsync --list-only --read-batch=changes.batch dst/",
+            "rsync -a -M--delete -M--max-delete=0 src/ host:dst/",
+            "rsync -a -M--delete -M-n src/ host:dst/",
+            "rsync -M--delete src/ host:dst/",
+            "rsync -a -M--delete=now src/ host:dst/",
+            "rsync -a --remote-option=--delete src/",
+            "rsync --help --read-batch=changes.batch dst/",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "rsync inactive, dry-run, bounded, invalid or incomplete batch/remote deletion was treated as effective for {command:?}"
             );
         }
     }
