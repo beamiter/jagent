@@ -329,6 +329,12 @@ Bash `exec`, `command`, and `builtin` prefixes retain their execution modes:
 `exec -a NAME` still exposes the real executable, while `command -v/-V`, help,
 invalid options, and non-existent `builtin` targets remain non-executing data
 instead of producing a warning for their later arguments.
+Children launched by `env` or `xargs` stay direct argv across nested external
+wrappers: shell-only `command`, `eval`, and assignment prefixes are not
+interpreted a second time. BusyBox `env` uses its smaller applet grammar, while
+GNU-only `-S` remains invalid there. The same context-aware dispatcher walk
+follows a fixed `curl`/`wget` child across a pipeline without treating an
+uppercase or non-existent wrapper name as a network fetch.
 
 Use `validate_command_text` before an integration copies a proposal into an
 approval card, persistence adapter, or review-only shell insertion. It applies

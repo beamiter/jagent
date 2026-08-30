@@ -168,6 +168,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and clustered forms, before reviewing the actual executable. Query-only
   `command -v/-V`, help/invalid options, and non-builtin `builtin` targets stay
   inert instead of misclassifying their remaining argv as an executed command.
+- Fixed argv behind `env`, BusyBox `env`, or `xargs` now remains in
+  direct-execution context across nested external wrappers: shell-only
+  assignments, `command`, and `eval` are no longer reparsed after dispatch.
+  Fixed network fetchers remain visible across the same bounded walk, and `--`
+  correctly ends env options without disabling following `NAME=VALUE` operands.
 - Destructive-command warnings now decode shell ANSI-C quoting before
   classification. Hex, octal, and Unicode escapes or concatenated quote parts
   can no longer disguise the executable in forms such as

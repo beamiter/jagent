@@ -295,6 +295,12 @@ Bash builtin carriers are option-aware as well. `exec -a NAME` (attached or
 clustered) consumes the replacement argv-zero before exposing the executable;
 `command -v/-V` is treated as a query, and help, invalid options, or a
 non-existent `builtin` target do not reinterpret later words as execution.
+Dispatcher recursion now carries an explicit direct-argv context. GNU env,
+BusyBox's smaller env applet, and xargs therefore do not reinterpret `command`,
+`eval`, or assignment-looking child argv as shell syntax, including through
+nested external wrappers; fixed fetchers still propagate the network warning.
+For both env variants, `--` ends options but intentionally leaves subsequent
+`NAME=VALUE` operands active before the executable is selected.
 
 The structural proposal-text gate is now public as
 `validate_command_text`/`CommandTextError`, together with
