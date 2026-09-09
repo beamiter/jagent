@@ -9,6 +9,16 @@ use std::fmt;
 /// session adapters can enforce the exact same ceiling before copying text.
 pub const MAX_COMMAND_BYTES: usize = 16 * 1024;
 
+/// Every shell whose `-c` argument carries a script the classifier must parse.
+///
+/// Two hand-written copies of this set had drifted: the `-c` recursion in
+/// `dangerous_segment` knew five names while `is_interpreter` twenty lines
+/// later knew nine, so `ash -c 'rm -rf /'` was never inspected — and `ash` is
+/// the default `/bin/sh` on Alpine and BusyBox. One list, two readers.
+const SHELL_NAMES: &[&str] = &[
+    "sh", "ash", "bash", "csh", "dash", "fish", "ksh", "tcsh", "zsh",
+];
+
 /// Why command text cannot cross the shared review boundary.
 ///
 /// Passing this structural check does not make a command safe or suitable for
@@ -2271,6 +2281,48 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "unbuffer" => {
+                // expect(1)'s pty wrapper: `unbuffer [-p] PROGRAM ARGS...`.
+                // Without an arm here the effective command stayed `unbuffer`,
+                // no classifier matched it, and `dangerous_segment` fell
+                // through to None — so `unbuffer rm -rf /`, `unbuffer sudo ...`
+                // and `curl … | unbuffer sh` all reported no danger at all.
+                // jterm_core already lists `unbuffer` in its own STAGE_PREFIXES
+                // and steps over it, so jagent was the unsafe side of a
+                // disagreement the family had otherwise settled.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "version"]) {
+                            Some(_) => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            None => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    if !flags.chars().all(|flag| flag == 'p') {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "stdbuf" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -2986,12 +3038,17 @@ fn is_dangerous_rm_target(target: &str) -> bool {
     if components.len() <= 1 || components.contains(&"..") {
         return true;
     }
+    // A glob directly beneath a top-level directory wipes that directory's
+    // contents, whichever directory it is. The rule already existed but was
+    // bound to three roots, so `/etc/*`, `/usr/*`, `/var/*` and `/boot/*` were
+    // classified safe while the strictly-less-specific `/*` was flagged. This
+    // subsumes the old `/root/*` arm. Concrete two-component paths like
+    // `/usr/lib` still pass, so ordinary cleanup does not start warning.
+    if components.len() == 2 && matches!(components[1], "*" | ".*") {
+        return true;
+    }
     matches!(components[0], "home" | "users")
         && (components.len() == 2 || (components.len() == 3 && matches!(components[2], "*" | ".*")))
-        || components[0] == "root"
-            && components
-                .get(1)
-                .is_some_and(|tail| matches!(*tail, "*" | ".*"))
 }
 
 #[derive(Clone, Copy)]
@@ -8131,7 +8188,11 @@ fn dangerous_segment(
                 }
             }
         }
-        let script = if matches!(command, "sh" | "bash" | "dash" | "zsh" | "ksh") {
+        // Recurse into a shell's `-c` payload. The membership test must be the
+        // same one `is_interpreter` uses: a second hand-written list drifted,
+        // and `ash -c 'rm -rf /'` — `ash` being the default /bin/sh on Alpine
+        // and BusyBox — went uninspected while `sh -c 'rm -rf /'` was flagged.
+        let script = if SHELL_NAMES.contains(&command) {
             effective[1..]
                 .windows(2)
                 .find(|pair| pair[0].starts_with('-') && pair[0].contains('c'))
@@ -8854,39 +8915,33 @@ fn is_interpreter(tokens: &[String]) -> bool {
                     .any(|segment| inner(&segment.words, depth + 1, false)),
             };
         }
-        if matches!(
-            command,
-            "sh" | "ash"
-                | "bash"
-                | "csh"
-                | "dash"
-                | "fish"
-                | "ksh"
-                | "tcsh"
-                | "zsh"
-                | "python"
-                | "python2"
-                | "python3"
-                | "perl"
-                | "php"
-                | "ruby"
-                | "node"
-                | "pwsh"
-                | "powershell"
-                | "nsenter"
-                | "unshare"
-                | "setarch"
-                | "uname26"
-                | "linux32"
-                | "linux64"
-                | "i386"
-                | "i486"
-                | "i586"
-                | "i686"
-                | "athlon"
-                | "x86_64"
-                | "systemd-run"
-        ) {
+        if SHELL_NAMES.contains(&command)
+            || matches!(
+                command,
+                "python"
+                    | "python2"
+                    | "python3"
+                    | "perl"
+                    | "php"
+                    | "ruby"
+                    | "node"
+                    | "pwsh"
+                    | "powershell"
+                    | "nsenter"
+                    | "unshare"
+                    | "setarch"
+                    | "uname26"
+                    | "linux32"
+                    | "linux64"
+                    | "i386"
+                    | "i486"
+                    | "i586"
+                    | "i686"
+                    | "athlon"
+                    | "x86_64"
+                    | "systemd-run"
+            )
+        {
             return true;
         }
         if command == "xargs" {
@@ -8901,6 +8956,69 @@ fn is_interpreter(tokens: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// `unbuffer` is expect's pty wrapper. Until it was known as a wrapper the
+    /// effective command stayed `unbuffer`, no classifier ran, and every
+    /// destructive form behind it reported no danger at all.
+    #[test]
+    fn unbuffer_does_not_hide_the_command_it_launches() {
+        for command in [
+            "unbuffer rm -rf /",
+            "unbuffer -p rm -rf /",
+            "unbuffer -- rm -rf /",
+            "unbuffer mkfs.ext4 /dev/sda",
+            "unbuffer sudo rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "{command} must not classify as safe"
+            );
+        }
+        // The wrapper must not invent danger where the child is harmless.
+        assert!(is_dangerous("unbuffer ls -l").is_none());
+        assert!(is_dangerous("unbuffer -p echo hi").is_none());
+    }
+
+    /// The `-c` recursion and `is_interpreter` now read one list, so every
+    /// shell's script argument is parsed. `ash` is the default /bin/sh on
+    /// Alpine and BusyBox, and `busybox` is itself stripped as a wrapper.
+    #[test]
+    fn every_known_shell_has_its_dash_c_script_inspected() {
+        for shell in SHELL_NAMES {
+            let command = format!("{shell} -c 'rm -rf /'");
+            assert!(
+                is_dangerous(&command).is_some(),
+                "{command} must not classify as safe"
+            );
+        }
+        assert!(is_dangerous("busybox ash -c 'rm -rf /'").is_some());
+        // A harmless script stays harmless through the same path.
+        assert!(is_dangerous("fish -c 'echo hi'").is_none());
+    }
+
+    /// A glob directly under any top-level directory wipes that directory. The
+    /// rule used to be bound to /home, /users and /root, so `/etc/*` passed
+    /// while the less specific `/*` was flagged.
+    #[test]
+    fn a_glob_under_any_system_root_is_dangerous() {
+        for target in [
+            "rm -rf /etc/*",
+            "rm -rf /usr/*",
+            "rm -rf /var/*",
+            "rm -rf /boot/*",
+            "rm -rf /lib/*",
+            "rm -rf /root/*",
+            "rm -rf /home/*",
+        ] {
+            assert!(
+                is_dangerous(target).is_some(),
+                "{target} must not classify as safe"
+            );
+        }
+        // Concrete paths are still ordinary cleanup, not a wipe.
+        assert!(is_dangerous("rm -rf /usr/lib/somepkg").is_none());
+        assert!(is_dangerous("rm -rf ./build/*").is_none());
+    }
     use super::*;
 
     #[test]
