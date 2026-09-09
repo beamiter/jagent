@@ -3143,7 +3143,7 @@ fn chmod_mode_effects(mode: &str) -> Option<ChmodModeEffects> {
                 match operator {
                     '=' => owner_locked = copies_class || !provides_owner_access,
                     '+' if provides_owner_access => owner_locked = false,
-                    '-' if [b'r', b'w', b'x']
+                    '-' if b"rwx"
                         .iter()
                         .all(|permission| permissions.as_bytes().contains(permission)) =>
                     {
