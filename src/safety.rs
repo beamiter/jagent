@@ -8171,12 +8171,13 @@ fn kubectl_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     Some(tokens[index..].to_vec())
 }
 
-/// Explicit command argv after `lxc exec` flags and the instance name.
+/// Explicit command argv after `lxc`/`incus exec` flags and the instance name.
 fn lxc_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     if tokens.len() < 4 {
         return None;
     }
-    if command_name(tokens.first()?) != "lxc" {
+    let engine = command_name(tokens.first()?);
+    if !matches!(engine, "lxc" | "incus") {
         return None;
     }
     if tokens.get(1).map(String::as_str) != Some("exec") {
@@ -8667,7 +8668,7 @@ fn dangerous_segment(
         }
     }
 
-    if command == "lxc" {
+    if matches!(command, "lxc" | "incus") {
         if let Some(child) = lxc_exec_child_argv(selected.tokens) {
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
@@ -9531,6 +9532,28 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "lxc exec metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incus_exec_exposes_the_command_after_the_instance_name() {
+        for command in [
+            "incus exec mybox rm -rf /",
+            "incus exec -t mybox bash -c 'rm -rf /'",
+            "incus exec mybox -- git reset --hard HEAD~1",
+            "env incus exec mybox rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "incus exec hid child for {command:?}"
+            );
+        }
+
+        for command in ["incus exec mybox", "incus exec --help rm -rf /", "incus exec"] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "incus exec metadata was treated as child for {command:?}"
             );
         }
     }

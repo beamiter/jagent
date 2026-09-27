@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 7)
+Updated: 2026-09-28 (wave 8)
 Baseline: 0.7.0
 Release target: Unreleased
+
+## 2026-09-28 (wave 8)
+
+- **`incus exec` child inspection** — Incus instance exec classification now
+  recurses into the argv after the instance name (and optional `--` separator),
+  matching the existing `lxc exec` behavior.
 
 ## 2026-09-28 (wave 7)
 
