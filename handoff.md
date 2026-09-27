@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-27
+Updated: 2026-09-27 (wave 3)
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -265,6 +265,16 @@ Container init wrappers `dumb-init` and `tini` now strip their own options and
 expose the direct child they exec, matching `setsid`/`unbuffer`/`stdbuf`.
 `dumb-init rm -rf /` and `tini -s rm -rf /` therefore reach the same classifier
 as the bare command instead of reporting no danger.
+
+`docker run` and `podman run` now parse their flags and image operand to expose
+any explicit post-image argv to the same classifier, so
+`docker run --rm alpine rm -rf /` warns like the bare command instead of
+stopping at the engine name.
+
+`runc run` and `crun run` now apply the same OCI pattern: flags and the
+container id are stripped before classifying any explicit command override, so
+`runc run myctr rm -rf /` warns like the bare command instead of stopping at
+the runtime name.
 
 The non-authorizing command warning now carries network provenance across the
 whole pipeline: `curl ... | tee setup.sh | sh` is treated like the adjacent

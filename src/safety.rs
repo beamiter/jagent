@@ -8036,6 +8036,134 @@ fn killall_delivers_signal(tokens: &[String]) -> bool {
     names > 0 && delivers
 }
 
+/// Explicit command argv after container `run` flags and the image or container
+/// reference. Unknown flags use a conservative consume heuristic; when the
+/// operand cannot be located confidently this returns `None`.
+fn container_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
+    if tokens.len() < 3 {
+        return None;
+    }
+    let engine = command_name(tokens.first()?);
+    if !matches!(engine, "docker" | "podman" | "runc" | "crun") {
+        return None;
+    }
+    if tokens.get(1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    if matches!(engine, "runc" | "crun") {
+        return oci_run_child_argv(tokens);
+    }
+    let mut index = 2usize;
+    while index < tokens.len() {
+        let token = tokens.get(index).map(String::as_str)?;
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            let consumes = matches!(
+                token,
+                "--name" | "--volume" | "--env" | "--publish" | "--mount"
+                    | "--network" | "--net" | "--user" | "--workdir" | "--hostname"
+                    | "--entrypoint" | "--platform" | "--label" | "--device"
+                    | "--memory" | "--cpus" | "--gpus" | "--env-file" | "--add-host"
+                    | "--annotation" | "--cap-add" | "--cap-drop" | "--cidfile"
+                    | "--dns" | "--expose" | "--group-add" | "--health-cmd"
+                    | "--ipc" | "--link" | "--log-driver" | "--log-opt"
+                    | "--mac-address" | "--memory-swap" | "--pid" | "--pull"
+                    | "--restart" | "--runtime" | "--security-opt" | "--shm-size"
+                    | "--stop-signal" | "--stop-timeout" | "--storage-opt"
+                    | "--sysctl" | "--tmpfs" | "--ulimit" | "--userns" | "--uts"
+                    | "--volume-driver" | "--volumes-from"
+            );
+            index += 1;
+            if consumes
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
+            }
+        } else {
+            let letters: Vec<char> = token.chars().skip(1).collect();
+            index += 1;
+            if let Some(last) = letters.last() {
+                if matches!(*last, 'v' | 'e' | 'p' | 'u' | 'w' | 'm' | 'h' | 'l' | 'c' | 'a')
+                    && index < tokens.len()
+                    && !tokens[index].starts_with('-')
+                {
+                    index += 1;
+                }
+            }
+        }
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    index += 1;
+    if index >= tokens.len() {
+        return None;
+    }
+    Some(tokens[index..].to_vec())
+}
+
+/// Child argv after `runc run` / `crun run` flags and the container id.
+fn oci_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
+    let mut index = 2usize;
+    while index < tokens.len() {
+        let token = tokens.get(index).map(String::as_str)?;
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            let consumes = matches!(
+                token,
+                "--bundle" | "--config" | "--console-socket" | "--pid-file"
+                    | "--preserve-fds" | "--rootfs" | "--log" | "--log-format"
+                    | "--process" | "--detach" | "--no-subreaper" | "--systemd-cgroup"
+            );
+            index += 1;
+            if consumes
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
+            }
+        } else {
+            let letters: Vec<char> = token.chars().skip(1).collect();
+            index += 1;
+            if let Some(last) = letters.last() {
+                if matches!(*last, 'b' | 'p' | 'r') && index < tokens.len() && !tokens[index].starts_with('-')
+                {
+                    index += 1;
+                }
+            }
+        }
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    index += 1;
+    if index >= tokens.len() {
+        return None;
+    }
+    Some(tokens[index..].to_vec())
+}
+
 fn dangerous_segment(
     original: &[String],
     normalized: &[String],
@@ -8357,7 +8485,19 @@ fn dangerous_segment(
         }
     }
 
-    if matches!(command, "docker" | "podman") {
+    if matches!(command, "docker" | "podman" | "runc" | "crun") {
+        if let Some(child) = container_run_child_argv(selected.tokens) {
+            if depth >= 4 {
+                return Some("command dispatcher nesting exceeds the review limit");
+            }
+            let normalized_child: Vec<String> =
+                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            if let Some(reason) =
+                dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
+            {
+                return Some(reason);
+            }
+        }
         let action = command_arguments(effective);
         if action.windows(2).any(|pair| pair == ["system", "prune"])
             || action.windows(2).any(|pair| pair == ["volume", "rm"])
@@ -9153,6 +9293,37 @@ mod tests {
     /// effective command stayed `unbuffer`, no classifier ran, and every
     /// destructive form behind it reported no danger at all.
     #[test]
+    fn container_run_exposes_the_command_after_the_image() {
+        for command in [
+            "docker run alpine rm -rf /",
+            "docker run --rm alpine rm -rf /",
+            "docker run -it --rm ubuntu bash -c 'rm -rf /'",
+            "podman run --rm fedora git reset --hard HEAD~1",
+            "runc run myctr rm -rf /",
+            "crun run --bundle /srv/bundle myctr git clean -fdx",
+            "env docker run --rm alpine rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "container run hid child for {command:?}"
+            );
+        }
+
+        for command in [
+            "docker run --rm alpine",
+            "docker run --help rm -rf /",
+            "docker run --rm",
+            "podman run --version rm -rf /",
+            "runc run myctr",
+            "crun run --help rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "container run metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
     fn container_init_wrappers_expose_their_direct_child() {
         for command in [
             "dumb-init rm -rf /",

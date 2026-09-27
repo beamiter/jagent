@@ -93,10 +93,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `runc run` and `crun run` now expose explicit command overrides to the same
+  classifier as `docker run`, so low-level OCI launches warn on destructive
+  child argv instead of stopping at the runtime name.
 - `dumb-init` and `tini` init wrappers no longer hide the program they exec.
   Their option parsing now exposes the direct child argv to the dangerous-command
   classifier, so container PID-1 forms such as `dumb-init rm -rf /` warn like
   the bare command.
+- `docker run` and `podman run` no longer stop at the engine name when an
+  explicit image command is present. Flag parsing exposes the post-image argv to
+  the same dangerous-command classifier, so forms such as
+  `docker run --rm alpine rm -rf /` warn like the bare command.
 
 - Snapshot restoration now binds approval and in-flight execution states to
   the final retained proposal, validates model-turn accounting and terminal
