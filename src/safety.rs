@@ -8113,6 +8113,64 @@ fn container_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     Some(tokens[index..].to_vec())
 }
 
+/// Explicit command argv after `kubectl exec` flags, pod name, and optional
+/// `-c` container selector.
+fn kubectl_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
+    if tokens.len() < 3 {
+        return None;
+    }
+    if command_name(tokens.first()?) != "kubectl" {
+        return None;
+    }
+    if tokens.get(1).map(String::as_str) != Some("exec") {
+        return None;
+    }
+    let mut index = 2usize;
+    while index < tokens.len() {
+        let token = tokens.get(index).map(String::as_str)?;
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            let consumes = matches!(token, "--container" | "--namespace" | "--context");
+            index += 1;
+            if consumes
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
+            }
+        } else {
+            let letters: Vec<char> = token.chars().skip(1).collect();
+            index += 1;
+            if letters.iter().any(|flag| matches!(*flag, 'c' | 'n')) {
+                if index < tokens.len() && !tokens[index].starts_with('-') {
+                    index += 1;
+                }
+            }
+        }
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    index += 1;
+    if tokens.get(index).map(String::as_str) == Some("--") {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    Some(tokens[index..].to_vec())
+}
+
 /// Explicit command argv after container `exec` flags and the container name.
 fn container_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     if tokens.len() < 4 {
@@ -8540,6 +8598,21 @@ fn dangerous_segment(
         }
         if subcommand == "worktree" && arguments.first().is_some_and(|action| action == "remove") {
             return Some("git worktree remove can discard a working tree");
+        }
+    }
+
+    if command == "kubectl" {
+        if let Some(child) = kubectl_exec_child_argv(selected.tokens) {
+            if depth >= 4 {
+                return Some("command dispatcher nesting exceeds the review limit");
+            }
+            let normalized_child: Vec<String> =
+                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            if let Some(reason) =
+                dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
+            {
+                return Some(reason);
+            }
         }
     }
 
@@ -9353,6 +9426,27 @@ mod tests {
     /// effective command stayed `unbuffer`, no classifier ran, and every
     /// destructive form behind it reported no danger at all.
     #[test]
+    fn kubectl_exec_exposes_the_command_after_the_pod_name() {
+        for command in [
+            "kubectl exec mypod rm -rf /",
+            "kubectl exec -it mypod -- bash -c 'rm -rf /'",
+            "kubectl exec -n prod deploy/api -- git reset --hard HEAD~1",
+            "env kubectl exec mypod rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "kubectl exec hid child for {command:?}"
+            );
+        }
+
+        for command in ["kubectl exec mypod", "kubectl exec --help rm -rf /", "kubectl exec"] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "kubectl exec metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn container_exec_exposes_the_command_after_the_container_name() {
         for command in [

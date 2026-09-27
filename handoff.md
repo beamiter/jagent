@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-27 (wave 5)
+Updated: 2026-09-28 (wave 6)
 Baseline: 0.7.0
 Release target: Unreleased
+
+## 2026-09-28 (wave 6)
+
+- **`kubectl exec` child inspection** — cluster exec classification now recurses
+  into the argv after the pod name (and optional `-c`/`--container` selector),
+  matching container-engine `exec` behavior.
 
 ## 2026-09-27 (wave 5)
 
