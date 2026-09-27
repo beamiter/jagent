@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 6)
+Updated: 2026-09-28 (wave 7)
 Baseline: 0.7.0
 Release target: Unreleased
+
+## 2026-09-28 (wave 7)
+
+- **`lxc exec` child inspection** — LXD instance exec classification now recurses
+  into the argv after the instance name (and optional `--` separator), matching
+  container-engine `exec` behavior.
 
 ## 2026-09-28 (wave 6)
 

@@ -8171,6 +8171,57 @@ fn kubectl_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     Some(tokens[index..].to_vec())
 }
 
+/// Explicit command argv after `lxc exec` flags and the instance name.
+fn lxc_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
+    if tokens.len() < 4 {
+        return None;
+    }
+    if command_name(tokens.first()?) != "lxc" {
+        return None;
+    }
+    if tokens.get(1).map(String::as_str) != Some("exec") {
+        return None;
+    }
+    let mut index = 2usize;
+    while index < tokens.len() {
+        let token = tokens.get(index).map(String::as_str)?;
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            let consumes = matches!(token, "--project" | "--env");
+            index += 1;
+            if consumes
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
+            }
+        } else {
+            index += 1;
+        }
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    index += 1;
+    if tokens.get(index).map(String::as_str) == Some("--") {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    Some(tokens[index..].to_vec())
+}
+
 /// Explicit command argv after container `exec` flags and the container name.
 fn container_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     if tokens.len() < 4 {
@@ -8603,6 +8654,21 @@ fn dangerous_segment(
 
     if command == "kubectl" {
         if let Some(child) = kubectl_exec_child_argv(selected.tokens) {
+            if depth >= 4 {
+                return Some("command dispatcher nesting exceeds the review limit");
+            }
+            let normalized_child: Vec<String> =
+                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            if let Some(reason) =
+                dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
+            {
+                return Some(reason);
+            }
+        }
+    }
+
+    if command == "lxc" {
+        if let Some(child) = lxc_exec_child_argv(selected.tokens) {
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
             }
@@ -9443,6 +9509,28 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "kubectl exec metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lxc_exec_exposes_the_command_after_the_instance_name() {
+        for command in [
+            "lxc exec mybox rm -rf /",
+            "lxc exec -t mybox bash -c 'rm -rf /'",
+            "lxc exec mybox -- git reset --hard HEAD~1",
+            "env lxc exec mybox rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "lxc exec hid child for {command:?}"
+            );
+        }
+
+        for command in ["lxc exec mybox", "lxc exec --help rm -rf /", "lxc exec"] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "lxc exec metadata was treated as child for {command:?}"
             );
         }
     }
