@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-27 (wave 3)
+Updated: 2026-09-27 (wave 4)
 Baseline: 0.7.0
 Release target: Unreleased
+
+## 2026-09-27 (wave 4)
+
+- **`nerdctl run` child inspection** — container-engine classification now
+  treats `nerdctl` like `docker`/`podman`, recursing into the argv after the
+  image instead of stopping at the wrapper name.
 
 The 0.7 baseline adds an integration-first path over the hardened 0.6 primitives.
 The low-level provider, tool, stream, and session APIs remain available, while
@@ -266,7 +272,7 @@ expose the direct child they exec, matching `setsid`/`unbuffer`/`stdbuf`.
 `dumb-init rm -rf /` and `tini -s rm -rf /` therefore reach the same classifier
 as the bare command instead of reporting no danger.
 
-`docker run` and `podman run` now parse their flags and image operand to expose
+`docker run`, `podman run`, and `nerdctl run` now parse their flags and image operand to expose
 any explicit post-image argv to the same classifier, so
 `docker run --rm alpine rm -rf /` warns like the bare command instead of
 stopping at the engine name.

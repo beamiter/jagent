@@ -8044,7 +8044,7 @@ fn container_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
         return None;
     }
     let engine = command_name(tokens.first()?);
-    if !matches!(engine, "docker" | "podman" | "runc" | "crun") {
+    if !matches!(engine, "docker" | "podman" | "nerdctl" | "runc" | "crun") {
         return None;
     }
     if tokens.get(1).map(String::as_str) != Some("run") {
@@ -8485,7 +8485,7 @@ fn dangerous_segment(
         }
     }
 
-    if matches!(command, "docker" | "podman" | "runc" | "crun") {
+    if matches!(command, "docker" | "podman" | "nerdctl" | "runc" | "crun") {
         if let Some(child) = container_run_child_argv(selected.tokens) {
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
@@ -9299,6 +9299,7 @@ mod tests {
             "docker run --rm alpine rm -rf /",
             "docker run -it --rm ubuntu bash -c 'rm -rf /'",
             "podman run --rm fedora git reset --hard HEAD~1",
+            "nerdctl run --rm alpine rm -rf /",
             "runc run myctr rm -rf /",
             "crun run --bundle /srv/bundle myctr git clean -fdx",
             "env docker run --rm alpine rm -rf /",
