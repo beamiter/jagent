@@ -8113,6 +8113,64 @@ fn container_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     Some(tokens[index..].to_vec())
 }
 
+/// Explicit command argv after container `exec` flags and the container name.
+fn container_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
+    if tokens.len() < 4 {
+        return None;
+    }
+    let engine = command_name(tokens.first()?);
+    if !matches!(engine, "docker" | "podman" | "nerdctl") {
+        return None;
+    }
+    if tokens.get(1).map(String::as_str) != Some("exec") {
+        return None;
+    }
+    let mut index = 2usize;
+    while index < tokens.len() {
+        let token = tokens.get(index).map(String::as_str)?;
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if !token.starts_with('-') {
+            break;
+        }
+        if token.starts_with("--") {
+            if token.contains('=') {
+                index += 1;
+                continue;
+            }
+            let consumes = matches!(
+                token,
+                "--detach-keys" | "--env" | "--user" | "--workdir" | "--privileged"
+            );
+            index += 1;
+            if consumes
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
+            }
+        } else {
+            let letters: Vec<char> = token.chars().skip(1).collect();
+            index += 1;
+            if letters.iter().any(|flag| matches!(*flag, 'e' | 'u' | 'w')) {
+                if index < tokens.len() && !tokens[index].starts_with('-') {
+                    index += 1;
+                }
+            }
+        }
+    }
+    if index >= tokens.len() {
+        return None;
+    }
+    index += 1;
+    if index >= tokens.len() {
+        return None;
+    }
+    Some(tokens[index..].to_vec())
+}
+
 /// Child argv after `runc run` / `crun run` flags and the container id.
 fn oci_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
     let mut index = 2usize;
@@ -8486,7 +8544,9 @@ fn dangerous_segment(
     }
 
     if matches!(command, "docker" | "podman" | "nerdctl" | "runc" | "crun") {
-        if let Some(child) = container_run_child_argv(selected.tokens) {
+        if let Some(child) = container_run_child_argv(selected.tokens)
+            .or_else(|| container_exec_child_argv(selected.tokens))
+        {
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
             }
@@ -9292,6 +9352,35 @@ mod tests {
     /// `unbuffer` is expect's pty wrapper. Until it was known as a wrapper the
     /// effective command stayed `unbuffer`, no classifier ran, and every
     /// destructive form behind it reported no danger at all.
+    #[test]
+    #[test]
+    fn container_exec_exposes_the_command_after_the_container_name() {
+        for command in [
+            "docker exec mybox rm -rf /",
+            "docker exec -it mybox bash -c 'rm -rf /'",
+            "podman exec --user root fedora git reset --hard HEAD~1",
+            "nerdctl exec alpine rm -rf /",
+            "env docker exec mybox rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "container exec hid child for {command:?}"
+            );
+        }
+
+        for command in [
+            "docker exec mybox",
+            "docker exec --help rm -rf /",
+            "podman exec --version rm -rf /",
+            "nerdctl exec",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "container exec metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn container_run_exposes_the_command_after_the_image() {
         for command in [

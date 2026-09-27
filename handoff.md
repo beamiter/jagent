@@ -1,8 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-27 (wave 4)
+Updated: 2026-09-27 (wave 5)
 Baseline: 0.7.0
 Release target: Unreleased
+
+## 2026-09-27 (wave 5)
+
+- **`docker`/`podman`/`nerdctl exec` child inspection** — container-engine
+  classification now recurses into the argv after the container name for
+  `exec`, matching the existing `run`/`runc`/`crun` behavior.
 
 ## 2026-09-27 (wave 4)
 
