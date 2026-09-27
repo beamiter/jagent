@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-08-25
+Updated: 2026-09-27
 Baseline: 0.7.0
 Release target: Unreleased
 
@@ -260,6 +260,11 @@ consumer migration details.
 7. Restore validates proposal ordering, adjacent execution outcomes, model-turn
    accounting, final-turn state binding, and transcript budgets before making
    a session live.
+
+Container init wrappers `dumb-init` and `tini` now strip their own options and
+expose the direct child they exec, matching `setsid`/`unbuffer`/`stdbuf`.
+`dumb-init rm -rf /` and `tini -s rm -rf /` therefore reach the same classifier
+as the bare command instead of reporting no danger.
 
 The non-authorizing command warning now carries network provenance across the
 whole pipeline: `curl ... | tee setup.sh | sh` is treated like the adjacent

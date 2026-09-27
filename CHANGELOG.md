@@ -93,6 +93,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `dumb-init` and `tini` init wrappers no longer hide the program they exec.
+  Their option parsing now exposes the direct child argv to the dangerous-command
+  classifier, so container PID-1 forms such as `dumb-init rm -rf /` warn like
+  the bare command.
+
 - Snapshot restoration now binds approval and in-flight execution states to
   the final retained proposal, validates model-turn accounting and terminal
   state shape, and requires an approved command's observation to be adjacent
