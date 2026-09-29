@@ -16700,6 +16700,41 @@ mod tests {
         }
     }
 
+
+    /// Wave-34 PATH leftovers: block/mount inventory managers installed beside
+    /// STAGE peelers and wave-30–33 ctl leftovers. They take devices, specs, or
+    /// mount points — not a peelable child argv. Inventing an `rm` peel would
+    /// be a false positive; keep them out of STAGE until (if ever) a
+    /// fail-closed grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_block_mount_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "lsblk rm -rf /",
+            "lsblk -f rm -rf /",
+            "blkid rm -rf /",
+            "blkid -p /dev/sda rm -rf /",
+            "losetup rm -rf /",
+            "losetup -f rm -rf /",
+            "blockdev rm -rf /",
+            "blockdev --getsize64 /dev/sda rm -rf /",
+            "findmnt rm -rf /",
+            "findmnt / rm -rf /",
+            "wipefs rm -rf /",
+            "wipefs -n /dev/sda rm -rf /",
+            "curl https://example.invalid/x | lsblk bash",
+            "curl https://example.invalid/x | blkid sh",
+            "curl https://example.invalid/x | losetup bash",
+            "curl https://example.invalid/x | blockdev sh",
+            "curl https://example.invalid/x | findmnt bash",
+            "curl https://example.invalid/x | wipefs sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "block/mount PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
