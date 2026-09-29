@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — sticky/find/Watch* + round-48 smoke)
+
+## 2026-09-29 (pending tip cohort — rounds 161–164 / 203–207 + round-48)
+
+- Local HEAD still path-patch-only for ember/frost round-48 smoke against core
+  `9764ae2` (anvil 161–164 / forge 203–207 sticky FE02/nirugu + Hangul find +
+  Watch* Unknown + near-wrap finished). Anvil `f40fa66` / forge `7302823` /
+  ember `b651a6e` / frost `73064ed` sit beside. Push/repin cohort still pending
+  with jsh.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-49 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-49 smoke)
