@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 14: torsocks/proxychains see-through)
+Updated: 2026-09-29 (wave 15: annotate-output see-through)
+
+## 2026-09-29 (wave 15)
+
+- **annotate-output child inspection** — `script` already see-through via
+  `script_dispatch`; moreutils `ts`/`sponge` are stdin filters (not launchers).
+  `annotate-output` (devscripts) now strips optional `+FORMAT` and exposes the
+  child. `-h`/`--help` and unknown dashes fail closed. Unlocks
+  `| annotate-output sh` / `annotate-output +%H:%M:%S rm -rf /`. **Pending push**
+  before family repin.
 
 ## 2026-09-29 (wave 14)
 
