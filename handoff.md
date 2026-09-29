@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip cohort after wave-38 / round-60)
+
+## 2026-09-30 (align tip cohort after wave-38 / round-60)
+
+- Local HEAD path-patch-only against core `e178407` after PATH wave-38
+  process-table monitor leftovers + softlimit/cgexec nest deepen. Ember/frost
+  round-60 smoke sit beside. Push/repin still pending with jsh.
+
+
 Updated: 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)
 
 ## 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)
