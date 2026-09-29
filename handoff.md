@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 25 deepen: uclampset/gamemoderun timeout/nice nests)
+
+## 2026-09-29 (wave 25 deepen — uclampset/gamemoderun nests)
+
+- **Nested carriers** — `uclampset` / `gamemoderun` danger regressions now
+  cover `timeout` / `nice` outside and inside those peelers (plus pipe forms).
+  Pin `uclampset_and_gamemoderun_nest_with_timeout_and_nice`. **Pending push**.
+
 Updated: 2026-09-29 (wave 24 deepen: timeout/nice nest for gnome-session-inhibit)
 
 ## 2026-09-29 (wave 24 deepen — gnome-session-inhibit timeout/nice nest)
