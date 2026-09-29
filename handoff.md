@@ -1,5 +1,26 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 24: gnome-session-inhibit see-through)
+
+## 2026-09-29 (wave 24 — gnome-session-inhibit)
+
+- **gnome-session-inhibit child inspection** — strips through to COMMAND.
+  `--list` / `--inhibit-only` / help / version / options-only / bare stay
+  childless. Bounded `--app-id`/`--reason`/`--inhibit` table; unknowns fail
+  closed. Unlocks STAGE 67→**68** for core. **Pending push**.
+
+Updated: 2026-09-29 (wave 23 deepen: timeout/nice nest + setuidgid `--`)
+
+## 2026-09-29 (wave 23 deepen — timeout/nice nest + setuidgid `--`)
+
+- **Nested carriers** — `daemonize` / `setlock` / `s6-setuidgid` danger
+  regressions now cover `timeout` / `nice` outside and inside those peelers
+  (plus pipe forms). Pin
+  `daemonize_setlock_s6_setuidgid_nest_with_timeout_and_nice`.
+- **`setuidgid` / `s6-setuidgid` optional `--`** — peel `--` before the
+  account so `s6-setuidgid -- nobody rm -rf /` matches core classify. Help /
+  unknown after `--` still fail closed. **Pending push**.
+
 Updated: 2026-09-29 (wave 23 leftover: s6-envdir family stays out)
 
 ## 2026-09-29 (wave 23 leftover — s6-envdir / s6-log)
