@@ -1,6 +1,25 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 15: annotate-output see-through)
+Updated: 2026-09-29 (wave 17: bubblewrap argv0 alias)
+
+## 2026-09-29 (wave 17)
+
+- **`bubblewrap` argv0 alias of `bwrap`** — Debian/Fedora ship only
+  `/usr/bin/bwrap` (package name ≠ binary). Rare symlink/`exec -a` forms still
+  use argv0 `bubblewrap`; the wrapper arm and dynamic `--args` refusal now
+  match both names. `bwrapper` stays non-alias. Unlocks
+  `| bubblewrap --ro-bind / / sh`. **Pending push** before family repin.
+
+## 2026-09-29 (wave 16)
+
+- **`unshare` / `nsenter` are interpreters, not stage prefixes** — both remain
+  in the shell/interpreter set (`is_interpreter` / personality wrappers) and
+  keep option see-through only for *child* argv classification. They are
+  **not** `STAGE_PREFIXES` for jterm_core pipe scans: a bare `unshare` /
+  `nsenter` drops into a shell, so `| unshare -r sh` must stop on the wrapper
+  name (jterm_core `PIPE_INTERPRETERS`), not step through like `env`/`timeout`.
+  Documented here so family continue waves do not "unlock STAGE_PREFIXES" for
+  these two. No code change.
 
 ## 2026-09-29 (wave 15)
 
