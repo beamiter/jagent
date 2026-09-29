@@ -16999,6 +16999,40 @@ mod tests {
         }
     }
 
+    /// Wave-37 PATH leftovers: process/IPC inventory managers installed beside
+    /// STAGE peelers and wave-30–36 ctl/block/host/network leftovers. They take
+    /// PIDs, files, or IPC keys — not a peelable child argv. Inventing an `rm`
+    /// peel would be a false positive; keep them out of STAGE until (if ever) a
+    /// fail-closed grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_process_ipc_inventory_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "lsof rm -rf /",
+            "lsof -nP rm -rf /",
+            "fuser rm -rf /",
+            "fuser -v /tmp rm -rf /",
+            "vmstat rm -rf /",
+            "vmstat 1 rm -rf /",
+            "perf rm -rf /",
+            "perf stat rm -rf /",
+            "ipcs rm -rf /",
+            "ipcs -a rm -rf /",
+            "ipcrm rm -rf /",
+            "ipcrm -a rm -rf /",
+            "curl https://example.invalid/x | lsof bash",
+            "curl https://example.invalid/x | fuser sh",
+            "curl https://example.invalid/x | vmstat bash",
+            "curl https://example.invalid/x | perf sh",
+            "curl https://example.invalid/x | ipcs bash",
+            "curl https://example.invalid/x | ipcrm sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "process/IPC inventory PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
