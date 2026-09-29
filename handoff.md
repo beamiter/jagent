@@ -18,24 +18,10 @@ Updated: 2026-09-29 (pending tip cohort — ember/frost round-40 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-40 smoke)
 
-- Local HEAD `aefca5f` still path-patch-only for ember/frost round-40 smoke
-  against core `ef2727c` (7/12 passed). Anvil `9adb857` / forge `a25aaf4`
-  sticky/find/notice edges (129–130 / 164–166) sit beside STAGE 71. Push/repin
-  cohort still pending with jsh.
-
-
-Updated: 2026-09-29 (wave 30 probe: PATH systemd ctl/notify leftovers)
-
-## 2026-09-29 (wave 30 probe — PATH systemd ctl/notify leftovers)
-
-- **PATH probe** — ctl/notify/mount managers and VT/AppArmor peers beside
-  STAGE `systemd-*` / `openvt` / `aa-exec` (`busctl` / `journalctl` /
-  `timedatectl` / `resolvectl` / `systemd-notify` / `systemd-mount` /
-  `systemd-delta` / `chvt` / `aa-status`) are not peelable child-argv
-  launchers. Pin `path_probe_systemd_ctl_notify_leftovers_do_not_invent_a_child_peel`.
-  (`systemctl` already has a direct state-disruption classifier — core leftovers
-  list keeps it out of STAGE.) Core leftovers list stays lockstep.
-  **Pending push**.
+- Local HEAD `711e4a0` still path-patch-only for ember/frost round-40 smoke
+  against core `786f924` (wave-30 leftovers + WatchSettled finish + CrossBlock
+  wrap). Anvil `0ecb722` / forge `1d6e0ed` rounds 126–128 / 161–163 sit beside
+  sticky/find 129–130 / 164–166. Push/repin cohort still pending with jsh.
 
 
 Updated: 2026-09-29 (wave 29 deepen: daemonize/setlock/s6 busybox + pipe)
