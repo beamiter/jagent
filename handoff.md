@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 12: fakeroot/proot/firejail see-through)
+Updated: 2026-09-29 (wave 13: cgexec/schedtool see-through)
+
+## 2026-09-29 (wave 13)
+
+- **cgexec / schedtool child inspection** — these wrappers now strip through to
+  the direct child. `cgexec` accepts `-g controllers:path` (repeatable),
+  flag-only `-b`/`-r`/`-s`/`--sticky`, and fails closed on help/unknown.
+  `schedtool` only exposes a child in `-e COMMAND…` mode; PID query/set and
+  `-r`/`-h` stay terminal. Unlocks jterm_core `STAGE_PREFIXES` for
+  `| cgexec -g cpu:g sh` / `| schedtool -B -e bash`. **Pending push** before
+  family repin.
 
 ## 2026-09-29 (wave 12)
 
