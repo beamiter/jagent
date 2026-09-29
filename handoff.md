@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after round-47 align)
+
+- Pending tip cohort note remains current at HEAD `56b6d27` (core `be18f3c`)
+  after round-47 edges align beside round-47 smoke.
+
+
 Updated: 2026-09-29 (align tip cohort after round-47 edges beside round-47)
 
 ## 2026-09-29 (align tip cohort — round-47 edges beside round-47)
