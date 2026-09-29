@@ -4,7 +4,7 @@ Updated: 2026-09-30 (sticky FF1A / rounds 211/265 tip note)
 
 ## 2026-09-30 (pending tip — sticky FF1A / anvil 208–211 / forge 261–265)
 
-- Local HEAD `824035e` stays path-patch cohort beside jterm_core MAX-12 cancel
+- Local HEAD `1f89a3f` stays path-patch cohort beside jterm_core MAX-12 cancel
   and anvil **208–211** / forge **261–265**. STAGE **71** / between() **93**
   unchanged. Pending push/repin.
 
