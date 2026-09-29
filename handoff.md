@@ -1,6 +1,25 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 19: strace / scriptlive see-through)
+Updated: 2026-09-29 (wave 20: systemd-cat / aa-exec see-through)
+
+## 2026-09-29 (wave 20)
+
+- **systemd-cat / aa-exec child inspection** — these `/usr/bin` launchers now
+  strip through to the direct child. Unlocks `| systemd-cat sh`,
+  `| aa-exec sh`, and destructive `systemd-cat … rm -rf /` /
+  `aa-exec -p PROFILE rm -rf /` forms for jterm_core `STAGE_PREFIXES`.
+  Bounded option tables; help/version/unknowns fail closed. Bare /
+  options-only `systemd-cat` (stdin→journal filter, no COMMAND) stays
+  childless. **Pending push** before family repin.
+
+## 2026-09-29 (wave 20 probe — PATH leftovers)
+
+- **PATH probe** (`ls /usr/bin/*wrap* *exec* set* *jail*` + named checks):
+  `logger` is a message writer (not a child argv launcher) — leave out.
+  `script` already PIPE (bare form starts an interactive shell). `setns`
+  / `cgroupfs-mount` **absent** from PATH. `capsh` already STAGE.
+  Printer/`foo2*`/`jexec`/gnome wrappers are not child-launch peel targets.
+  `systemd-cat` / `aa-exec` closed in wave 20 above.
 
 ## 2026-09-29 (wave 19)
 
