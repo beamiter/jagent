@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250)
+
+## 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250)
+
+- Pending tip cohort note remains current at HEAD `b2132c7` (core `01c6a91`)
+  after sticky 1803/1802/MAX-9/Unknown→GuardCautious beside wave-37 leftovers.
+
 Updated: 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
 
 ## 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
