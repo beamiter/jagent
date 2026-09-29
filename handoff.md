@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 29: openvt STAGE peel)
+
+## 2026-09-29 (wave 29 — openvt STAGE peel)
+
+- **openvt** — graduate deferred VT launcher into fail-closed see-through.
+  Peel `openvt [opts] [--] COMMAND` with `-c`/`--console` meta; `-u`/`--user`
+  clears child (runs `login`); help/version/unknown/`-C` fail closed. Pin
+  `openvt_exposes_its_direct_child_across_dispatchers`. Core STAGE_PREFIXES
+  len **71** lockstep. **Pending push**.
+
 Updated: 2026-09-29 (wave 28 probe: PATH systemd inspector leftovers)
 
 ## 2026-09-29 (wave 28 probe — PATH systemd inspector leftovers)
@@ -11,8 +21,9 @@ Updated: 2026-09-29 (wave 28 probe: PATH systemd inspector leftovers)
   `systemd-analyze` / `systemd-path` / `systemd-escape` /
   `systemd-detect-virt`) are not peelable child-argv launchers. Pin
   `path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel`.
-  `openvt` remains a deferred peelable candidate (VT/console grammar). Core
-  leftovers list stays lockstep. **Pending push**.
+  `openvt` graduated to STAGE in wave 29. Core leftovers list stays lockstep.
+  **Pending push**.
+
 
 Updated: 2026-09-29 (wave 21/20 deepen: busybox + timeout/nice for systemd-cat/inhibit)
 
