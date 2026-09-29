@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel align)
+
+- Pending tip cohort note remains current at HEAD  (core )
+  after round-47 cancel cohort align beside smoke.
+
+
 Updated: 2026-09-29 (align tip cohort after round-47 cancel cohort)
 
 ## 2026-09-29 (align tip cohort — round-47 cancel cohort)
