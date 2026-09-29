@@ -16417,6 +16417,44 @@ mod tests {
         }
     }
 
+    /// Wave-30 PATH leftovers: ctl/notify/mount managers and VT/AppArmor peers
+    /// installed beside STAGE `systemd-*` / `openvt` / `aa-exec`. They take
+    /// units, properties, VT numbers, or status queries — not a peelable child
+    /// argv. Inventing an `rm` peel would be a false positive; keep them out of
+    /// STAGE until (if ever) a fail-closed grammar exists (pairs core leftovers).
+    /// (`systemctl` already has a direct state-disruption classifier — it is
+    /// not a STAGE peeler and is listed only on the core leftovers pin.)
+    #[test]
+    fn path_probe_systemd_ctl_notify_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "busctl rm -rf /",
+            "busctl tree rm -rf /",
+            "journalctl rm -rf /",
+            "journalctl -xe rm -rf /",
+            "timedatectl rm -rf /",
+            "timedatectl status rm -rf /",
+            "resolvectl rm -rf /",
+            "resolvectl status rm -rf /",
+            "systemd-notify rm -rf /",
+            "systemd-notify --ready rm -rf /",
+            "systemd-mount --list rm -rf /",
+            "systemd-delta rm -rf /",
+            "chvt rm -rf /",
+            "chvt 3 rm -rf /",
+            "aa-status rm -rf /",
+            "aa-status --enabled rm -rf /",
+            "curl https://example.invalid/x | busctl bash",
+            "curl https://example.invalid/x | chvt sh",
+            "curl https://example.invalid/x | systemd-notify bash",
+            "curl https://example.invalid/x | aa-status sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd ctl/notify PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
