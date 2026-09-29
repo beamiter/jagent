@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 39 leftovers: user/session inventory PATH probe)
+
+## 2026-09-30 (wave 39 leftovers — user/session inventory PATH probe)
+
+- **PATH probe** — `id` / `getent` / `whoami` / `groups` / `who` / `w` /
+  `last` / `lastlog` / `faillog` report identity or login history beside STAGE
+  peelers and wave-30–38 leftovers are not peelable child-argv launchers. Pin
+  `path_probe_user_session_inventory_leftovers_do_not_invent_a_child_peel` so
+  inventing an `rm` peel stays a false positive (pairs core leftovers).
+  CLASSIFY/DISPATCHES remain lockstep at **71**.
+
+
 Updated: 2026-09-30 (align tip note self-hash after wave-38 / round-60 final)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 final)
