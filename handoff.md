@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — ember/frost round-41 smoke)
+
+## 2026-09-29 (pending tip cohort — round-41 smoke)
+
+- Local HEAD `eddbaf1` still path-patch-only for ember/frost round-41 smoke
+  against core `786f924` (wave-30 leftovers + WatchSettled finish + CrossBlock
+  wrap). Anvil `82450d0` / forge `96f7bb1` rounds 131–132 / 167–169 sit beside
+  sticky/find 129–130 / 164–166. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (wave 30 probe: PATH systemd ctl/notify leftovers)
 
 ## 2026-09-29 (wave 30 probe — PATH systemd ctl/notify leftovers)
