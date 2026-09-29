@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 26 probe — PATH non-launcher leftovers)
+
+## 2026-09-29 (wave 26 probe — PATH non-launcher leftovers)
+
+- **PATH probe** (`command -v snice skill run-mailcap xdg-open chrt`): all four
+  non-launchers are installed beside already-STAGE `chrt`. `snice`/`skill` are
+  obsolete process matchers (not child argv); `run-mailcap`/`xdg-open` open by
+  MIME/URL. Pin `path_probe_non_launcher_leftovers_do_not_invent_a_child_peel`
+  so they never invent an `rm` peel. Core leftovers list stays lockstep.
+  **Pending push**.
+
 Updated: 2026-09-29 (wave 25 deepen: uclampset/gamemoderun timeout/nice nests)
 
 ## 2026-09-29 (wave 25 deepen — uclampset/gamemoderun nests)
