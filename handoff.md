@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 33 deepen: setsid busybox + nests)
+
+## 2026-09-29 (wave 33 deepen — setsid busybox + timeout/nice nests)
+
+- **Thin STAGE 71 nest** — `setsid` expose + nest regressions now peel busybox
+  applet carriers and pipe-to-bash; busybox `--` / help/version under timeout
+  stay fail-closed. Pins `setsid_exposes_its_direct_child_across_dispatchers`
+  / `setsid_nest_with_timeout_and_nice`. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (wave 33 probe: PATH device/sysctl leftovers)
 
 ## 2026-09-29 (wave 33 probe — PATH device/sysctl leftovers)
