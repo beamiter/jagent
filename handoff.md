@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 33 probe: PATH device/sysctl leftovers)
+
+## 2026-09-29 (wave 33 probe — PATH device/sysctl leftovers)
+
+- **PATH probe** — device/audio/print/`sysctl` managers (`alsactl` / `cupsctl` /
+  `pccardctl` / `rtkitctl` / `zramctl` / `sysctl`) beside STAGE peelers and
+  wave-30/31/32 ctl leftovers are not peelable child-argv launchers. Pin
+  `path_probe_device_sys_ctl_leftovers_do_not_invent_a_child_peel`.
+  Core leftovers list stays lockstep. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel repair)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel repair)
