@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 29 deepen: daemonize/setlock/s6 busybox + pipe)
+
+## 2026-09-29 (wave 29 deepen — daemonize/setlock/s6 busybox + pipe)
+
+- **Thin STAGE 71 nests** — `daemonize` / `setlock` / `s6-setuidgid` expose +
+  nest regressions now peel busybox applet carriers and pipe-to-bash; busybox
+  `--` / help/version under timeout stay fail-closed. Pins
+  `daemonize_exposes_its_direct_child` / `setlock_skips_its_lockfile_positional`
+  / `daemonize_setlock_s6_setuidgid_nest_with_timeout_and_nice`.
+
+
 Updated: 2026-09-29 (wave 29 deepen: openvt busybox + pipe-to-bash)
 
 ## 2026-09-29 (wave 29 deepen — openvt busybox + pipe-to-bash)
