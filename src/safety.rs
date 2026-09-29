@@ -16905,6 +16905,52 @@ mod tests {
         }
     }
 
+    /// Wave-36 PATH leftovers: network inventory managers installed beside
+    /// STAGE peelers and wave-30–35 ctl/block/host leftovers. They take
+    /// interfaces, routes, or link state — not a peelable child argv.
+    /// Inventing an `rm` peel would be a false positive; keep them out of
+    /// STAGE until (if ever) a fail-closed grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_network_inventory_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "ip rm -rf /",
+            "ip link show rm -rf /",
+            "ss rm -rf /",
+            "ss -tulpn rm -rf /",
+            "nmcli rm -rf /",
+            "nmcli device status rm -rf /",
+            "nstat rm -rf /",
+            "nstat -a rm -rf /",
+            "arp rm -rf /",
+            "arp -an rm -rf /",
+            "route rm -rf /",
+            "route -n rm -rf /",
+            "netstat rm -rf /",
+            "netstat -tulpn rm -rf /",
+            "bridge rm -rf /",
+            "bridge link show rm -rf /",
+            "tc rm -rf /",
+            "tc qdisc show rm -rf /",
+            "rfkill rm -rf /",
+            "rfkill list rm -rf /",
+            "curl https://example.invalid/x | ip bash",
+            "curl https://example.invalid/x | ss sh",
+            "curl https://example.invalid/x | nmcli bash",
+            "curl https://example.invalid/x | nstat sh",
+            "curl https://example.invalid/x | arp bash",
+            "curl https://example.invalid/x | route sh",
+            "curl https://example.invalid/x | netstat bash",
+            "curl https://example.invalid/x | bridge sh",
+            "curl https://example.invalid/x | tc bash",
+            "curl https://example.invalid/x | rfkill sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "network inventory PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
