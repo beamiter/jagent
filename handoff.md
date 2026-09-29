@@ -1,5 +1,20 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 23: daemonize / setlock / s6-setuidgid see-through)
+
+## 2026-09-29 (wave 23)
+
+- **daemonize / setlock / s6-setuidgid child inspection** — these launchers
+  now strip through to the direct child. Unlocks `| daemonize sh`,
+  `| setlock FILE sh`, `| s6-setuidgid account sh`, and the destructive
+  `… rm -rf /` forms for jterm_core `STAGE_PREFIXES`. `daemonize` has a
+  bounded cwd/stdio/pid/user/lock/env option table (first non-option is the
+  child path). `setlock` takes flag-only `-nNxX` then a lockfile positional
+  like flock. `s6-setuidgid` shares `setuidgid`'s account positional (no
+  option table). Help / unknown / missing values fail closed. `firejail` /
+  `chpst` / `softlimit` / `setuidgid` already STAGE. **Pending push** before
+  family repin.
+
 Updated: 2026-09-29 (wave 22: systemd-socket-activate see-through)
 
 ## 2026-09-29 (wave 22)
