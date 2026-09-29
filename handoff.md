@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 29 deepen: openvt timeout/nice nest)
+
+## 2026-09-29 (wave 29 deepen — openvt timeout/nice nest)
+
+- **Nested carriers** — `openvt` danger regressions now cover `timeout` /
+  `nice` outside and inside the peeler (plus busybox + pipe forms). Terminal
+  help/user under timeout still fail closed. Pin `openvt_nest_with_timeout_and_nice`.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (wave 29: openvt STAGE peel)
 
 ## 2026-09-29 (wave 29 — openvt STAGE peel)
