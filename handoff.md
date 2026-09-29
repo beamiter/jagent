@@ -4,7 +4,7 @@ Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / round-58 fi
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250 final)
 
-- Pending tip cohort note remains current at HEAD `ec88aea` (core `8a8e607`)
+- Pending tip cohort note remains current at HEAD `24b2184` (core `8a8e607`)
   after sticky 1803/1802/MAX-9/Unknown→GuardCautious final align beside round-58 smoke.
 
 Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 final)
