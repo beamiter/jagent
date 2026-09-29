@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip cohort after round-47 edges beside round-47)
+
+## 2026-09-29 (align tip cohort — round-47 edges beside round-47)
+
+- Local HEAD `0d8e74a` path-patch-only against core `be18f3c` after anvil
+  `042fe04` / forge `29fc73d` sticky VS/find/GlanceAside pins + ember
+  `13bb735` / frost `7f3b327` round-47 smoke. Push/repin still pending with jsh.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 smoke)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after round-47 smoke)
