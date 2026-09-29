@@ -1,5 +1,24 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 31 probe: PATH ctl/utility leftovers)
+
+## 2026-09-29 (wave 31 probe — PATH ctl/utility leftovers)
+
+- **PATH probe** — more `*ctl` managers (`loginctl` / `hostnamectl` /
+  `localectl` / `bootctl` / `networkctl` / `kernel-install`), systemd
+  setup/id/hwdb utilities (`systemd-tmpfiles` / `systemd-sysusers` /
+  `systemd-id128` / `systemd-hwdb` / `systemd-sysext` /
+  `systemd-cryptenroll` / `systemd-machine-id-setup` / `systemd-umount` /
+  `systemd-tty-ask-password-agent`), `lsns`, and AppArmor teardown peers
+  (`aa-teardown` / `aa-remove-unknown` / `apparmor_status`) beside STAGE
+  `systemd-*` / `aa-exec` and wave-30 ctl/notify leftovers are not peelable
+  child-argv launchers. Pin
+  `path_probe_ctl_utility_leftovers_do_not_invent_a_child_peel`.
+  `unshare` / `nsenter` already peel via PIPE_INTERPRETERS — leave them out
+  of STAGE (CLASSIFY/DISPATCHES stay lockstep at **71**). Core leftovers
+  list stays lockstep. **Pending push**.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-41 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-41 smoke)
