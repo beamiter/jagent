@@ -1,21 +1,5 @@
 # Engineering handoff
 
-Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 final)
-
-## 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250)
-
-- Pending tip cohort note remains current at HEAD `7fc82d8` (core `01c6a91`)
-  after sticky 1803/1802/MAX-9/Unknown→GuardCautious beside wave-37 leftovers.
-
-Updated: 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
-
-## 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
-
-- Local HEAD still path-patch-only after anvil 196–199 / forge 246–250 sticky
-  Mongolian full stop + 1802/comma find + MAX-9 cancel + Unknown→GuardCautious
-  (Unknown↔GuardRecovery already synced) beside core tip. CLASSIFY/DISPATCHES
-  **71** held. Push/repin cohort still pending with jsh.
-
 Updated: 2026-09-30 (wave 37 probe: PATH process/IPC inventory leftovers)
 
 ## 2026-09-30 (wave 37 probe — PATH process/IPC inventory leftovers)
