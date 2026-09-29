@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 34 probe: PATH block/mount leftovers)
+
+## 2026-09-29 (wave 34 probe — PATH block/mount leftovers)
+
+- **PATH probe** — block/mount inventory managers (`lsblk` / `blkid` /
+  `losetup` / `blockdev` / `findmnt` / `wipefs`) beside STAGE peelers and
+  wave-30–33 ctl leftovers are not peelable child-argv launchers. Pin
+  `path_probe_block_mount_leftovers_do_not_invent_a_child_peel`.
+  Core leftovers list stays lockstep. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 174/219 final)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after rounds 174/219 final)
