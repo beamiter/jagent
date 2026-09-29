@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 smoke)
+
+## 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 smoke)
+
+- Pending tip cohort note remains current at HEAD `3e6fa19` (core `322cf2e`)
+  after wave-38 leftovers/deepen final align beside round-60 smoke.
+
 Updated: 2026-09-30 (align tip note self-hash after rounds 203/255 / round-59 final)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after rounds 203/255 final)
