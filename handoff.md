@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 20 edge-case pins for systemd-cat / aa-exec)
+
+## 2026-09-29 (wave 20 edge-case pins)
+
+- **systemd-cat / aa-exec regressions** — attached `-tunit` / `-punconfined`,
+  bare/options-only `aa-exec`, `--level-prefix` without value, and stacked
+  `systemd-cat`↔`aa-exec` forms stay pinned. **Pending push** before family
+  repin.
+
 Updated: 2026-09-29 (wave 20: systemd-cat / aa-exec see-through)
 
 ## 2026-09-29 (wave 20)
