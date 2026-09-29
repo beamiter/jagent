@@ -16455,6 +16455,56 @@ mod tests {
         }
     }
 
+    /// Wave-31 PATH leftovers: more `*ctl` managers, systemd setup/id/hwdb
+    /// utilities, namespace listing, and AppArmor teardown peers installed
+    /// beside STAGE `systemd-*` / `aa-exec` and wave-30 ctl/notify leftovers.
+    /// They take units, configs, devices, or profile ops — not a peelable
+    /// child argv. (`unshare` / `nsenter` are already peeled via
+    /// PIPE_INTERPRETERS, so they stay out of STAGE and are not leftovers.)
+    /// Inventing an `rm` peel would be a false positive; keep these out of
+    /// STAGE until (if ever) a fail-closed grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_ctl_utility_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "loginctl rm -rf /",
+            "loginctl list-sessions rm -rf /",
+            "hostnamectl rm -rf /",
+            "hostnamectl status rm -rf /",
+            "localectl rm -rf /",
+            "localectl status rm -rf /",
+            "bootctl rm -rf /",
+            "bootctl status rm -rf /",
+            "networkctl rm -rf /",
+            "networkctl status rm -rf /",
+            "kernel-install rm -rf /",
+            "kernel-install add 1.0 /boot/vmlinuz rm -rf /",
+            "systemd-tmpfiles --create rm -rf /",
+            "systemd-sysusers rm -rf /",
+            "systemd-id128 new rm -rf /",
+            "systemd-hwdb update rm -rf /",
+            "systemd-sysext status rm -rf /",
+            "systemd-cryptenroll /dev/null rm -rf /",
+            "systemd-machine-id-setup rm -rf /",
+            "systemd-umount /mnt rm -rf /",
+            "systemd-tty-ask-password-agent rm -rf /",
+            "lsns rm -rf /",
+            "lsns -t mnt rm -rf /",
+            "aa-teardown rm -rf /",
+            "aa-remove-unknown rm -rf /",
+            "apparmor_status rm -rf /",
+            "curl https://example.invalid/x | loginctl bash",
+            "curl https://example.invalid/x | hostnamectl sh",
+            "curl https://example.invalid/x | systemd-tmpfiles bash",
+            "curl https://example.invalid/x | lsns sh",
+            "curl https://example.invalid/x | aa-teardown bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "ctl/utility PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
