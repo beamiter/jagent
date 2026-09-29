@@ -1,6 +1,6 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 17: bubblewrap argv0 alias)
+Updated: 2026-09-29 (wave 16 clarify: unshare/nsenter ≠ bubblewrap STAGE)
 
 ## 2026-09-29 (wave 17)
 
@@ -18,8 +18,9 @@ Updated: 2026-09-29 (wave 17: bubblewrap argv0 alias)
   **not** `STAGE_PREFIXES` for jterm_core pipe scans: a bare `unshare` /
   `nsenter` drops into a shell, so `| unshare -r sh` must stop on the wrapper
   name (jterm_core `PIPE_INTERPRETERS`), not step through like `env`/`timeout`.
-  Documented here so family continue waves do not "unlock STAGE_PREFIXES" for
-  these two. No code change.
+  Contrast wave 17 `bubblewrap` (true STAGE_PREFIXES alias of `bwrap`).
+  Documented so family continue waves do not "unlock STAGE_PREFIXES" for these
+  two. No code change.
 
 ## 2026-09-29 (wave 15)
 
