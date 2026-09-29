@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 35 deepen: chrt/ionice nests)
+
+## 2026-09-29 (wave 35 deepen — chrt/ionice timeout/nice nests)
+
+- **Thin STAGE 71 nest** — `ionice` nest regressions peel busybox applet
+  carriers and pipe-to-bash; help/pid under timeout stay fail-closed.
+  `chrt` nest with timeout/nice (no busybox applet). Pins
+  `ionice_nest_with_timeout_and_nice` / `chrt_nest_with_timeout_and_nice`.
+  CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (wave 35 probe: PATH host/hw inventory leftovers)
 
 ## 2026-09-29 (wave 35 probe — PATH host/hw inventory leftovers)
