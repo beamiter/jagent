@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 36 deepen: numactl/schedtool nests)
+
+## 2026-09-29 (wave 36 deepen — numactl/schedtool timeout/nice nests)
+
+- **Thin STAGE 71 nest** — `numactl` nest regressions peel timeout/nice carriers
+  (no busybox applet); query/show/hardware/help stay fail-closed under timeout.
+  `schedtool` nest with timeout/nice around `-e` exec mode; help/reset stay
+  fail-closed. Pins `numactl_nest_with_timeout_and_nice` /
+  `schedtool_nest_with_timeout_and_nice`. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (wave 36 probe: PATH network inventory leftovers)
 
 ## 2026-09-29 (wave 36 probe — PATH network inventory leftovers)
