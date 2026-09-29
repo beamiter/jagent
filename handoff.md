@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 187/235 final)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after rounds 187/235 final)
+
+- Pending tip cohort note remains current at HEAD `c37bde3` (core `0a637a7`)
+  after sticky FE07/FE06/MAX-6/GuardRecovery final align beside round-53 smoke.
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-35 / round-54 final)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after wave-35 / round-54 final)
