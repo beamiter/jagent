@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — wave-36 leftovers and deepen)
+
+## 2026-09-29 (pending tip cohort — wave-36 leftovers and deepen)
+
+- Local HEAD still path-patch-only after wave-36 network inventory leftover pin
+  + numactl/schedtool nest deepen beside core tip. CLASSIFY/DISPATCHES **71**
+  held. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (wave 36 deepen: numactl/schedtool nests)
 
 ## 2026-09-29 (wave 36 deepen — numactl/schedtool timeout/nice nests)
