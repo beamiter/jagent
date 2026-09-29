@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip cohort after round-47 cancel cohort)
+
+## 2026-09-29 (align tip cohort — round-47 cancel cohort)
+
+- Local HEAD path-patch-only against core  after anvil  /
+  forge  rounds 155–159 / 196–201 + ember  / frost 
+  round-47 smoke. Push/repin still pending with jsh.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 align)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after round-47 align)
