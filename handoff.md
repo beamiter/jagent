@@ -1,6 +1,13 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 16 clarify: unshare/nsenter ≠ bubblewrap STAGE)
+Updated: 2026-09-29 (wave 17b: bubblewrap/bwrap danger parity assert)
+
+## 2026-09-29 (wave 17b)
+
+- **Parity regression** — `is_dangerous("bubblewrap --ro-bind / / rm -rf /")`
+  must equal `is_dangerous("bwrap --ro-bind / / rm -rf /")` (same reason
+  string), not merely both `Some`. Pins argv0 alias classification beyond the
+  shared positive/negative tables. **Pending push** before family repin.
 
 ## 2026-09-29 (wave 17)
 

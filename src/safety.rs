@@ -11625,6 +11625,13 @@ mod tests {
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
+        // argv0 `bubblewrap` must classify identically to `bwrap` for the
+        // canonical read-only bind + destructive child form.
+        assert_eq!(
+            is_dangerous("bwrap --ro-bind / / rm -rf /"),
+            is_dangerous("bubblewrap --ro-bind / / rm -rf /"),
+        );
+        assert!(is_dangerous("bubblewrap --ro-bind / / rm -rf /").is_some());
 
         for command in [
             "bwrap --help rm -rf /",
