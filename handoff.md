@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 25/24 deepen: busybox applet + pipe-to-bash)
+
+## 2026-09-29 (wave 25/24 deepen — busybox applet + pipe-to-bash)
+
+- **Busybox carriers** — `uclampset` / `gamemoderun` / `gnome-session-inhibit`
+  danger regressions now cover `busybox <wrapper>` applet peels and
+  `curl | busybox <wrapper> bash` pipe forms beside the timeout/nice nests.
+  Fail-closed: `busybox --` / `--help` / `-h` never invent a child; uclampset
+  `-s`/`--system` and gnome `--list`/`-l`/`--inhibit-only` stay childless under
+  busybox + timeout. Pins extend the existing expose + nest tests.
+  **Pending push**.
+
 Updated: 2026-09-29 (wave 26 probe — PATH non-launcher leftovers)
 
 ## 2026-09-29 (wave 26 probe — PATH non-launcher leftovers)
