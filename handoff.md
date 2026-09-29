@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — ember/frost round-45 smoke)
+
+## 2026-09-29 (pending tip cohort — round-45 smoke)
+
+- Local HEAD `f0bc04a` still path-patch-only for ember/frost round-45 smoke
+  against core `af7487e` (anvil 152–154 / forge 192–195 bidi sticky/find/notice
+  + ambient disposition beside 148–151 / 188–191 Idle/Rest Guard + wave-32
+  PATH leftovers / aa-exec/socket-activate deepen). Anvil `36a2a79` / forge
+  `a9d9eea` sit beside. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-46 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-46 smoke)
