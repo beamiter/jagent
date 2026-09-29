@@ -5,8 +5,8 @@ Updated: 2026-09-29 (pending tip cohort — ember/frost round-40 smoke)
 ## 2026-09-29 (pending tip cohort — round-40 smoke)
 
 - Local HEAD `aefca5f` still path-patch-only for ember/frost round-40 smoke
-  against core `ef2727c` (7/12 passed). Anvil `183c059` / forge `e790c60`
-  sticky/find/notice edges (126–127 / 161–163) sit beside STAGE 71. Push/repin
+  against core `ef2727c` (7/12 passed). Anvil `9adb857` / forge `a25aaf4`
+  sticky/find/notice edges (129–130 / 164–166) sit beside STAGE 71. Push/repin
   cohort still pending with jsh.
 
 
