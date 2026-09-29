@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — sticky FE04/find/MAX-3 + round-50 smoke)
+
+## 2026-09-29 (pending tip cohort — rounds 171–174 / 215–219 + round-50)
+
+- Local HEAD still path-patch-only for ember/frost round-50 smoke against core
+  `8b9db5a` (anvil 171–174 / forge 215–219 sticky FE04/syllable + FE03 find +
+  MAX-3 cancel + Celebrate→Unknown). Anvil `4fdb3ec` / forge `4d48560` /
+  ember `410d79d` / frost `f32a2b3` sit beside. Push/repin cohort still
+  pending with jsh.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 final)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 final)
