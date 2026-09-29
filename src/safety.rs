@@ -12268,6 +12268,10 @@ mod tests {
         }
         assert!(is_dangerous("systemd-cat echo hi").is_none());
         assert!(is_dangerous("systemd-cat -t x ls -l").is_none());
+        // Attached short identifier and stacked aa-exec still expose the child.
+        assert!(is_dangerous("systemd-cat -tunit rm -rf /").is_some());
+        assert!(is_dangerous("systemd-cat -t x aa-exec -p unconfined rm -rf /").is_some());
+        assert!(is_dangerous("systemd-cat --level-prefix").is_none());
     }
 
     #[test]
@@ -12305,6 +12309,21 @@ mod tests {
         }
         assert!(is_dangerous("aa-exec echo hi").is_none());
         assert!(is_dangerous("aa-exec -p unconfined ls -l").is_none());
+        // Bare / options-only: no PROGRAM child (unlike forms that hide rm).
+        for command in [
+            "aa-exec",
+            "aa-exec -p unconfined",
+            "aa-exec --profile=unconfined --namespace=ns",
+            "aa-exec -i -d -v",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "aa-exec metadata/bare treated as child for {command:?}"
+            );
+        }
+        // Attached short profile and stacked systemd-cat still expose the child.
+        assert!(is_dangerous("aa-exec -punconfined rm -rf /").is_some());
+        assert!(is_dangerous("aa-exec -p x systemd-cat -- rm -rf /").is_some());
     }
 
     #[test]
