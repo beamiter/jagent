@@ -16812,6 +16812,46 @@ mod tests {
         }
     }
 
+
+    /// Wave-35 PATH leftovers: host/hw inventory managers installed beside
+    /// STAGE peelers and wave-30–34 ctl/block leftovers. These list hardware /
+    /// login / IPC state and are not peelable child-argv launchers — keep them
+    /// out of STAGE until taught fail-closed (mirrors core leftovers list).
+    #[test]
+    fn path_probe_host_inventory_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "lsusb rm -rf /",
+            "lsusb -v rm -rf /",
+            "lspci rm -rf /",
+            "lspci -nn rm -rf /",
+            "lscpu rm -rf /",
+            "lscpu -e rm -rf /",
+            "lsmem rm -rf /",
+            "lsmem -a rm -rf /",
+            "lsipc rm -rf /",
+            "lsipc -m rm -rf /",
+            "lslocks rm -rf /",
+            "lslocks -u rm -rf /",
+            "lslogins rm -rf /",
+            "lslogins -u rm -rf /",
+            "dmidecode rm -rf /",
+            "dmidecode -t system rm -rf /",
+            "curl https://example.invalid/x | lsusb bash",
+            "curl https://example.invalid/x | lspci sh",
+            "curl https://example.invalid/x | lscpu bash",
+            "curl https://example.invalid/x | lsmem sh",
+            "curl https://example.invalid/x | lsipc bash",
+            "curl https://example.invalid/x | lslocks sh",
+            "curl https://example.invalid/x | lslogins bash",
+            "curl https://example.invalid/x | dmidecode sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "host/hw inventory PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
