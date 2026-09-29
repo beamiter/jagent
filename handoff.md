@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip cohort — sticky 1804/1803/MAX-10 + rounds 203/255)
+
+## 2026-09-30 (pending tip cohort — sticky 1804/1803/MAX-10 + rounds 203/255)
+
+- Local HEAD still path-patch-only after anvil 200–203 / forge 251–255 sticky
+  Mongolian colon + 1803/full-stop find + MAX-10 cancel + Unknown→GuardStuck
+  beside wave-38 process-table leftovers + softlimit/cgexec deepen and core
+  `d30081c` tip. CLASSIFY/DISPATCHES **71** held. Push/repin cohort still
+  pending with jsh.
+
 Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / round-58 final)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250 final)
