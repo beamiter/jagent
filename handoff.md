@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip cohort after wave-39 leftovers/deepen)
+
+## 2026-09-30 (align tip cohort after wave-39 leftovers/deepen)
+
+- Local HEAD path-patch-only against core  after PATH wave-39
+  user/session inventory leftovers + chpst/envdir/setuidgid nest deepen.
+  Ember/frost smoke left for peer. CLASSIFY/DISPATCHES **71**.
+
+
 Updated: 2026-09-30 (pending tip cohort — wave-39 leftovers and deepen)
 
 ## 2026-09-30 (pending tip cohort — wave-39 leftovers and deepen)
