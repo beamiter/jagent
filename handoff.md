@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
+
+## 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
+
+- Local HEAD still path-patch-only after anvil 196–199 / forge 246–250 sticky
+  Mongolian full stop + 1802/comma find + MAX-9 cancel + Unknown→GuardCautious
+  (Unknown↔GuardRecovery already synced) beside core tip. CLASSIFY/DISPATCHES
+  **71** held. Push/repin cohort still pending with jsh.
+
 Updated: 2026-09-30 (wave 37 probe: PATH process/IPC inventory leftovers)
 
 ## 2026-09-30 (wave 37 probe — PATH process/IPC inventory leftovers)
