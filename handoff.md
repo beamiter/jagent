@@ -22,7 +22,7 @@ Updated: 2026-09-29 (pending tip cohort — wave-35 leftovers and deepen)
 ## 2026-09-29 (pending tip cohort — wave-35 leftovers and deepen)
 
 - Local HEAD still path-patch-only after wave-35 host/hw inventory leftover pin
-  + chrt/ionice nest deepen beside core . CLASSIFY/DISPATCHES **71**
+  + chrt/ionice nest deepen beside core `85bbcac`. CLASSIFY/DISPATCHES **71**
   held. Push/repin cohort still pending with jsh.
 
 
