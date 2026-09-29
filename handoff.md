@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (align tip note self-hash after rounds 203/255 / round-59 final)
+
+## 2026-09-30 (point pending tip cohort note at HEAD after rounds 203/255 final)
+
+- Pending tip cohort note remains current at HEAD `097b607` (core `11e7640`)
+  after sticky 1804/1803/MAX-10/Unknown→GuardStuck final align beside round-59
+  smoke and wave-38 leftovers/deepen / round-60.
+
 Updated: 2026-09-30 (align tip note self-hash after wave-38 / round-60 final)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 final)
