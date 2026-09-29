@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — ember/frost round-42 smoke)
+
+## 2026-09-29 (pending tip cohort — round-42 smoke)
+
+- Local HEAD `adeeea8` still path-patch-only for ember/frost
+  round-42 smoke against core `c660336` (wave-31 leftovers +
+  CLASSIFY/DISPATCHES STAGE 71 lockstep). Anvil `5acd139` /
+  forge `0cfbbe5` rounds 137–140 / 175–179 sit beside
+  Hangul/Watch* 133–136 / 170–174. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-43 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-43 smoke)
