@@ -1,5 +1,19 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 28 probe: PATH systemd inspector leftovers)
+
+## 2026-09-29 (wave 28 probe — PATH systemd inspector leftovers)
+
+- **PATH probe** — `command -v` confirms `cgexec` missing (already STAGE),
+  `systemd-run` / `runuser` / `chrt` / `taskset` already STAGE, and both
+  `/usr/bin/*inhibit*` (`systemd-inhibit` / `gnome-session-inhibit`) already
+  STAGE. Inspectors beside them (`systemd-cgls` / `systemd-cgtop` /
+  `systemd-analyze` / `systemd-path` / `systemd-escape` /
+  `systemd-detect-virt`) are not peelable child-argv launchers. Pin
+  `path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel`.
+  `openvt` remains a deferred peelable candidate (VT/console grammar). Core
+  leftovers list stays lockstep. **Pending push**.
+
 Updated: 2026-09-29 (wave 21/20 deepen: busybox + timeout/nice for systemd-cat/inhibit)
 
 ## 2026-09-29 (wave 21/20 deepen — systemd-cat/inhibit busybox + nests)
