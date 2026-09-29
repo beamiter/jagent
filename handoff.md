@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 25: uclampset + gamemoderun see-through)
+
+## 2026-09-29 (wave 25 — uclampset / gamemoderun)
+
+- **uclampset child inspection** — util-linux scheduling twin of `choom`.
+  Strips through to COMMAND; `-p`/`--pid` and `-s`/`--system` stay childless.
+  Bounded `-m`/`-M` util clamp (`[0:1024]` or `-1`); unknowns / help / version /
+  bare / options-only fail closed. Unlocks STAGE for `| uclampset sh`.
+- **gamemoderun child inspection** — GameMode env launcher
+  (`exec env LD_PRELOAD=libgamemodeauto.so.0 "$@"`). Same fail-closed shape as
+  `eatmydata`/`nohup`: `--` then PROGRAM, leading dash never invents a child.
+  Unlocks STAGE for `| gamemoderun sh`. **Pending push**.
+
 Updated: 2026-09-29 (wave 24: gnome-session-inhibit see-through)
 
 ## 2026-09-29 (wave 24 — gnome-session-inhibit)
