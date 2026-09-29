@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip cohort after rounds 178/224 + round-51)
+
+## 2026-09-29 (align tip cohort — rounds 178/224 + round-51)
+
+- Local HEAD path-patch-only against core `938e88a` after anvil `3a36c01` /
+  forge `3ee0e4a` sticky FE05/find/MAX-4/Rest→Unknown pins + ember
+  `6e37241` / frost `7c1cccd` round-51 smoke. Push/repin still pending
+  with jsh.
+
+
 Updated: 2026-09-29 (pending tip cohort — rounds 175–178 / 220–224 + round-51 smoke)
 
 ## 2026-09-29 (pending tip cohort — rounds 175–178 / 220–224 + round-51)
