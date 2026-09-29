@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 38 deepen: softlimit/cgexec nests)
+
+## 2026-09-30 (wave 38 deepen — softlimit/cgexec timeout/nice nests)
+
+- **Thin STAGE 71 nest** — softlimit nest regressions peel timeout/nice
+  carriers (no busybox applet); help/version/unknown stay fail-closed under
+  timeout. cgexec nest with timeout/nice around -g exec; help/-h stay
+  fail-closed. Pins `softlimit_nest_with_timeout_and_nice` /
+  `cgexec_nest_with_timeout_and_nice`. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
 Updated: 2026-09-30 (wave 38 probe: PATH process-table monitor leftovers)
 
 ## 2026-09-30 (wave 38 probe — PATH process-table monitor leftovers)
