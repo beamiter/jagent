@@ -1,5 +1,21 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 32 probe: PATH ctl/service leftovers)
+
+## 2026-09-29 (wave 32 probe — PATH ctl/service leftovers)
+
+- **PATH probe** — more D-Bus/`*ctl` managers (`bluetoothctl` / `boltctl` /
+  `grdctl` / `obexctl` / `oomctl` / `pactl` / `powerprofilesctl` / `snapctl` /
+  `switcherooctl` / `udisksctl` / `wdctl`) and SysV rc helpers (`update-rc.d` /
+  `invoke-rc.d`) beside STAGE peelers and wave-30/31 ctl leftovers are not
+  peelable child-argv launchers. Pin
+  `path_probe_ctl_service_leftovers_do_not_invent_a_child_peel`.
+  (`service` already has a direct state-disruption classifier; `docker` has
+  container-engine scanners — both stay off STAGE and are listed only on the
+  core leftovers pin, matching wave-30 `systemctl`.) Core leftovers list stays
+  lockstep. CLASSIFY/DISPATCHES remain **71**. **Pending push**.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-44 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-44 smoke)
