@@ -1,12 +1,11 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (repair tip cohort after round-47 cancel align)
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel repair)
 
-## 2026-09-29 (align tip cohort — round-47 cancel cohort)
+## 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel repair)
 
-- Local HEAD `fa23fcf` path-patch-only against core `37c4204` after anvil
-  `dcf2ff2` / forge `6bd0903` rounds 155–159 / 196–201 + ember `13bb735` /
-  frost `7f3b327` round-47 smoke. Push/repin still pending with jsh.
+- Pending tip cohort note remains current at HEAD `5bb4e48` (core `37c4204`)
+  after round-47 cancel cohort hash repair beside smoke.
 
 
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 align)
