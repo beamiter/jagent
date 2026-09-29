@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip cohort after wave-36 / round-57)
+
+## 2026-09-29 (align tip cohort after wave-36 / round-57)
+
+- Local HEAD path-patch-only against core `6c32877` after PATH wave-36
+  network inventory leftovers + numactl/schedtool nest deepen. Ember
+  `00f351c` / frost `3610702` round-57 smoke sit beside. Push/repin
+  still pending with jsh.
+
+
 Updated: 2026-09-29 (pending tip cohort — wave-36 leftovers and deepen)
 
 ## 2026-09-29 (pending tip cohort — wave-36 leftovers and deepen)
