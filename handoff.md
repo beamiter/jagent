@@ -4,7 +4,7 @@ Updated: 2026-09-30 (align tip note self-hash after rounds 199/250 / wave-37 fin
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after rounds 199/250)
 
-- Pending tip cohort note remains current at HEAD `efb6bb4` (core `01c6a91`)
+- Pending tip cohort note remains current at HEAD `7fc82d8` (core `01c6a91`)
   after sticky 1803/1802/MAX-9/Unknown→GuardCautious beside wave-37 leftovers.
 
 Updated: 2026-09-30 (pending tip cohort — sticky 1803/1802/MAX-9 + rounds 199/250)
