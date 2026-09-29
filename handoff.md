@@ -1,5 +1,12 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 195/245)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after rounds 195/245)
+
+- Pending tip cohort note remains current at HEAD `9383fee` (core `7e3fdf5`)
+  after sticky 1802/1801/MAX-8/Unknown→GuardRecovery beside round-56 smoke.
+
 Updated: 2026-09-29 (pending tip cohort — sticky 1802/1801/MAX-8 + rounds 195/245)
 
 ## 2026-09-29 (pending tip cohort — sticky 1802/1801/MAX-8 + rounds 195/245)
