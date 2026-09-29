@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 38 probe: PATH process-table monitor leftovers)
+
+## 2026-09-30 (wave 38 probe — PATH process-table monitor leftovers)
+
+- **PATH probe** — process-table / resource monitors (top / htop / free /
+  uptime / pstree / ps / pmap / slabtop) beside STAGE peelers and wave-30–37
+  ctl/block/host/network/process-IPC leftovers are not peelable child-argv
+  launchers (watch is already STAGE). Pin
+  `path_probe_process_table_monitor_leftovers_do_not_invent_a_child_peel`.
+  Core leftovers list stays lockstep. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
 Updated: 2026-09-30 (align tip note self-hash after rounds 203/255 / round-59)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after rounds 203/255)
