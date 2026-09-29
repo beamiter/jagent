@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 32 deepen: aa-exec + socket-activate busybox + nests)
+
+## 2026-09-29 (wave 32 deepen — aa-exec / systemd-socket-activate busybox + nests)
+
+- **Thin STAGE 71 nests** — `aa-exec` / `systemd-socket-activate` expose +
+  nest regressions now peel busybox applet carriers and pipe-to-bash; busybox
+  `--` / help/version under timeout stay fail-closed. Pins
+  `aa_exec_exposes_its_direct_child` / `aa_exec_nest_with_timeout_and_nice` /
+  `systemd_socket_activate_exposes_its_direct_child` /
+  `systemd_socket_activate_nest_with_timeout_and_nice`.
+
+
 Updated: 2026-09-29 (wave 32 probe: PATH ctl/service leftovers)
 
 ## 2026-09-29 (wave 32 probe — PATH ctl/service leftovers)
