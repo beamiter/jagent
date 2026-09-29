@@ -4,8 +4,8 @@ Updated: 2026-09-29 (pending tip cohort — ember/frost round-46 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-46 smoke)
 
-- Local HEAD  still path-patch-only for ember/frost round-46 smoke
-  against core  (PATH wave-32 ctl/service leftovers + aa-exec /
+- Local HEAD `039ff07` still path-patch-only for ember/frost round-46 smoke
+  against core `191d35d` (PATH wave-32 ctl/service leftovers + aa-exec /
   systemd-socket-activate busybox nest deepen beside STAGE 71). Push/repin
   cohort still pending with jsh.
 
