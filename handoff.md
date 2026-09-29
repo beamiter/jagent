@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 37 probe: PATH process/IPC inventory leftovers)
+
+## 2026-09-30 (wave 37 probe — PATH process/IPC inventory leftovers)
+
+- **PATH probe** — process/IPC inventory managers (`lsof` / `fuser` / `vmstat` /
+  `perf` / `ipcs` / `ipcrm`) beside STAGE peelers and wave-30–36 ctl/block/host/
+  network leftovers are not peelable child-argv launchers. Pin
+  `path_probe_process_ipc_inventory_leftovers_do_not_invent_a_child_peel`.
+  Core leftovers list stays lockstep. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
 Updated: 2026-09-29 (align tip note self-hash after rounds 195/245 / round-56 final)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after rounds 195/245 final)
