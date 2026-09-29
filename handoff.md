@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-34)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after wave-34)
+
+- Pending tip cohort note remains current at HEAD `fd1661d` (core `1406fe6`)
+  after wave-34 leftovers + taskset/choom/prlimit deepen.
+
+
 Updated: 2026-09-29 (pending tip cohort — wave-34 leftovers/deepen)
 
 ## 2026-09-29 (pending tip cohort — wave-34 leftovers/deepen)
