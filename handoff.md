@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 21/20 deepen: busybox + timeout/nice for systemd-cat/inhibit)
+
+## 2026-09-29 (wave 21/20 deepen — systemd-cat/inhibit busybox + nests)
+
+- **Busybox carriers** — `systemd-inhibit` / `systemd-cat` danger regressions
+  now cover `busybox <wrapper>` applet peels and
+  `curl | busybox <wrapper> bash` pipe forms.
+- **Nested carriers** — pin `systemd_cat_and_inhibit_nest_with_timeout_and_nice`
+  for `timeout` / `nice` outside and inside those peelers (plus busybox +
+  pipe). Terminal `--list` / busybox `--` stay fail-closed. **Pending push**.
+
 Updated: 2026-09-29 (wave 27 probe: PATH identity/agent leftovers)
 
 ## 2026-09-29 (wave 27 probe — PATH identity/agent leftovers)
