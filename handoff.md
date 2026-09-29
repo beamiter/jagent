@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 174/219 align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after rounds 174/219 align)
+
+- Pending tip cohort note remains current at HEAD `5dc1370` (core `8b9db5a`)
+  after sticky FE04/find/MAX-3 align beside round-50 smoke.
+
+
 Updated: 2026-09-29 (align tip cohort after rounds 174/219 + round-50)
 
 ## 2026-09-29 (align tip cohort — rounds 174/219 + round-50)
