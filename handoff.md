@@ -1,6 +1,15 @@
 # Engineering handoff
 
-Updated: 2026-09-28 (wave 8)
+Updated: 2026-09-29 (wave 9: eatmydata/chronic/numactl/flock see-through)
+
+## 2026-09-29 (wave 9)
+
+- **eatmydata / chronic / numactl / flock child inspection** — these wrappers
+  now strip through to the direct child (numactl query modes and flock FD-only
+  forms stay terminal). Unlocks jterm_core `STAGE_PREFIXES` so pipe-to-
+  interpreter no longer misses `| numactl … sh` / `| flock FILE sh` /
+  `| eatmydata sh` / `| chronic sh`. **Pending push** before family repin.
+
 Baseline: 0.7.0
 Release target: Unreleased
 

