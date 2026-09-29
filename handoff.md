@@ -1,5 +1,29 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 22: systemd-socket-activate see-through)
+
+## 2026-09-29 (wave 22)
+
+- **systemd-socket-activate child inspection** — this `/usr/bin` launcher now
+  strips through to the direct daemon child. Unlocks
+  `| systemd-socket-activate sh` and destructive
+  `systemd-socket-activate … rm -rf /` forms for jterm_core `STAGE_PREFIXES`.
+  Bounded option table (`--listen`/`-l`, `--setenv`/`-E`, `--fdname`, flags
+  `--datagram`/`--seqpacket`/`--accept`/`-a`/`-d`/`--inetd`); help / version /
+  unknowns / bare / options-only fail closed. **Pending push** before family
+  repin.
+
+## 2026-09-29 (wave 22 probe — PATH leftovers)
+
+- **PATH probe** (socket-activate revisit + peer launchers):
+  `systemd-socket-activate` closed in wave 22 above (was wrongly left out as
+  listen-and-spawn — argv is options then daemon). `chrt` / `schedtool` /
+  `setpriv` already STAGE (no new arm). `dbus-launch` can wrap PROGRAM but is
+  primarily an env-printer / `--autolaunch` helper — leave out; prefer already
+  STAGE `dbus-run-session`. `flatpak-spawn` **absent** from PATH here — leave
+  out. `snap run` argv too complex — skip. `systemd-stdio-bridge` /
+  `aa-enabled` / `aa-features-abi` still not peel targets.
+
 Updated: 2026-09-29 (wave 21: systemd-inhibit see-through)
 
 ## 2026-09-29 (wave 21)
@@ -14,8 +38,8 @@ Updated: 2026-09-29 (wave 21: systemd-inhibit see-through)
 ## 2026-09-29 (wave 21 probe — PATH leftovers)
 
 - **PATH probe** (`ls /usr/bin/*wrap* *chain* *jail* systemd-* aa-*`):
-  `systemd-socket-activate` / `systemd-stdio-bridge` listen-and-spawn (not a
-  simple argv peel) — leave out until a fail-closed table is written.
+  `systemd-socket-activate` revisited in wave 22 (now peeled).
+  `systemd-stdio-bridge` listen-and-spawn (not a simple argv peel) — leave out.
   `aa-enabled` / `aa-features-abi` are query tools, not child launchers.
   Printer/`foo2*`/`gnome-terminal.wrapper` / `orca-dm-wrapper` are not peel
   targets. `systemd-inhibit` closed in wave 21 above; `systemd-cat` /
