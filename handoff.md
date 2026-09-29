@@ -1,5 +1,18 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 23 probe — PATH leftovers)
+
+## 2026-09-29 (wave 23 probe — PATH leftovers)
+
+- **PATH probe** (`command -v daemonize setlock s6-setuidgid s6-sudo
+  multilog setuidgid`): none of those binaries are installed here.
+  `firejail` / `chpst` / `softlimit` / `setuidgid` already STAGE. Peelable
+  grammar still landed for `daemonize`, `setlock`, and `s6-setuidgid` in
+  wave 23 above. `s6-sudo` is a unix-socket client (not a local child argv)
+  — leave out. `multilog` / `svlogd` are stdin loggers — leave out. Runit
+  helpers `runsv` / `runsvdir` / `sv` are supervisors, not peelable
+  launchers (`chpst` already STAGE). `tcsh` stays PIPE_INTERPRETERS.
+
 Updated: 2026-09-29 (wave 23: daemonize / setlock / s6-setuidgid see-through)
 
 ## 2026-09-29 (wave 23)
