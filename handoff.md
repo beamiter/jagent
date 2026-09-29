@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 18: dbus-run-session / runcon / xvfb-run see-through)
+Updated: 2026-09-29 (wave 19: strace / scriptlive see-through)
+
+## 2026-09-29 (wave 19)
+
+- **strace / scriptlive child inspection** — these `/usr/bin` launchers now
+  strip through to the direct child. Unlocks `| strace sh`, `| scriptlive
+  typescript sh`, and destructive `strace … rm -rf /` /
+  `scriptlive typescript rm -rf /` (plus `-c` shell-string) forms for
+  jterm_core `STAGE_PREFIXES`. Bounded option tables; help/version/unknowns
+  fail closed. `strace -p PID` attach-only and typescript-only `scriptlive`
+  stay childless. **Pending push** before family repin.
 
 ## 2026-09-29 (wave 18)
 
@@ -18,8 +28,8 @@ Updated: 2026-09-29 (wave 18: dbus-run-session / runcon / xvfb-run see-through)
   argv launcher (runs scripts from a directory) — leave out of STAGE. /
   `catchsegv` **not on PATH** here (needs `glibc-tools`); skip until installed
   and a fail-closed option table is written. `qemu-*-static` **absent** —
-  skip. `systemd-run` / `pkexec` already STAGE. `strace` / `scriptlive` remain
-  open candidates (complex CLIs); not in this wave.
+  skip. `systemd-run` / `pkexec` already STAGE. `strace` / `scriptlive` closed
+  in wave 19.
 
 ## 2026-09-29 (wave 17b)
 
