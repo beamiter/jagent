@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip cohort — wave-39 leftovers and deepen)
+
+## 2026-09-30 (pending tip cohort — wave-39 leftovers and deepen)
+
+- Local HEAD still path-patch-only after wave-39 user/session inventory leftover
+  pin + chpst/envdir/setuidgid nest deepen beside core tip .
+  CLASSIFY/DISPATCHES **71**. Ember/frost smoke numbers left for peer.
+  **Pending push/repin**.
+
+
 Updated: 2026-09-30 (wave 39 deepen: chpst/envdir/setuidgid nests)
 
 ## 2026-09-30 (wave 39 deepen — chpst/envdir/setuidgid timeout/nice nests)
