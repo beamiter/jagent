@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 + round-48)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 + round-48)
+
+- Pending tip cohort note remains current at HEAD `adafc90` (core `9764ae2`)
+  after sticky/find/Watch*/near-wrap pins and round-48 smoke.
+
+
 Updated: 2026-09-29 (pending tip cohort — sticky/find/Watch* + round-48 smoke)
 
 ## 2026-09-29 (pending tip cohort — rounds 161–164 / 203–207 + round-48)
