@@ -1,5 +1,26 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 21: systemd-inhibit see-through)
+
+## 2026-09-29 (wave 21)
+
+- **systemd-inhibit child inspection** — this `/usr/bin` launcher now strips
+  through to the direct child. Unlocks `| systemd-inhibit sh` and destructive
+  `systemd-inhibit … rm -rf /` forms for jterm_core `STAGE_PREFIXES`. Bounded
+  option table (`--what`/`--who`/`--why`/`--mode`, flag-only `--no-pager`/
+  `--no-legend`); `--list` / help / version / unknowns / bare / options-only
+  fail closed. **Pending push** before family repin.
+
+## 2026-09-29 (wave 21 probe — PATH leftovers)
+
+- **PATH probe** (`ls /usr/bin/*wrap* *chain* *jail* systemd-* aa-*`):
+  `systemd-socket-activate` / `systemd-stdio-bridge` listen-and-spawn (not a
+  simple argv peel) — leave out until a fail-closed table is written.
+  `aa-enabled` / `aa-features-abi` are query tools, not child launchers.
+  Printer/`foo2*`/`gnome-terminal.wrapper` / `orca-dm-wrapper` are not peel
+  targets. `systemd-inhibit` closed in wave 21 above; `systemd-cat` /
+  `aa-exec` / `systemd-run` already STAGE.
+
 Updated: 2026-09-29 (wave 20 edge-case pins for systemd-cat / aa-exec)
 
 ## 2026-09-29 (wave 20 edge-case pins)
