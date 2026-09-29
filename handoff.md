@@ -1,6 +1,16 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 10: rlwrap see-through)
+Updated: 2026-09-29 (wave 11: softlimit/chpst/setuidgid/envdir see-through)
+
+## 2026-09-29 (wave 11)
+
+- **softlimit / chpst / setuidgid / envdir child inspection** — daemontools /
+  runit wrappers now strip through to the direct child (`softlimit` and `chpst`
+  with bounded option tables; `setuidgid` skips the account positional like
+  gosu; `envdir` skips the directory positional like chroot/flock). Help /
+  unknown fail closed. Unlocks jterm_core `STAGE_PREFIXES` for
+  `| softlimit sh` / `| chpst -u nobody bash` / `| setuidgid nobody sh` /
+  `| envdir /env sh`. **Pending push** before family repin.
 
 ## 2026-09-29 (wave 10)
 

