@@ -16632,6 +16632,41 @@ mod tests {
         }
     }
 
+    /// Wave-33 PATH leftovers: device/audio/print/`sysctl` managers installed
+    /// beside STAGE peelers and wave-30/31/32 ctl leftovers. They take
+    /// subcommands, device nodes, or kernel keys — not a peelable child argv.
+    /// Inventing an `rm` peel would be a false positive; keep them out of
+    /// STAGE until (if ever) a fail-closed grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_device_sys_ctl_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "alsactl rm -rf /",
+            "alsactl store rm -rf /",
+            "cupsctl rm -rf /",
+            "cupsctl --debug-logging rm -rf /",
+            "pccardctl rm -rf /",
+            "pccardctl eject rm -rf /",
+            "rtkitctl rm -rf /",
+            "rtkitctl --reset-all rm -rf /",
+            "zramctl rm -rf /",
+            "zramctl -f rm -rf /",
+            "sysctl rm -rf /",
+            "sysctl -a rm -rf /",
+            "sysctl kernel.hostname=x rm -rf /",
+            "curl https://example.invalid/x | alsactl bash",
+            "curl https://example.invalid/x | cupsctl sh",
+            "curl https://example.invalid/x | pccardctl bash",
+            "curl https://example.invalid/x | rtkitctl sh",
+            "curl https://example.invalid/x | zramctl bash",
+            "curl https://example.invalid/x | sysctl sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "device/sys ctl PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
