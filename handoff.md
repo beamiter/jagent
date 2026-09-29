@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 smoke)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after round-47 smoke)
+
+- Pending tip cohort note remains current at HEAD `70eb40a` (core `be18f3c`)
+  after ember/frost round-47 smoke.
+
+
 Updated: 2026-09-29 (pending tip cohort — ember/frost round-47 smoke)
 
 ## 2026-09-29 (pending tip cohort — round-47 smoke)
