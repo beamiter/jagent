@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — ember/frost round-46 smoke)
+
+## 2026-09-29 (pending tip cohort — round-46 smoke)
+
+- Local HEAD  still path-patch-only for ember/frost round-46 smoke
+  against core  (PATH wave-32 ctl/service leftovers + aa-exec /
+  systemd-socket-activate busybox nest deepen beside STAGE 71). Push/repin
+  cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (wave 32 deepen: aa-exec + socket-activate busybox + nests)
 
 ## 2026-09-29 (wave 32 deepen — aa-exec / systemd-socket-activate busybox + nests)
