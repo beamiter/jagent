@@ -1,11 +1,12 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 + round-48)
+Updated: 2026-09-29 (align tip cohort after rounds 164/207 + round-48)
 
-## 2026-09-29 (point pending tip cohort note at HEAD after rounds 164/207 + round-48)
+## 2026-09-29 (align tip cohort — rounds 164/207 + round-48)
 
-- Pending tip cohort note remains current at HEAD `adafc90` (core `9764ae2`)
-  after sticky/find/Watch*/near-wrap pins and round-48 smoke.
+- Local HEAD path-patch-only against core `f772516` after anvil `f40fa66` /
+  forge `7302823` sticky/find/Watch* pins + ember `b651a6e` / frost `73064ed`
+  round-48 smoke. Push/repin still pending with jsh.
 
 
 Updated: 2026-09-29 (pending tip cohort — sticky/find/Watch* + round-48 smoke)
