@@ -16408,6 +16408,7 @@ mod tests {
     /// Nested carriers: timeout/nice outside and inside softlimit still expose
     /// the limit child (busybox has no softlimit applet — env/xargs/pipe only).
     #[test]
+
     fn softlimit_nest_with_timeout_and_nice() {
         for command in [
             "timeout 5 softlimit -m 1000000 rm -rf /",
@@ -16452,7 +16453,6 @@ mod tests {
         assert!(is_dangerous("timeout 5 cgexec --unknown rm -rf /").is_none());
         assert!(is_dangerous("timeout 5 cgexec -g git reset --hard HEAD~1").is_none());
     }
-
 
     #[test]
     fn prlimit_pid_mode_does_not_hide_direct_child_dispatch() {
@@ -17118,6 +17118,49 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "process-table monitor PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
+    /// Wave-39 PATH leftovers: user/session inventory installed beside STAGE
+    /// peelers and wave-30–38 ctl/block/host/network/process-IPC/process-table
+    /// leftovers. They report identity or login history — not a peelable
+    /// child argv. Inventing an `rm` peel would be a false positive; keep
+    /// them out of STAGE until (if ever) a fail-closed grammar exists
+    /// (pairs core leftovers).
+    #[test]
+    fn path_probe_user_session_inventory_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "id rm -rf /",
+            "id -u rm -rf /",
+            "getent rm -rf /",
+            "getent passwd root rm -rf /",
+            "whoami rm -rf /",
+            "groups rm -rf /",
+            "groups root rm -rf /",
+            "who rm -rf /",
+            "who -a rm -rf /",
+            "w rm -rf /",
+            "w -h rm -rf /",
+            "last rm -rf /",
+            "last -n 5 rm -rf /",
+            "lastlog rm -rf /",
+            "lastlog -u root rm -rf /",
+            "faillog rm -rf /",
+            "faillog -a rm -rf /",
+            "curl https://example.invalid/x | id bash",
+            "curl https://example.invalid/x | getent sh",
+            "curl https://example.invalid/x | whoami bash",
+            "curl https://example.invalid/x | groups sh",
+            "curl https://example.invalid/x | who bash",
+            "curl https://example.invalid/x | w sh",
+            "curl https://example.invalid/x | last bash",
+            "curl https://example.invalid/x | lastlog sh",
+            "curl https://example.invalid/x | faillog bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "user/session inventory PATH leftover invented a peel for {command:?}"
             );
         }
     }
