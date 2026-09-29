@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 9: eatmydata/chronic/numactl/flock see-through)
+Updated: 2026-09-29 (wave 10: rlwrap see-through)
+
+## 2026-09-29 (wave 10)
+
+- **`rlwrap` child inspection** — bounded option table strips through to the
+  direct child (`-a` is optional-attached only so `rlwrap -a sh` still exposes
+  `sh`; one-value `-f/-H/-s/-S/-p/-P/-z` and matching longs; `--help`/`--version`
+  and unknowns fail closed). Unlocks jterm_core `STAGE_PREFIXES` for
+  `| rlwrap sh` / `| rlwrap -a bash`. **Pending push** before family repin.
 
 ## 2026-09-29 (wave 9)
 

