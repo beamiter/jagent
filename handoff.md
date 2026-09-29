@@ -1,6 +1,17 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 13: cgexec/schedtool see-through)
+Updated: 2026-09-29 (wave 14: torsocks/proxychains see-through)
+
+## 2026-09-29 (wave 14)
+
+- **torsocks / proxychains child inspection** — GNU `parallel`/`sem` skipped
+  (template/`:::` grammar is not fail-closed-feasible). Instead these Tor/proxy
+  wrappers strip through to the direct child. `torsocks` accepts isolate/ipv6/
+  on/off flags and one-value user/pass/address/port; `--shell`/`--help`/
+  `--version` and unknowns fail closed. `proxychains`/`proxychains4`/
+  `proxychains3` accept `-q`/`--quiet` and `-f FILE`. Unlocks jterm_core
+  `STAGE_PREFIXES` for `| torsocks sh` / `| proxychains bash`. **Pending push**
+  before family repin.
 
 ## 2026-09-29 (wave 13)
 
