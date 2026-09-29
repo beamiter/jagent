@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-45 align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after round-45 align)
+
+- Pending tip cohort note remains current at HEAD `5df5543` (core `bedcc55`)
+  after round-45 edges align beside round-46.
+
+
 Updated: 2026-09-29 (align tip cohort after round-45 edges beside round-46)
 
 ## 2026-09-29 (align tip cohort — round-45 edges beside round-46)
