@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 27 probe: PATH identity/agent leftovers)
+
+## 2026-09-29 (wave 27 probe — PATH identity/agent leftovers)
+
+- **PATH probe** — ACL/SELinux labelers (`chcon`/`setfacl`/`getfacl`), group
+  switchers (`sg`/`newgrp`), and agent/password helpers (`ssh-agent`/
+  `gpg-agent`/`systemd-ask-password`) are installed beside STAGE peelers but
+  are not fail-closed child-argv launchers. Pin
+  `path_probe_identity_agent_leftovers_do_not_invent_a_child_peel` so they never
+  invent an `rm` peel. Core leftovers list stays lockstep. **Pending push**.
+
 Updated: 2026-09-29 (wave 25/24 deepen: busybox applet + pipe-to-bash)
 
 ## 2026-09-29 (wave 25/24 deepen — busybox applet + pipe-to-bash)
