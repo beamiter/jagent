@@ -16239,6 +16239,37 @@ mod tests {
         }
     }
 
+    /// Wave-28 PATH leftovers: systemd inspectors/formatters installed beside
+    /// already-STAGE `systemd-inhibit` / `systemd-run` / `systemd-cat`. They
+    /// list cgroups, analyze units, escape names, or detect virt — not a
+    /// peelable child argv. `cgexec` / `runuser` / `chrt` / `taskset` and both
+    /// `*inhibit*` binaries are already STAGE; `openvt` remains a peelable
+    /// candidate deferred (VT/console grammar). Keep these out of STAGE.
+    #[test]
+    fn path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "systemd-cgls rm -rf /",
+            "systemd-cgls -a -- git reset --hard HEAD~1",
+            "systemd-cgtop rm -rf /",
+            "systemd-cgtop -p systemctl reboot",
+            "systemd-analyze rm -rf /",
+            "systemd-analyze blame rm -rf /",
+            "systemd-path rm -rf /",
+            "systemd-path --suffix=bin systemctl reboot",
+            "systemd-escape rm -rf /",
+            "systemd-escape --suffix=service git reset --hard HEAD~1",
+            "systemd-detect-virt rm -rf /",
+            "systemd-detect-virt -c systemctl reboot",
+            "curl https://example.invalid/x | systemd-cgls bash",
+            "curl https://example.invalid/x | systemd-analyze sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd inspector PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     #[test]
     fn systemd_run_options_expose_direct_or_implicit_shell_children() {
         for command in [
