@@ -4,6 +4,14 @@ Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final a
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final align)
 
+- Pending tip cohort note remains current at HEAD `6ca01d7` (core `99437d4`)
+  after wave-34 leftovers/deepen final align.
+
+
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final align)
+
 - Pending tip cohort note remains current at HEAD `4409d60` (core `4d84468`)
   after wave-34 leftovers/deepen final align.
 
