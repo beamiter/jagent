@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — ember/frost round-49 smoke)
+
+## 2026-09-29 (pending tip cohort — round-49 smoke)
+
+- Local HEAD still path-patch-only for ember/frost round-49 smoke against core
+  `8ea7344` (PATH wave-33 device/sysctl leftovers + setsid busybox nest deepen
+  beside STAGE 71). Anvil `db42070` / forge `acd144e` / ember `296010d` /
+  frost `0cc7094` sit beside. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (wave 33 deepen: setsid busybox + nests)
 
 ## 2026-09-29 (wave 33 deepen — setsid busybox + timeout/nice nests)
