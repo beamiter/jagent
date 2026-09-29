@@ -1,5 +1,15 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (handoff sync STAGE 64 still pending push)
+
+## 2026-09-29 (handoff sync — STAGE 64 through wave 23)
+
+- **Cargo.toml stays on published `628811b`** — local jagent HEAD `967c2d4`
+  (systemd-socket-activate STAGE 64; daemonize/setlock/s6-setuidgid wave 23)
+  and jterm_core HEAD `55c798a` (STAGE_PREFIXES len 67, `between()` 76,
+  `flock --` end-of-options) remain path-patch-only until the tip cohort is
+  pushed; then repin the family.
+
 Updated: 2026-09-29 (wave 23 probe — PATH leftovers)
 
 ## 2026-09-29 (wave 23 probe — PATH leftovers)
