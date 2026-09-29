@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (sticky 1805 / rounds 207/260 tip note)
+
+## 2026-09-30 (pending tip — sticky 1805 / anvil 204–207 / forge 256–260)
+
+- Local HEAD `8b59260` stays path-patch cohort beside jterm_core MAX-11 cancel
+  and anvil **204–207** / forge **256–260**. STAGE **71** / between() **93**
+  unchanged. Pending push/repin.
+
 Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after wave-39 leftovers/deepen)
