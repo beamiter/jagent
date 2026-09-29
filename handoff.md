@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — wave-34 leftovers/deepen)
+
+## 2026-09-29 (pending tip cohort — wave-34 leftovers/deepen)
+
+- Local HEAD still path-patch-only for PATH wave-34 block/mount leftovers +
+  taskset/choom/prlimit nest deepen against core `c19d9da` (CLASSIFY/DISPATCHES
+  STAGE 71). Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-29 (wave 34 deepen: taskset/choom/prlimit nests)
 
 ## 2026-09-29 (wave 34 deepen — taskset/choom/prlimit busybox + nests)
