@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (align tip cohort after wave-34 final)
+
+## 2026-09-29 (align tip cohort after wave-34 final)
+
+- Local HEAD path-patch-only against core `c26fdfa` after PATH wave-34
+  block/mount leftovers + taskset/choom/prlimit STAGE nest deepen. Push/repin
+  still pending with jsh.
+
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-34)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after wave-34)
