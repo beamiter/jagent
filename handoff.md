@@ -1,6 +1,25 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 17b: bubblewrap/bwrap danger parity assert)
+Updated: 2026-09-29 (wave 18: dbus-run-session / runcon / xvfb-run see-through)
+
+## 2026-09-29 (wave 18)
+
+- **dbus-run-session / runcon / xvfb-run child inspection** — these
+  `/usr/bin` launchers now strip through to the direct child. Unlocks
+  `| dbus-run-session sh`, `| runcon CONTEXT sh`, `| xvfb-run sh` (and the
+  destructive `… rm -rf /` forms) for jterm_core `STAGE_PREFIXES`. Bounded
+  option tables; help/version/unknowns fail closed. `runcon` also drops the
+  positional SELinux CONTEXT before judging COMMAND. **Pending push** before
+  family repin.
+
+## 2026-09-29 (wave 18 probe — catchsegv / run-parts / qemu)
+
+- **Launcher probe** (`which -a`): `run-parts` present but **not** a child
+  argv launcher (runs scripts from a directory) — leave out of STAGE. /
+  `catchsegv` **not on PATH** here (needs `glibc-tools`); skip until installed
+  and a fail-closed option table is written. `qemu-*-static` **absent** —
+  skip. `systemd-run` / `pkexec` already STAGE. `strace` / `scriptlive` remain
+  open candidates (complex CLIs); not in this wave.
 
 ## 2026-09-29 (wave 17b)
 
