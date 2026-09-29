@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-35 / round
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after wave-35 / round-54 final)
 
-- Pending tip cohort note remains current at HEAD `7284159` (core `8268d7a`)
+- Pending tip cohort note remains current at HEAD `9bf790f` (core `db41aef`)
   after wave-35 leftovers/deepen final align beside round-54 smoke.
 
 
