@@ -1,5 +1,17 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 34 deepen: taskset/choom/prlimit nests)
+
+## 2026-09-29 (wave 34 deepen — taskset/choom/prlimit busybox + nests)
+
+- **Thin STAGE 71 nest** — `taskset` expose + nest regressions now peel busybox
+  applet carriers and pipe-to-bash; help/version under timeout stay fail-closed.
+  `choom`/`prlimit` nest with timeout/nice (no busybox applets). Pins
+  `taskset_nest_with_timeout_and_nice` / `choom_nest_with_timeout_and_nice` /
+  `prlimit_nest_with_timeout_and_nice`. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-29 (wave 34 probe: PATH block/mount leftovers)
 
 ## 2026-09-29 (wave 34 probe — PATH block/mount leftovers)
