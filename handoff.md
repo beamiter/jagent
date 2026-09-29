@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after round-47 cancel repair)
 
-- Pending tip cohort note remains current at HEAD `5bb4e48` (core `37c4204`)
+- Pending tip cohort note remains current at HEAD `ad7a120` (core `e72436c`)
   after round-47 cancel cohort hash repair beside smoke.
 
 
