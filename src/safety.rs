@@ -16505,6 +16505,55 @@ mod tests {
         }
     }
 
+    /// Wave-32 PATH leftovers: more D-Bus/`*ctl` managers and SysV rc helpers
+    /// installed beside STAGE peelers and wave-30/31 ctl leftovers. They take
+    /// subcommands or unit basenames — not a peelable child argv. Inventing an
+    /// `rm` peel would be a false positive; keep them out of STAGE until (if
+    /// ever) a fail-closed grammar exists (pairs core leftovers list).
+    /// (`service` already has a direct state-disruption classifier and `docker`
+    /// has container-engine scanners — both stay off STAGE and are listed only
+    /// on the core leftovers pin, matching wave-30 `systemctl`.)
+    #[test]
+    fn path_probe_ctl_service_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "bluetoothctl rm -rf /",
+            "bluetoothctl power on rm -rf /",
+            "boltctl rm -rf /",
+            "boltctl list rm -rf /",
+            "grdctl rm -rf /",
+            "grdctl status rm -rf /",
+            "obexctl rm -rf /",
+            "oomctl rm -rf /",
+            "oomctl dump rm -rf /",
+            "pactl rm -rf /",
+            "pactl info rm -rf /",
+            "powerprofilesctl rm -rf /",
+            "powerprofilesctl get rm -rf /",
+            "snapctl rm -rf /",
+            "snapctl get foo rm -rf /",
+            "switcherooctl rm -rf /",
+            "switcherooctl list rm -rf /",
+            "udisksctl rm -rf /",
+            "udisksctl status rm -rf /",
+            "wdctl rm -rf /",
+            "wdctl --show rm -rf /",
+            "update-rc.d rm -rf /",
+            "update-rc.d ssh defaults rm -rf /",
+            "invoke-rc.d rm -rf /",
+            "invoke-rc.d ssh status rm -rf /",
+            "curl https://example.invalid/x | bluetoothctl bash",
+            "curl https://example.invalid/x | pactl sh",
+            "curl https://example.invalid/x | powerprofilesctl bash",
+            "curl https://example.invalid/x | update-rc.d sh",
+            "curl https://example.invalid/x | invoke-rc.d bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "ctl/service PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
     /// kbd `openvt` is STAGE: peel COMMAND after VT flags / `-c` console meta.
     /// `-u` runs `login` (no argv child); help/version/unknowns fail closed.
     #[test]
