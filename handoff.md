@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (pending tip cohort — sticky 1802/1801/MAX-8 + rounds 195/245)
+
+## 2026-09-29 (pending tip cohort — sticky 1802/1801/MAX-8 + rounds 195/245)
+
+- Local HEAD still path-patch-only after anvil 192–195 / forge 241–245 sticky
+  Mongolian comma + 1801/ellipsis find + MAX-8 cancel + Unknown→GuardRecovery
+  beside core `7e3fdf5` tip. CLASSIFY/DISPATCHES **71** held. Push/repin cohort
+  still pending with jsh.
+
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-36 / round-57 final)
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after wave-36 / round-57 final)
