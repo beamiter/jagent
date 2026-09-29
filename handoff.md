@@ -8,6 +8,14 @@ Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
   after wave-39 leftovers/deepen. Ember/frost smoke left for peer.
 
 
+Updated: 2026-09-30 (align tip note self-hash after wave-39 leftovers/deepen)
+
+## 2026-09-30 (point pending tip cohort note at HEAD after wave-39 leftovers/deepen)
+
+- Pending tip cohort note remains current at HEAD  (core )
+  after wave-39 leftovers/deepen. Ember/frost smoke left for peer.
+
+
 Updated: 2026-09-30 (point pending tip cohort note at HEAD after wave-39)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after wave-39)
