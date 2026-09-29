@@ -1,6 +1,14 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (handoff sync STAGE 64 still pending push)
+Updated: 2026-09-29 (wave 23 leftover: s6-envdir family stays out)
+
+## 2026-09-29 (wave 23 leftover — s6-envdir / s6-log)
+
+- **PATH leftovers beside STAGE 67** — `s6-setuidgid` is peeled; `s6-envdir` /
+  `s6-envuidgid` / `s6-applyuidgid` (identity/env helpers with different argv)
+  and `s6-log` (stdin logger like `multilog`) stay out until taught
+  fail-closed. `s6-sudo` remains a unix-socket client. Core classify now
+  consumes `--` before the `s6-setuidgid` account. **Pending push**.
 
 ## 2026-09-29 (handoff sync — STAGE 64 through wave 23)
 
