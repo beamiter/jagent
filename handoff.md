@@ -4,7 +4,7 @@ Updated: 2026-09-30 (align tip note self-hash after wave-38 / round-60 smoke)
 
 ## 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 smoke)
 
-- Pending tip cohort note remains current at HEAD `b53dae8` (core `0e0e261`)
+- Pending tip cohort note remains current at HEAD `b880d59` (core `3bef18e`)
   after wave-38 leftovers/deepen final align beside round-60 smoke.
 
 Updated: 2026-09-30 (point pending tip cohort note at HEAD after wave-38 / round-60 smoke)
