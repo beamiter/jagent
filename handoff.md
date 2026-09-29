@@ -1,5 +1,13 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final align)
+
+## 2026-09-29 (point pending tip cohort note at HEAD after wave-34 final align)
+
+- Pending tip cohort note remains current at HEAD `4409d60` (core `4d84468`)
+  after wave-34 leftovers/deepen final align.
+
+
 Updated: 2026-09-29 (align tip cohort after wave-34 final)
 
 ## 2026-09-29 (align tip cohort after wave-34 final)
