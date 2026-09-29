@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 39 deepen: chpst/envdir/setuidgid nests)
+
+## 2026-09-30 (wave 39 deepen — chpst/envdir/setuidgid timeout/nice nests)
+
+- **Thin STAGE 71 nest** — chpst / envdir / setuidgid nest regressions peel
+  timeout/nice carriers outside and inside the STAGE name; help/version and
+  dashed unknown operands stay fail-closed. Pins `chpst_nest_with_timeout_and_nice`
+  / `envdir_nest_with_timeout_and_nice` / `setuidgid_nest_with_timeout_and_nice`
+  (softlimit/cgexec already deepened in wave-38).
+
+
 Updated: 2026-09-30 (wave 39 leftovers: user/session inventory PATH probe)
 
 ## 2026-09-30 (wave 39 leftovers — user/session inventory PATH probe)
