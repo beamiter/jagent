@@ -4,7 +4,7 @@ Updated: 2026-09-29 (point pending tip cohort note at HEAD after rounds 191/240 
 
 ## 2026-09-29 (point pending tip cohort note at HEAD after rounds 191/240 final)
 
-- Pending tip cohort note remains current at HEAD `9eeb4ce` (core `4f3c35d`)
+- Pending tip cohort note remains current at HEAD `668b317` (core `d5d350f`)
   after sticky 1801/FE07/MAX-7/GuardRecovery final align beside round-55 smoke.
 
 Updated: 2026-09-29 (point pending tip cohort note at HEAD after wave-35 / round-54 final)
