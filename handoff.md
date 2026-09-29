@@ -1,6 +1,19 @@
 # Engineering handoff
 
-Updated: 2026-09-29 (wave 11: softlimit/chpst/setuidgid/envdir see-through)
+Updated: 2026-09-29 (wave 12: fakeroot/proot/firejail see-through)
+
+## 2026-09-29 (wave 12)
+
+- **fakeroot / proot / firejail child inspection** — these wrappers now strip
+  through to the direct child. `fakeroot` mirrors eatmydata/nohup (`[--]
+  PROGRAM`; any leading dash help/version/unknown fails closed). `proot`
+  accepts common `-r/-b/-w/-q/-0/-S` and matching `--rootfs`/`--bind`/`--pwd`/
+  `--cwd`/`--qemu`/`--root-id` forms. `firejail` is bounded to common flags and
+  one-value options (`--private=` attached OK); `--help`/`--version` terminal;
+  unknown fail closed (prefer fail-closed over perfect firejail grammar).
+  Unlocks jterm_core `STAGE_PREFIXES` for `| fakeroot sh` /
+  `| proot -r / sh` / `| firejail --noprofile bash`. **Pending push** before
+  family repin.
 
 ## 2026-09-29 (wave 11)
 
