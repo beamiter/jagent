@@ -1,5 +1,16 @@
 # Engineering handoff
 
+Updated: 2026-09-29 (wave 29 deepen: openvt busybox + pipe-to-bash)
+
+## 2026-09-29 (wave 29 deepen — openvt busybox + pipe-to-bash)
+
+- **Busybox applet / pipe** — `openvt` expose + nest regressions now peel
+  `busybox openvt` carriers and `curl|…| busybox openvt bash` forms; busybox
+  `--` / help and openvt `-u`/`--user` under timeout stay fail-closed. Pin
+  `openvt_exposes_its_direct_child_across_dispatchers` /
+  `openvt_nest_with_timeout_and_nice`.
+
+
 Updated: 2026-09-29 (wave 29 deepen: openvt timeout/nice nest)
 
 ## 2026-09-29 (wave 29 deepen — openvt timeout/nice nest)
