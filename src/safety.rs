@@ -16406,6 +16406,7 @@ mod tests {
     }
 
 
+
     #[test]
     fn prlimit_pid_mode_does_not_hide_direct_child_dispatch() {
         for command in [
@@ -17029,6 +17030,47 @@ mod tests {
             assert!(
                 is_dangerous(command).is_none(),
                 "process/IPC inventory PATH leftover invented a peel for {command:?}"
+            );
+        }
+    }
+
+    /// Wave-38 PATH leftovers: process-table / resource monitors installed
+    /// beside STAGE peelers and wave-30–37 ctl/block/host/network/process-IPC
+    /// leftovers. They list processes or memory/CPU state — not a peelable
+    /// child argv (`watch` is already STAGE). Inventing an `rm` peel would be
+    /// a false positive; keep them out of STAGE until (if ever) a fail-closed
+    /// grammar exists (pairs core leftovers).
+    #[test]
+    fn path_probe_process_table_monitor_leftovers_do_not_invent_a_child_peel() {
+        for command in [
+            "top rm -rf /",
+            "top -b -n 1 rm -rf /",
+            "htop rm -rf /",
+            "htop -d 10 rm -rf /",
+            "free rm -rf /",
+            "free -h rm -rf /",
+            "uptime rm -rf /",
+            "uptime -p rm -rf /",
+            "pstree rm -rf /",
+            "pstree -a rm -rf /",
+            "ps rm -rf /",
+            "ps aux rm -rf /",
+            "pmap rm -rf /",
+            "pmap -x 1 rm -rf /",
+            "slabtop rm -rf /",
+            "slabtop -o rm -rf /",
+            "curl https://example.invalid/x | top bash",
+            "curl https://example.invalid/x | htop sh",
+            "curl https://example.invalid/x | free bash",
+            "curl https://example.invalid/x | uptime sh",
+            "curl https://example.invalid/x | pstree bash",
+            "curl https://example.invalid/x | ps sh",
+            "curl https://example.invalid/x | pmap bash",
+            "curl https://example.invalid/x | slabtop sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_none(),
+                "process-table monitor PATH leftover invented a peel for {command:?}"
             );
         }
     }
