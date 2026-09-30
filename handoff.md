@@ -1,5 +1,14 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)
+
+## 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)
+
+- Local HEAD still path-patch-only after wave-38 process-table monitor leftover
+  pin + softlimit/cgexec nest deepen beside core tip. CLASSIFY/DISPATCHES **71**
+  held. Push/repin cohort still pending with jsh.
+
+
 Updated: 2026-09-30 (wave 38 deepen: softlimit/cgexec nests)
 
 ## 2026-09-30 (wave 38 deepen — softlimit/cgexec timeout/nice nests)
