@@ -1,5 +1,521 @@
 # Engineering handoff
 
+Updated: 2026-09-30 (wave 38 probe: PATH process-table monitor leftovers)
+
+## 2026-09-30 (wave 38 probe — PATH process-table monitor leftovers)
+
+- **PATH probe** — process-table / resource monitors ( /                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 0[8.5]   4[16.]   8[33.]  12[11.]    16[8.8]  20[6.2]  24[6.5]  28[3.3]1[5.1]   
+F1Help  F2Setup F3SearchF4FilterF5Tree  F6SortByF7Nice -F8Nice +F9Kill  F10Quit
+                                                                               
+
+ /                total        used        free      shared  buff/cache   available
+Mem:       131611664    79322140    25899924      653172    26389600    50253612
+Swap:        2097148     2095084        2064 /
+   09:57:53 up 15 days, 12:20,  0 users,  load average: 598.21, 612.39, 263.41 / systemd-+-ModemManager---2*[{ModemManager}]
+        |-NetworkManager---2*[{NetworkManager}]
+        |-accounts-daemon---2*[{accounts-daemon}]
+        |-acpid
+        |-avahi-daemon---avahi-daemon
+        |-awesun_daemon-+-awesun---15*[{awesun}]
+        |               `-2*[{awesun_daemon}]
+        |-bluetoothd
+        |-browser_crashpa---{browser_crashpa}
+        |-browser_crashpa
+        |-15*[chrome_crashpad---2*[{chrome_crashpad}]]
+        |-chrome_crashpad---{chrome_crashpad}
+        |-codex-+-codex-+-codex-code-mode---19*[{codex-code-mode}]
+        |       |       |-node_repl---34*[{node_repl}]
+        |       |       `-53*[{codex}]
+        |       `-33*[{codex}]
+        |-colord---2*[{colord}]
+        |-com.alibabainc.---2*[{com.alibabainc.}]
+        |-containerd---22*[{containerd}]
+        |-cron
+        |-cups-browsed---2*[{cups-browsed}]
+        |-cupsd---dbus
+        |-3*[dbus-daemon]
+        |-12*[dconf---3*[{dconf}]]
+        |-dnsmasq
+        |-dockerd---25*[{dockerd}]
+        |-faked-sysv
+        |-faked-tcp
+        |-fcitx
+        |-fcitx-dbus-watc
+        |-gdm3-+-gdm-session-wor-+-gdm-x-session-+-Xorg---{Xorg}
+        |      |                 |               |-jwm-tool---jwm-+-ChatGPT-+-ChatGPT-+-ChatGPT-+-ChatGPT
+        |      |                 |               |                |         |         |         `-13*[{ChatGPT}]
+        |      |                 |               |                |         |         `-ChatGPT---7*[{ChatGPT}]
+        |      |                 |               |                |         |-ChatGPT---ChatGPT-+-2*[ChatGPT---9*[{ChatGPT}]]
+        |      |                 |               |                |         |                   |-2*[ChatGPT---38*[{ChatGPT}]]
+        |      |                 |               |                |         |                   |-ChatGPT---37*[{ChatGPT}]
+        |      |                 |               |                |         |                   |-ChatGPT---27*[{ChatGPT}]
+        |      |                 |               |                |         |                   `-ChatGPT---40*[{ChatGPT}]
+        |      |                 |               |                |         |-ChatGPT---13*[{ChatGPT}]
+        |      |                 |               |                |         |-codex-+-node_repl---34*[{node_repl}]
+        |      |                 |               |                |         |       `-51*[{codex}]
+        |      |                 |               |                |         `-48*[{ChatGPT}]
+        |      |                 |               |                |-Elevator.sh---com.alibabainc.-+-com.alibabainc.
+        |      |                 |               |                |                               |-com.alibabainc.---com.alibabain+
+        |      |                 |               |                |                               |-com.alibabainc.---3*[{com.aliba+
+        |      |                 |               |                |                               |-com.alibabainc.---5*[{com.aliba+
+        |      |                 |               |                |                               `-243*[{com.alibabainc.}]
+        |      |                 |               |                |-awesun---16*[{awesun}]
+        |      |                 |               |                |-chrome-+-2*[cat]
+        |      |                 |               |                |        |-chrome---chrome-+-chrome
+        |      |                 |               |                |        |                 `-12*[{chrome}]
+        |      |                 |               |                |        |-chrome---chrome-+-chrome---8*[{chrome}]
+        |      |                 |               |                |        |                 |-5*[chrome---38*[{chrome}]]
+        |      |                 |               |                |        |                 |-2*[chrome---42*[{chrome}]]
+        |      |                 |               |                |        |                 |-6*[chrome---41*[{chrome}]]
+        |      |                 |               |                |        |                 |-chrome---33*[{chrome}]
+        |      |                 |               |                |        |                 |-chrome---39*[{chrome}]
+        |      |                 |               |                |        |                 |-chrome---23*[{chrome}]
+        |      |                 |               |                |        |                 |-chrome---25*[{chrome}]
+        |      |                 |               |                |        |                 |-chrome---9*[{chrome}]
+        |      |                 |               |                |        |                 |-chrome---45*[{chrome}]
+        |      |                 |               |                |        |                 `-chrome---26*[{chrome}]
+        |      |                 |               |                |        |-chrome---37*[{chrome}]
+        |      |                 |               |                |        |-chrome---9*[{chrome}]
+        |      |                 |               |                |        `-39*[{chrome}]
+        |      |                 |               |                |-cursor-+-cursor---cursor-+-cursor
+        |      |                 |               |                |        |                 `-39*[{cursor}]
+        |      |                 |               |                |        |-cursor---cursor---cursor---40*[{cursor}]
+        |      |                 |               |                |        |-cursor---9*[{cursor}]
+        |      |                 |               |                |        |-3*[cursor---20*[{cursor}]]
+        |      |                 |               |                |        |-cursor---6*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-2*[cursor---8*[{cursor}]]
+        |      |                 |               |                |        |        `-20*[{cursor}]
+        |      |                 |               |                |        |-cursor---88*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-cursor---12*[{cursor}]
+        |      |                 |               |                |        |        `-21*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-bash---python3
+        |      |                 |               |                |        |        `-20*[{cursor}]
+        |      |                 |               |                |        |-cursor---21*[{cursor}]
+        |      |                 |               |                |        `-41*[{cursor}]
+        |      |                 |               |                |-cursor-+-cursor---cursor-+-cursor
+        |      |                 |               |                |        |                 `-39*[{cursor}]
+        |      |                 |               |                |        |-cursor---cursor---cursor---42*[{cursor}]
+        |      |                 |               |                |        |-cursor---8*[{cursor}]
+        |      |                 |               |                |        |-cursor---19*[{cursor}]
+        |      |                 |               |                |        |-2*[cursor---20*[{cursor}]]
+        |      |                 |               |                |        |-cursor---6*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-cursor---8*[{cursor}]
+        |      |                 |               |                |        |        `-20*[{cursor}]
+        |      |                 |               |                |        |-cursor---52*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-cursor---12*[{cursor}]
+        |      |                 |               |                |        |        `-21*[{cursor}]
+        |      |                 |               |                |        |-cursor-+-bash---bash---pstree
+        |      |                 |               |                |        |        `-20*[{cursor}]
+        |      |                 |               |                |        |-cursor---21*[{cursor}]
+        |      |                 |               |                |        `-39*[{cursor}]
+        |      |                 |               |                |-feishu-+-2*[cat]
+        |      |                 |               |                |        |-feishu---15*[{feishu}]
+        |      |                 |               |                |        |-feishu-+-feishu
+        |      |                 |               |                |        |        `-28*[{feishu}]
+        |      |                 |               |                |        |-feishu---39*[{feishu}]
+        |      |                 |               |                |        |-feishu---9*[{feishu}]
+        |      |                 |               |                |        |-feishu---1031*[{feishu}]
+        |      |                 |               |                |        |-feishu---48*[{feishu}]
+        |      |                 |               |                |        |-feishu---8*[{feishu}]
+        |      |                 |               |                |        |-feishu-+-feishu
+        |      |                 |               |                |        |        `-26*[{feishu}]
+        |      |                 |               |                |        |-feishu-+-feishu
+        |      |                 |               |                |        |        `-42*[{feishu}]
+        |      |                 |               |                |        |-feishu-+-feishu
+        |      |                 |               |                |        |        `-14*[{feishu}]
+        |      |                 |               |                |        |-feishu-+-feishu
+        |      |                 |               |                |        |        `-16*[{feishu}]
+        |      |                 |               |                |        |-2*[feishu-+-feishu]
+        |      |                 |               |                |        |           `-44*[{feishu}]]
+        |      |                 |               |                |        `-53*[{feishu}]
+        |      |                 |               |                |-frost-+-jsh---claude-+-bash-+-bash---claude.exe
+        |      |                 |               |                |       |              |      `-ssh
+        |      |                 |               |                |       |              |-npm exec @larks-+-sh---node---12*[{node}+
+        |      |                 |               |                |       |              |                 `-10*[{npm exec @larks}]
+        |      |                 |               |                |       |              `-29*[{claude}]
+        |      |                 |               |                |       |-jsh---vim-+-simplecc-daemon-+-node---6*[{node}]
+        |      |                 |               |                |       |           |                 `-35*[{simplecc-daemon}]
+        |      |                 |               |                |       |           |-simplegit-daemo---39*[{simplegit-daemo}]
+        |      |                 |               |                |       |           |-simpleline-daem---34*[{simpleline-daem}]
+        |      |                 |               |                |       |           |-simpletree-daem---7*[{simpletree-daem}]
+        |      |                 |               |                |       |           |-ts-hl-daemon
+        |      |                 |               |                |       |           `-{vim}
+        |      |                 |               |                |       |-3*[jsh]
+        |      |                 |               |                |       |-jsh---node-+-codex---44*[{codex}]
+        |      |                 |               |                |       |            `-6*[{node}]
+        |      |                 |               |                |       |-jsh---claude-+-npm exec @larks-+-sh---node---12*[{node}+
+        |      |                 |               |                |       |              |                 `-10*[{npm exec @larks}]
+        |      |                 |               |                |       |              `-38*[{claude}]
+        |      |                 |               |                |       `-53*[{frost}]
+        |      |                 |               |                |-2*[tao_glow_bar---40*[{tao_glow_bar}]]
+        |      |                 |               |                `-6*[{jwm}]
+        |      |                 |               `-2*[{gdm-x-session}]
+        |      |                 `-2*[{gdm-session-wor}]
+        |      `-2*[{gdm3}]
+        |-gnome-keyring-d---3*[{gnome-keyring-d}]
+        |-irqbalance---{irqbalance}
+        |-2*[kerneloops]
+        |-networkd-dispat
+        |-nix-daemon---16*[{nix-daemon}]
+        |-60*[node---12*[{node}]]
+        |-packagekitd---2*[{packagekitd}]
+        |-polkitd---2*[{polkitd}]
+        |-power-profiles----2*[{power-profiles-}]
+        |-python3-+-2*[g1_initial_forc]
+        |         `-2*[g1_initial_stat]
+        |-rsyslogd---3*[{rsyslogd}]
+        |-rtkit-daemon---2*[{rtkit-daemon}]
+        |-run.sh---java---275*[{java}]
+        |-snapd---34*[{snapd}]
+        |-ssh
+        |-sshd
+        |-switcheroo-cont---2*[{switcheroo-cont}]
+        |-systemd-+-(sd-pam)
+        |         |-at-spi-bus-laun-+-dbus-daemon
+        |         |                 `-3*[{at-spi-bus-laun}]
+        |         |-at-spi2-registr---2*[{at-spi2-registr}]
+        |         |-chrome_crashpad---2*[{chrome_crashpad}]
+        |         |-dbus-daemon
+        |         |-dconf---3*[{dconf}]
+        |         |-dconf-service---2*[{dconf-service}]
+        |         |-gnome-keyring-d---2*[{gnome-keyring-d}]
+        |         |-goa-daemon---3*[{goa-daemon}]
+        |         |-goa-identity-se---2*[{goa-identity-se}]
+        |         |-gvfs-afc-volume---3*[{gvfs-afc-volume}]
+        |         |-gvfs-goa-volume---2*[{gvfs-goa-volume}]
+        |         |-gvfs-gphoto2-vo---2*[{gvfs-gphoto2-vo}]
+        |         |-gvfs-mtp-volume---2*[{gvfs-mtp-volume}]
+        |         |-gvfs-udisks2-vo---3*[{gvfs-udisks2-vo}]
+        |         |-gvfsd-+-gvfsd-dnssd---2*[{gvfsd-dnssd}]
+        |         |       |-gvfsd-network---3*[{gvfsd-network}]
+        |         |       |-gvfsd-trash---2*[{gvfsd-trash}]
+        |         |       `-2*[{gvfsd}]
+        |         |-gvfsd-fuse---8*[{gvfsd-fuse}]
+        |         |-gvfsd-metadata---2*[{gvfsd-metadata}]
+        |         |-jwm-bridge---6*[{jwm-bridge}]
+        |         |-pipewire---{pipewire}
+        |         |-pipewire-media----{pipewire-media-}
+        |         |-pulseaudio---3*[{pulseaudio}]
+        |         |-snap---15*[{snap}]
+        |         |-speech-dispatch-+-sd_dummy---2*[{sd_dummy}]
+        |         |                 |-sd_espeak-ng---{sd_espeak-ng}
+        |         |                 |-sd_espeak-ng-mb
+        |         |                 `-5*[{speech-dispatch}]
+        |         |-tracker-miner-f---5*[{tracker-miner-f}]
+        |         |-user-session-he-+-snapd-desktop-i---4*[{snapd-desktop-i}]
+        |         |                 `-3*[{user-session-he}]
+        |         |-xdg-desktop-por---5*[{xdg-desktop-por}]
+        |         |-2*[xdg-desktop-por---3*[{xdg-desktop-por}]]
+        |         |-xdg-document-po-+-fusermount3-+-fuser-mount3
+        |         |                 |             `-4*[{fusermount3}]
+        |         |                 `-8*[{xdg-document-po}]
+        |         `-xdg-permission----2*[{xdg-permission-}]
+        |-systemd-journal
+        |-systemd-logind
+        |-systemd-oomd
+        |-systemd-resolve
+        |-systemd-timesyn---{systemd-timesyn}
+        |-systemd-udevd
+        |-thermald---{thermald}
+        |-udisksd---4*[{udisksd}]
+        |-unattended-upgr---{unattended-upgr}
+        |-upowerd---2*[{upowerd}]
+        |-wpa_supplicant
+        |-yunshu-daemon---49*[{yunshu-daemon}]
+        `-yunshu-updater-+-TBEngine---{TBEngine}
+                         |-TBRunner-+-10*[TBEngine]
+                         |          |-TBEngine---{TBEngine}
+                         |          `-6*[{TBRunner}]
+                         `-186*[{yunshu-updater}] /     PID TTY          TIME CMD
+   3986 ?        00:00:01 systemd
+   3987 ?        00:00:00 (sd-pam)
+   3993 ?        00:00:00 pipewire
+   3994 ?        00:02:04 pipewire-media-
+   3995 ?        07:34:18 pulseaudio
+   4005 ?        00:00:01 gnome-keyring-d
+   4016 ?        00:10:16 dbus-daemon
+   4036 ?        00:00:01 xdg-document-po
+   4043 ?        00:00:00 xdg-permission-
+   4194 ?        00:00:05 dbus-daemon
+   4201 ?        00:14:56 jwm-bridge
+   4293 ?        00:00:29 xdg-desktop-por
+   4333 ?        00:03:04 xdg-desktop-por
+   4342 ?        00:00:00 gvfsd
+   4348 ?        00:01:39 gvfsd-fuse
+   4363 ?        00:00:04 xdg-desktop-por
+   4364 ?        00:00:00 at-spi-bus-laun
+   4370 ?        00:00:06 dbus-daemon
+   4375 ?        00:00:35 at-spi2-registr
+   4382 ?        00:00:00 gnome-keyring-d
+   4414 ?        00:00:00 user-session-he
+   4487 ?        00:01:51 snapd-desktop-i
+   8773 ?        03:44:52 feishu
+   8782 ?        00:00:00 cat
+   8783 ?        00:00:00 cat
+   8814 ?        00:07:41 feishu
+   8843 ?        01:59:36 feishu
+   8847 ?        00:03:28 feishu
+   8848 ?        00:00:30 feishu
+   8881 ?        05:43:03 feishu
+   8920 ?        00:22:11 feishu
+   8981 ?        00:00:00 feishu
+  10940 ?        00:00:03 node
+  11169 ?        00:00:03 node
+  11419 ?        00:00:00 gvfsd-trash
+  11436 ?        00:00:00 gvfs-udisks2-vo
+  11441 ?        00:00:00 gvfs-gphoto2-vo
+  11445 ?        00:00:40 gvfs-afc-volume
+  11450 ?        00:00:00 gvfs-mtp-volume
+  11454 ?        00:00:00 gvfs-goa-volume
+  11458 ?        00:00:00 goa-daemon
+  11465 ?        00:01:15 goa-identity-se
+  11472 ?        00:00:00 dconf-service
+  11896 ?        02:01:01 chrome
+  11900 ?        00:00:00 cat
+  11901 ?        00:00:00 cat
+  11903 ?        00:00:00 chrome_crashpad
+  11905 ?        00:00:00 chrome_crashpad
+  11911 ?        00:00:00 chrome
+  11912 ?        00:00:00 chrome
+  11914 ?        00:01:08 chrome
+  11938 ?        19:13:37 chrome
+  11940 ?        01:07:47 chrome
+  11951 ?        00:02:42 chrome
+  11973 ?        00:00:25 chrome
+  12104 ?        00:00:00 chrome
+  12173 ?        18:31:03 chrome
+  12238 ?        03:14:14 chrome
+  12346 ?        01:58:57 chrome
+  12396 ?        00:14:42 chrome
+  12492 ?        00:00:38 chrome
+  12851 ?        00:00:03 node
+  64881 ?        00:00:00 feishu
+  93106 ?        00:00:03 chrome
+  94909 ?        00:00:03 node
+ 155242 ?        00:00:03 node
+ 155828 ?        00:00:00 faked-sysv
+ 155845 ?        00:00:00 faked-tcp
+ 292230 ?        00:00:00 chrome_crashpad
+ 293269 ?        00:00:00 dconf
+ 387633 ?        00:03:40 chrome
+ 388008 ?        00:00:03 node
+ 388286 ?        00:00:03 node
+ 499775 ?        00:00:23 feishu
+ 499779 ?        00:00:00 feishu
+ 500706 ?        00:00:03 node
+ 533448 ?        00:00:03 node
+ 543308 ?        00:00:02 node
+ 543893 ?        00:00:00 Elevator.sh
+ 543919 ?        00:42:51 com.alibabainc.
+ 544016 ?        00:00:00 com.alibabainc.
+ 544020 ?        00:00:00 com.alibabainc.
+ 544021 ?        00:00:00 com.alibabainc.
+ 548298 ?        00:00:00 com.alibabainc.
+ 548304 ?        00:00:01 com.alibabainc.
+ 550377 ?        00:00:00 chrome_crashpad
+ 551225 ?        00:00:00 dconf
+ 551452 ?        00:00:01 com.alibabainc.
+ 573960 ?        00:00:03 node
+ 576704 ?        00:00:46 chrome
+ 585244 ?        00:00:03 node
+ 632325 ?        00:00:21 codex
+ 646253 ?        00:00:00 chrome
+ 673446 ?        00:00:00 chrome
+ 702157 ?        00:00:00 chrome
+ 774464 ?        00:21:12 cursor
+ 774467 ?        00:00:00 cursor
+ 774468 ?        00:00:00 cursor
+ 774470 ?        00:00:00 cursor
+ 774499 ?        00:00:00 chrome_crashpad
+ 774529 ?        04:00:52 cursor
+ 774533 ?        00:00:09 cursor
+ 774581 ?        00:00:32 cursor
+ 774583 ?        01:26:19 cursor
+ 774597 ?        00:00:00 cursor
+ 775495 ?        00:00:04 cursor
+ 775946 ?        00:00:01 cursor
+ 777374 ?        00:04:50 cursor
+ 777459 ?        00:04:47 cursor
+ 777460 ?        00:10:00 cursor
+ 777461 ?        00:12:02 cursor
+ 777590 ?        00:00:00 cursor
+ 777725 ?        00:00:02 cursor
+ 777729 ?        00:00:02 cursor
+ 777903 ?        00:00:00 cursor
+ 782421 ?        00:00:07 cursor
+ 851287 ?        00:10:57 feishu
+ 851290 ?        00:00:00 feishu
+ 894118 ?        00:00:04 node
+ 896402 ?        00:00:25 chrome
+ 919837 ?        03:34:18 simplecc-daemon
+ 919873 ?        00:00:29 simplegit-daemo
+ 919908 ?        02:14:19 simpleline-daem
+ 920005 ?        00:00:23 node
+ 920006 ?        00:00:04 ts-hl-daemon
+ 921212 ?        00:00:02 node
+ 922105 ?        00:05:52 simpletree-daem
+ 996807 ?        00:01:27 chrome
+1013348 ?        00:00:20 ChatGPT
+1013368 ?        00:00:00 browser_crashpa
+1013370 ?        00:00:00 browser_crashpa
+1013374 ?        00:00:00 ChatGPT
+1013375 ?        00:00:00 ChatGPT
+1013378 ?        00:00:00 ChatGPT
+1013431 ?        00:00:21 ChatGPT
+1013433 ?        00:00:01 ChatGPT
+1013444 ?        00:00:00 ChatGPT
+1013571 ?        00:00:00 ChatGPT
+1014018 ?        00:00:00 ChatGPT
+1014019 ?        00:00:46 ChatGPT
+1014049 ?        00:00:10 codex
+1015542 ?        00:00:04 ChatGPT
+1016871 ?        00:00:00 ChatGPT
+1017168 ?        00:00:04 ChatGPT
+1017828 ?        00:00:00 node_repl
+1022515 ?        00:00:00 bash
+1022517 ?        00:00:00 ssh
+1022518 ?        00:00:00 bash
+1022519 ?        00:00:01 claude.exe
+1025081 ?        00:00:00 ChatGPT
+1027619 ?        00:13:25 python3
+1027646 ?        00:00:13 g1_initial_stat
+1027647 ?        00:00:09 g1_initial_forc
+1027648 ?        00:00:00 g1_initial_forc
+1028083 ?        00:00:00 bash
+1028097 ?        00:00:00 python3
+1032210 ?        00:00:00 g1_initial_stat
+1035410 ?        00:00:00 ChatGPT
+1047727 ?        00:00:00 node_repl
+1050596 ?        00:00:03 node
+1052066 ?        00:00:00 codex-code-mode
+1071145 ?        00:00:03 node
+1098913 ?        00:00:00 feishu
+1098930 ?        00:00:00 feishu
+1101419 ?        00:00:42 tracker-miner-f
+1102853 ?        00:00:03 node
+1105401 ?        00:01:29 speech-dispatch
+1105412 ?        00:00:00 sd_espeak-ng-mb <defunct>
+1105416 ?        00:00:00 sd_espeak-ng
+1105422 ?        00:01:27 sd_dummy
+1106457 ?        00:00:03 node
+1118307 ?        00:01:08 chrome
+1135730 ?        00:00:47 chrome
+1149390 ?        00:00:00 ps
+1192352 ?        00:00:03 node
+1202944 ?        00:00:00 chrome_crashpad
+1203797 ?        00:00:00 dconf
+1211326 ?        00:00:04 chrome
+1242744 ?        00:00:03 node
+1325884 ?        00:00:06 feishu
+1325888 ?        00:00:00 feishu
+1368328 ?        00:00:00 chrome_crashpad
+1369159 ?        00:00:00 dconf
+1369814 ?        00:00:00 chrome_crashpad
+1370638 ?        00:00:00 dconf
+1377398 ?        00:00:03 node
+1434027 ?        00:00:03 node
+1584224 ?        00:00:04 node
+1636738 ?        00:00:03 node
+1639081 ?        00:00:03 node
+1675484 ?        00:00:03 node
+1676772 ?        00:00:04 node
+1753176 ?        00:00:03 node
+1812360 ?        00:00:03 node
+1818650 ?        00:00:15 bash
+1819022 ?        00:00:00 bash
+1839673 ?        00:00:03 node
+1872542 ?        00:00:03 node
+1887224 ?        00:00:03 node
+1894514 ?        00:00:03 node
+1896190 ?        00:00:03 node
+1944272 ?        00:00:03 node
+2011175 ?        00:00:03 node
+2093445 ?        00:00:03 node
+2094539 ?        00:00:03 node
+2131663 ?        00:00:03 node
+2136461 ?        00:00:02 node
+2190709 ?        00:00:02 node
+2542976 ?        00:00:03 node
+2544517 ?        00:00:02 node
+2546099 ?        00:00:03 node
+2546520 ?        00:00:03 node
+2576177 ?        00:00:02 node
+2642252 ?        00:00:04 ssh
+2885984 ?        00:00:00 chrome_crashpad
+2886339 ?        00:00:00 dconf
+2891667 ?        00:00:03 node
+2896593 ?        00:00:00 gvfsd-metadata
+2898908 ?        00:00:00 gvfsd-network
+2898954 ?        00:05:51 gvfsd-dnssd
+2910813 ?        00:00:00 chrome_crashpad
+2911216 ?        00:00:00 dconf
+2919424 ?        00:00:03 node
+3283381 ?        00:00:04 node
+3489179 ?        00:00:00 chrome_crashpad
+3490452 ?        00:00:00 dconf
+3541420 ?        00:00:03 node
+3548353 ?        00:00:08 codex
+3586970 ?        00:00:02 node
+3596204 ?        00:01:11 chrome
+3605938 ?        00:00:03 node
+3606712 ?        09:47:42 feishu
+3606772 ?        00:00:00 feishu
+3706891 ?        00:00:00 chrome_crashpad
+3707250 ?        00:00:00 dconf
+3740038 ?        00:00:00 chrome_crashpad
+3740876 ?        00:00:00 dconf
+3825323 ?        00:00:03 node
+3828829 ?        00:00:02 node
+3836965 ?        00:00:47 snap
+3849480 ?        00:02:50 feishu
+3849483 ?        00:00:00 feishu
+3864931 ?        00:00:03 node
+3892343 ?        00:00:38 chrome
+3892960 ?        00:00:00 chrome_crashpad
+3893842 ?        00:00:00 dconf
+3902885 ?        00:00:03 node
+3909889 ?        01:29:40 frost
+3911027 ?        00:00:03 node
+3911262 ?        00:00:02 node
+3943747 ?        00:02:32 fcitx
+3943753 ?        00:00:15 dbus-daemon
+3943759 ?        00:00:00 fcitx-dbus-watc
+3986927 ?        00:00:00 chrome_crashpad
+3987900 ?        00:00:00 dconf
+4000955 ?        00:00:03 node
+4083530 ?        01:15:03 awesun
+4117680 ?        00:01:21 chrome
+4117836 ?        00:00:10 chrome
+4132033 ?        00:22:18 cursor
+4132036 ?        00:00:00 cursor
+4132037 ?        00:00:00 cursor
+4132039 ?        00:00:00 cursor
+4132069 ?        00:00:00 chrome_crashpad
+4132087 ?        03:52:13 cursor
+4132091 ?        00:00:08 cursor
+4132123 ?        00:00:24 cursor
+4132125 ?        02:58:28 cursor
+4132228 ?        00:00:00 cursor
+4132747 ?        00:00:05 cursor
+4133113 ?        00:00:02 cursor
+4135248 ?        00:05:42 cursor
+4135299 ?        00:05:44 cursor
+4135300 ?        00:27:53 cursor
+4135301 ?        01:48:33 cursor
+4135352 ?        00:00:00 cursor
+4135729 ?        00:00:00 cursor
+4139859 ?        00:00:09 cursor
+4165986 ?        00:00:00 chrome_crashpad
+4167350 ?        00:00:00 dconf
+4169921 ?        00:00:02 cursor /  / 
+) beside STAGE peelers and
+  wave-30–37 ctl/block/host/network/process-IPC leftovers are not peelable
+  child-argv launchers ( is already STAGE). Pin
+  .
+  Core leftovers list stays lockstep. CLASSIFY/DISPATCHES remain **71**.
+  **Pending push**.
+
+
 Updated: 2026-09-30 (sticky FF1A / rounds 211/265 tip note)
 
 ## 2026-09-30 (pending tip — sticky FF1A / anvil 208–211 / forge 261–265)
