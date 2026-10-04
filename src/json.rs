@@ -48,19 +48,17 @@ pub(crate) fn from_str(input: &str) -> Result<Value, serde_json::Error> {
 /// Validate one complete top-level object and reject duplicate members at
 /// every depth without retaining a decoded value tree.
 pub(crate) fn validate_object(input: &[u8]) -> Result<(), serde_json::Error> {
-    validate_no_duplicate_members(input)?;
-
     // With serde_json's `arbitrary_precision` feature, numbers are presented
     // to generic visitors through an internal map representation. Requiring
-    // the JSON object delimiter after full validation keeps this protocol
-    // shape check independent of feature unification in downstream graphs.
+    // the JSON object delimiter before recursive validation keeps this shape
+    // check feature-independent and avoids scanning rejected arrays/scalars.
     if input
         .iter()
         .copied()
         .find(|byte| !byte.is_ascii_whitespace())
         == Some(b'{')
     {
-        Ok(())
+        validate_no_duplicate_members(input)
     } else {
         Err(<serde_json::Error as de::Error>::custom(
             "expected a JSON object",
