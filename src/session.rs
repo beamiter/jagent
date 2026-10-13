@@ -386,6 +386,31 @@ pub enum AgentState {
     TurnLimitReached,
 }
 
+/// Content-free activity for presentation and ambient UI integrations.
+///
+/// This summarizes a state; it does not authorize execution or replace the
+/// proposal lifecycle checks. An idle session has no activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentActivity {
+    Working,
+    AskingReview,
+    Finished,
+    Gone,
+}
+
+impl AgentState {
+    /// Summarize this state without exposing commands, proposals, or output.
+    pub const fn activity(self) -> Option<AgentActivity> {
+        match self {
+            Self::Ready => None,
+            Self::AwaitingModel | Self::AwaitingObservation { .. } => Some(AgentActivity::Working),
+            Self::AwaitingApproval { .. } => Some(AgentActivity::AskingReview),
+            Self::Completed | Self::TurnLimitReached => Some(AgentActivity::Finished),
+            Self::Cancelled => Some(AgentActivity::Gone),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     EmptyUserMessage,
@@ -2351,6 +2376,44 @@ pub fn sample_observation(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_covers_every_state_without_proposal_identity() {
+        let cases = [
+            (AgentState::Ready, None),
+            (AgentState::AwaitingModel, Some(AgentActivity::Working)),
+            (
+                AgentState::AwaitingApproval {
+                    proposal_id: ProposalId(1),
+                },
+                Some(AgentActivity::AskingReview),
+            ),
+            (
+                AgentState::AwaitingApproval {
+                    proposal_id: ProposalId(u64::MAX),
+                },
+                Some(AgentActivity::AskingReview),
+            ),
+            (
+                AgentState::AwaitingObservation {
+                    proposal_id: ProposalId(1),
+                },
+                Some(AgentActivity::Working),
+            ),
+            (
+                AgentState::AwaitingObservation {
+                    proposal_id: ProposalId(u64::MAX),
+                },
+                Some(AgentActivity::Working),
+            ),
+            (AgentState::Completed, Some(AgentActivity::Finished)),
+            (AgentState::TurnLimitReached, Some(AgentActivity::Finished)),
+            (AgentState::Cancelled, Some(AgentActivity::Gone)),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(state.activity(), expected, "{state:?}");
+        }
+    }
 
     #[test]
     fn snapshot_roundtrip_preserves_resumable_states() {

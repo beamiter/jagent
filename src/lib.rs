@@ -96,9 +96,9 @@ pub use safety::{
     CommandTextError, MAX_COMMAND_BYTES,
 };
 pub use session::{
-    AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState, ApprovedCommand,
-    CommandExecutionFailure, CommandExecutionOutcome, ModelOutcome, ParseError, PendingProposal,
-    ProposalId, ProposalStatus, SessionError, Turn, MAX_ACTION_JSON_BYTES,
+    AgentActivity, AgentSession, AgentSessionSnapshot, AgentSnapshotError, AgentState,
+    ApprovedCommand, CommandExecutionFailure, CommandExecutionOutcome, ModelOutcome, ParseError,
+    PendingProposal, ProposalId, ProposalStatus, SessionError, Turn, MAX_ACTION_JSON_BYTES,
     MAX_AGENT_SNAPSHOT_JSON_BYTES, MAX_SESSION_TURNS,
 };
 pub use stream::{StreamEvent, StreamParser};

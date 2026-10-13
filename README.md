@@ -9,6 +9,10 @@ the bounded session state machine, provider wire formats, protocol parsing,
 request preparation, streaming accumulation, and command-review invariants.
 Your integration owns HTTP, process execution, durable storage, and UI.
 
+For ambient UI, `AgentState::activity()` exposes a content-free `AgentActivity`
+summary. An idle `Ready` session returns `None`; working, review, finished, and
+gone phases contain no command or model text and do not authorize execution.
+
 [jsh](https://github.com/beamiter/jsh) and
 [forge](https://github.com/beamiter/forge) use it directly.
 [jterm_core](https://github.com/beamiter/jterm_core) carries the shared
@@ -72,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut session = AgentSession::new(8);
 
     // Deliberately resembles a leaked token so the secure default is visible.
-    const SECRET: &str = "ghp_1234567890abcdefghijABCDEFGHIJ123456";
+    const SECRET: &str = "YOUR_GITHUB_TOKEN";
     session.submit_user(format!(
         "show the current directory; an accidental token was pasted: {SECRET}"
     ))?;
