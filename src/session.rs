@@ -464,6 +464,44 @@ impl std::error::Error for SessionError {
     }
 }
 
+/// Failure from a request-bound model callback.
+///
+/// This separate error preserves the existing [`SessionError`] enum for
+/// integrations that match it exhaustively. A stale callback never changes the
+/// transcript, turn budget, pending request, or proposal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelRequestError {
+    /// The handle belongs to a finished attempt, another session instance, or
+    /// an earlier attempt superseded by a retry or a new task.
+    StaleRequest,
+    /// The current request was matched, but ordinary session validation failed.
+    Session(SessionError),
+}
+
+impl std::fmt::Display for ModelRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleRequest => write!(f, "model callback does not belong to the active request"),
+            Self::Session(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ModelRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StaleRequest => None,
+            Self::Session(error) => Some(error),
+        }
+    }
+}
+
+impl From<SessionError> for ModelRequestError {
+    fn from(error: SessionError) -> Self {
+        Self::Session(error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelOutcome {
     Proposal {
@@ -597,6 +635,31 @@ impl CancellationToken {
     }
 }
 
+/// Opaque identity for one live model-request attempt.
+///
+/// Clone this handle when starting transport, then return it through
+/// [`AgentSession::accept_agent_response_for`] or
+/// [`AgentSession::model_failed_for`]. Request identity is distinct from both
+/// the task-wide [`CancellationToken`] and command [`ProposalId`]: a delayed
+/// callback cannot be accepted by a retry, another session, or a restored
+/// snapshot merely because that session is also awaiting model output.
+///
+/// Handles contain no prompt or provider data and are deliberately not
+/// serializable. Restoring a snapshot creates a fresh request identity.
+#[derive(Clone, Debug)]
+pub struct ModelRequestToken(Arc<AtomicBool>);
+
+impl ModelRequestToken {
+    /// Whether the originating request attempt is still live.
+    ///
+    /// Becomes false after its response or failure is recorded, and when the
+    /// originating session is cancelled or dropped. This is a cooperative
+    /// transport hint; the checked ingestion methods remain authoritative.
+    pub fn is_active(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Debug)]
 pub struct AgentSession {
     transcript: Vec<Turn>,
@@ -606,6 +669,7 @@ pub struct AgentSession {
     max_turns: u32,
     next_proposal_id: u64,
     cancelled: CancellationToken,
+    model_request: Option<ModelRequestToken>,
 }
 
 impl AgentSession {
@@ -618,6 +682,7 @@ impl AgentSession {
             max_turns: max_turns.clamp(1, MAX_SESSION_TURNS),
             next_proposal_id: 1,
             cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
+            model_request: None,
         }
     }
 
@@ -732,14 +797,36 @@ impl AgentSession {
         self.cancelled.clone()
     }
 
+    /// Capture the identity of the current model attempt for an asynchronous
+    /// transport callback. Repeated reads in the same attempt return clones
+    /// of the same identity; this method does not start another request.
+    ///
+    /// Every transition into [`AgentState::AwaitingModel`] creates a fresh
+    /// identity, including retry, rejection, command observation, and snapshot
+    /// restoration. Record a failed attempt with [`Self::model_failed_for`]
+    /// before calling [`Self::retry_model`] to dispatch a replacement.
+    pub fn model_request_token(&self) -> Option<ModelRequestToken> {
+        self.model_request
+            .as_ref()
+            .filter(|request| {
+                self.state == AgentState::AwaitingModel
+                    && !self.cancelled.is_cancelled()
+                    && request.is_active()
+            })
+            .cloned()
+    }
+
     pub fn submit_user(&mut self, message: impl Into<String>) -> Result<(), SessionError> {
         self.check_not_cancelled()?;
-        if self.turns_used >= self.max_turns {
-            self.state = AgentState::TurnLimitReached;
+        if self.state == AgentState::TurnLimitReached {
             return Err(SessionError::TurnLimitReached);
         }
         if self.state != AgentState::Ready {
             return Err(self.invalid_transition("submit user input"));
+        }
+        if self.turns_used >= self.max_turns {
+            self.state = AgentState::TurnLimitReached;
+            return Err(SessionError::TurnLimitReached);
         }
         let message = message.into();
         let message = message.trim();
@@ -750,7 +837,7 @@ impl AgentSession {
             return Err(SessionError::UserMessageTooLarge);
         }
         self.push_turn(Turn::User(message.to_string()));
-        self.state = AgentState::AwaitingModel;
+        self.begin_model_request();
         Ok(())
     }
 
@@ -794,6 +881,54 @@ impl AgentSession {
         self.accept_parsed_action(|| response.to_action())
     }
 
+    /// Accept a complete response only for the matching live model attempt.
+    ///
+    /// Prefer this over [`Self::accept_agent_response`] in asynchronous
+    /// integrations. Stale responses are rejected before action parsing and
+    /// leave the current attempt untouched; matching responses use the same
+    /// review-first state machine and still cannot authorize execution.
+    pub fn accept_agent_response_for(
+        &mut self,
+        request: &ModelRequestToken,
+        response: &crate::response::AgentResponse,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        self.expect_model_request(request)?;
+        self.accept_agent_response(response).map_err(Into::into)
+    }
+
+    /// Request-bound counterpart of [`Self::accept_model_reply`].
+    pub fn accept_model_reply_for(
+        &mut self,
+        request: &ModelRequestToken,
+        raw: &str,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        self.expect_model_request(request)?;
+        self.accept_model_reply(raw).map_err(Into::into)
+    }
+
+    /// Request-bound counterpart of [`Self::accept_model_tool_reply`].
+    pub fn accept_model_tool_reply_for(
+        &mut self,
+        request: &ModelRequestToken,
+        reply: &ToolResponse,
+    ) -> Result<ModelOutcome, ModelRequestError> {
+        self.expect_model_request(request)?;
+        self.accept_model_tool_reply(reply).map_err(Into::into)
+    }
+
+    /// Record a transport/provider failure only for its matching attempt.
+    ///
+    /// A late failure from an earlier request must not make the current
+    /// request retryable or replace its transcript context.
+    pub fn model_failed_for(
+        &mut self,
+        request: &ModelRequestToken,
+        message: impl Into<String>,
+    ) -> Result<(), ModelRequestError> {
+        self.expect_model_request(request)?;
+        self.model_failed(message).map_err(Into::into)
+    }
+
     fn accept_parsed_action(
         &mut self,
         parse: impl FnOnce() -> Result<ParsedAction, ParseError>,
@@ -802,6 +937,7 @@ impl AgentSession {
         if self.state != AgentState::AwaitingModel {
             return Err(self.invalid_transition("accept a model reply"));
         }
+        self.finish_model_request();
         if self.turns_used >= self.max_turns {
             self.state = AgentState::TurnLimitReached;
             return Err(SessionError::TurnLimitReached);
@@ -864,6 +1000,7 @@ impl AgentSession {
         if self.state != AgentState::AwaitingModel {
             return Err(self.invalid_transition("record a model failure"));
         }
+        self.finish_model_request();
         let message = elide_middle(&message.into(), MAX_MESSAGE_BYTES);
         // Repeated provider attempts replace one another, but a command
         // execution diagnostic is model context that the next successful
@@ -894,7 +1031,7 @@ impl AgentSession {
         if !self.can_retry_model() {
             return Err(self.invalid_transition("retry the last model request"));
         }
-        self.state = AgentState::AwaitingModel;
+        self.begin_model_request();
         Ok(())
     }
 
@@ -1002,11 +1139,7 @@ impl AgentSession {
         }
         // The rejection status itself asks the next model call for an
         // alternative. Optional feedback follows it as an ordinary user turn.
-        self.state = if self.turns_used >= self.max_turns {
-            AgentState::TurnLimitReached
-        } else {
-            AgentState::AwaitingModel
-        };
+        self.request_next_model_or_limit();
         Ok(())
     }
 
@@ -1053,7 +1186,7 @@ impl AgentSession {
             exit_code,
             output_sample: sample_observation(output),
         });
-        self.finish_observation();
+        self.request_next_model_or_limit();
         Ok(())
     }
 
@@ -1134,11 +1267,12 @@ impl AgentSession {
             message.push_str(&detail);
         }
         self.push_turn(Turn::ProtocolError(message));
-        self.finish_observation();
+        self.request_next_model_or_limit();
         Ok(())
     }
 
     pub fn cancel(&mut self) {
+        self.finish_model_request();
         self.cancelled.0.store(true, Ordering::SeqCst);
         self.state = AgentState::Cancelled;
     }
@@ -1227,12 +1361,39 @@ impl AgentSession {
         }
     }
 
-    fn finish_observation(&mut self) {
-        self.state = if self.turns_used >= self.max_turns {
-            AgentState::TurnLimitReached
+    fn request_next_model_or_limit(&mut self) {
+        if self.turns_used >= self.max_turns {
+            self.state = AgentState::TurnLimitReached;
         } else {
-            AgentState::AwaitingModel
-        };
+            self.begin_model_request();
+        }
+    }
+
+    fn begin_model_request(&mut self) {
+        self.finish_model_request();
+        self.model_request = Some(ModelRequestToken(Arc::new(AtomicBool::new(true))));
+        self.state = AgentState::AwaitingModel;
+    }
+
+    fn finish_model_request(&mut self) {
+        if let Some(request) = self.model_request.take() {
+            request.0.store(false, Ordering::Release);
+        }
+    }
+
+    fn expect_model_request(&self, request: &ModelRequestToken) -> Result<(), ModelRequestError> {
+        if self.state == AgentState::AwaitingModel
+            && !self.cancelled.is_cancelled()
+            && request.is_active()
+            && self
+                .model_request
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&current.0, &request.0))
+        {
+            Ok(())
+        } else {
+            Err(ModelRequestError::StaleRequest)
+        }
     }
 
     fn push_thought(&mut self, thought: Option<String>) {
@@ -1366,7 +1527,11 @@ impl AgentSession {
             max_turns: snapshot.max_turns,
             next_proposal_id,
             cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
+            model_request: None,
         };
+        if session.state == AgentState::AwaitingModel {
+            session.begin_model_request();
+        }
         session.compact_transcript();
         if let AgentState::AwaitingObservation { proposal_id } = session.state {
             session.push_turn(Turn::ProtocolError(format!(
@@ -1714,16 +1879,26 @@ fn validate_snapshot_lifecycle(
         AgentState::Completed => matches!(final_turn, Turn::AssistantSay(_)),
         AgentState::TurnLimitReached => {
             snapshot.turns_used == snapshot.max_turns
-                && matches!(
-                    final_turn,
+                && match final_turn {
                     Turn::AssistantSay(_)
-                        | Turn::ProtocolError(_)
-                        | Turn::Observation { .. }
-                        | Turn::AssistantProposed {
-                            status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                    | Turn::ProtocolError(_)
+                    | Turn::Observation { .. }
+                    | Turn::AssistantProposed {
+                        status: ProposalStatus::Rejected | ProposalStatus::ManualReview,
+                        ..
+                    } => true,
+                    // Final-turn rejection still records the user's feedback,
+                    // but cannot start another model attempt. Other user
+                    // input at an exhausted boundary remains invalid.
+                    Turn::User(_) => matches!(
+                        snapshot.transcript[..final_index].last(),
+                        Some(Turn::AssistantProposed {
+                            status: ProposalStatus::Rejected,
                             ..
-                        }
-                )
+                        })
+                    ),
+                    _ => false,
+                }
         }
         AgentState::Cancelled => false,
     };
@@ -2359,6 +2534,7 @@ impl std::error::Error for AgentSnapshotError {}
 
 impl Drop for AgentSession {
     fn drop(&mut self) {
+        self.finish_model_request();
         self.cancelled.0.store(true, Ordering::SeqCst);
     }
 }
@@ -3200,6 +3376,7 @@ mod tests {
             max_turns: 10,
             next_proposal_id: 4,
             cancelled: CancellationToken(Arc::new(AtomicBool::new(false))),
+            model_request: None,
         };
 
         let approved = session.approve(id).unwrap();
@@ -4176,6 +4353,352 @@ mod tests {
         assert!(session
             .build_user_prompt()
             .contains("no normal exit status was available"));
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn final_turn_user_input_preserves_pending_review_and_execution() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("inspect").unwrap();
+        let id = accept_run_proposal(&mut session, "pwd");
+        let before = session.snapshot().unwrap().to_json().unwrap();
+        assert!(matches!(
+            session.submit_user("another instruction"),
+            Err(SessionError::InvalidTransition {
+                state: AgentState::AwaitingApproval { .. },
+                ..
+            })
+        ));
+        assert_eq!(session.snapshot().unwrap().to_json().unwrap(), before);
+        assert_snapshot_roundtrips(&session);
+        assert_eq!(session.pending_proposal().unwrap().id, id);
+
+        let _approved = session.approve(id).unwrap();
+        let before = session.snapshot().unwrap().to_json().unwrap();
+        assert!(matches!(
+            session.submit_user("another instruction"),
+            Err(SessionError::InvalidTransition {
+                state: AgentState::AwaitingObservation { .. },
+                ..
+            })
+        ));
+        assert_eq!(session.snapshot().unwrap().to_json().unwrap(), before);
+        assert_snapshot_roundtrips(&session);
+        session.observe(id, 0, "/workspace").unwrap();
+        assert_eq!(session.state(), AgentState::TurnLimitReached);
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn final_turn_user_input_does_not_change_completed_state() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("inspect").unwrap();
+        session
+            .accept_model_reply(r#"{"action":"done","message":"complete"}"#)
+            .unwrap();
+        let before = session.snapshot().unwrap().to_json().unwrap();
+        assert!(matches!(
+            session.submit_user("again"),
+            Err(SessionError::InvalidTransition {
+                state: AgentState::Completed,
+                ..
+            })
+        ));
+        assert_eq!(session.snapshot().unwrap().to_json().unwrap(), before);
+        assert_eq!(session.state(), AgentState::Completed);
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn final_turn_rejection_feedback_stays_restorable_without_another_request() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("inspect").unwrap();
+        let request = session.model_request_token().unwrap();
+        let id = accept_run_proposal(&mut session, "pwd");
+        session
+            .reject_with_feedback(id, "do not run this command")
+            .unwrap();
+        assert_eq!(session.state(), AgentState::TurnLimitReached);
+        assert!(!request.is_active());
+        assert!(session.model_request_token().is_none());
+        assert!(
+            matches!(session.transcript().last(), Some(Turn::User(feedback))
+            if feedback == "do not run this command")
+        );
+        assert_snapshot_roundtrips(&session);
+
+        // A user turn after any other exhausted boundary is still impossible.
+        let mut forged = session.snapshot().unwrap();
+        let preceding = forged.transcript.len() - 2;
+        let Turn::AssistantProposed { status, .. } = &mut forged.transcript[preceding] else {
+            panic!("feedback must immediately follow its rejected proposal");
+        };
+        *status = ProposalStatus::ManualReview;
+        assert!(matches!(
+            AgentSession::restore(forged),
+            Err(AgentSnapshotError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn model_request_retry_rejects_late_response_and_failure_atomically() {
+        let mut session = AgentSession::new(4);
+        assert!(session.model_request_token().is_none());
+        session.submit_user("inspect").unwrap();
+        let old = session.model_request_token().unwrap();
+        assert!(old.is_active());
+        session.model_failed_for(&old, "request timed out").unwrap();
+        assert!(!old.is_active());
+        assert!(session.model_request_token().is_none());
+        session.retry_model().unwrap();
+        let current = session.model_request_token().unwrap();
+        let before = session.snapshot().unwrap().to_json().unwrap();
+
+        assert_eq!(
+            session.accept_model_reply_for(&old, &run_reply("printf stale")),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(
+            session.model_failed_for(&old, "late failure"),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(session.snapshot().unwrap().to_json().unwrap(), before);
+        assert_eq!(session.turns_used(), 0);
+        assert!(current.is_active());
+
+        let response = crate::response::AgentResponse::NativeTools(tool_reply(
+            TOOL_RUN,
+            r#"{"command":"pwd"}"#,
+        ));
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_agent_response_for(&current, &response)
+            .unwrap()
+        else {
+            panic!("current response must become a review proposal");
+        };
+        assert!(!current.is_active());
+        assert!(session.model_request_token().is_none());
+        assert_eq!(
+            session.state(),
+            AgentState::AwaitingApproval { proposal_id: id }
+        );
+        let before_duplicate = session.snapshot().unwrap().to_json().unwrap();
+        let duplicate = session
+            .accept_agent_response_for(&current, &response)
+            .unwrap_err();
+        assert_eq!(duplicate, ModelRequestError::StaleRequest);
+        assert!(std::error::Error::source(&duplicate).is_none());
+        assert_eq!(
+            session.snapshot().unwrap().to_json().unwrap(),
+            before_duplicate
+        );
+        assert_eq!(session.turns_used(), 1);
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn model_request_rejects_another_live_session_before_parsing() {
+        let mut first = AgentSession::new(4);
+        let mut second = AgentSession::new(4);
+        first.submit_user("first").unwrap();
+        second.submit_user("second").unwrap();
+        let first_request = first.model_request_token().unwrap();
+        let second_request = second.model_request_token().unwrap();
+        let before = second.snapshot().unwrap().to_json().unwrap();
+        assert_eq!(
+            second.accept_model_reply_for(&first_request, "invalid json"),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(second.snapshot().unwrap().to_json().unwrap(), before);
+        assert!(first_request.is_active());
+        assert!(second_request.is_active());
+        assert_eq!(second.turns_used(), 0);
+
+        let another_read = second.model_request_token().unwrap();
+        second
+            .accept_model_reply_for(&another_read, r#"{"action":"say","message":"second"}"#)
+            .unwrap();
+        assert!(!second_request.is_active());
+        assert!(!another_read.is_active());
+        assert!(first_request.is_active());
+    }
+
+    #[test]
+    fn model_request_rotates_after_rejection_and_observation() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let initial = session.model_request_token().unwrap();
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_reply_for(&initial, &run_reply("pwd"))
+            .unwrap()
+        else {
+            panic!("expected initial proposal");
+        };
+        assert!(!initial.is_active());
+        session
+            .reject_with_feedback(id, "show files instead")
+            .unwrap();
+        let after_rejection = session.model_request_token().unwrap();
+        assert!(after_rejection.is_active());
+        let reply = tool_reply(TOOL_RUN, r#"{"command":"ls"}"#);
+        let ModelOutcome::Proposal { id, .. } = session
+            .accept_model_tool_reply_for(&after_rejection, &reply)
+            .unwrap()
+        else {
+            panic!("expected replacement proposal");
+        };
+        assert!(!after_rejection.is_active());
+        let _approved = session.approve(id).unwrap();
+        assert!(session.model_request_token().is_none());
+        session.observe(id, 0, "Cargo.toml").unwrap();
+        let after_output = session.model_request_token().unwrap();
+        let before = session.snapshot().unwrap().to_json().unwrap();
+        assert_eq!(
+            session.accept_model_tool_reply_for(&after_rejection, &reply),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(session.snapshot().unwrap().to_json().unwrap(), before);
+        assert!(after_output.is_active());
+        session
+            .accept_model_reply_for(&after_output, r#"{"action":"done","message":"checked"}"#)
+            .unwrap();
+        assert!(!after_output.is_active());
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn model_request_restore_has_a_fresh_unpersisted_identity() {
+        let mut original = AgentSession::new(4);
+        original.submit_user("inspect").unwrap();
+        let original_request = original.model_request_token().unwrap();
+        let encoded = original.snapshot().unwrap().to_json().unwrap();
+        let mut restored =
+            AgentSession::restore(AgentSessionSnapshot::from_json(&encoded).unwrap()).unwrap();
+        let restored_request = restored.model_request_token().unwrap();
+        // The v1 persistence schema stores no ephemeral request identity.
+        assert_eq!(restored.snapshot().unwrap().to_json().unwrap(), encoded);
+        assert_eq!(
+            restored.accept_model_reply_for(&original_request, &run_reply("pwd")),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(
+            original.model_failed_for(&restored_request, "another instance failed"),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert!(original_request.is_active());
+        assert!(restored_request.is_active());
+        restored
+            .accept_model_reply_for(&restored_request, &run_reply("pwd"))
+            .unwrap();
+        assert!(!restored_request.is_active());
+        assert!(original_request.is_active());
+        assert_snapshot_roundtrips(&restored);
+    }
+
+    #[test]
+    fn model_request_cancel_and_drop_retire_transport_handles() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let request = session.model_request_token().unwrap();
+        let transcript = session.transcript().to_vec();
+        session.cancel();
+        assert!(!request.is_active());
+        assert!(session.model_request_token().is_none());
+        assert_eq!(
+            session.accept_model_reply_for(&request, &run_reply("pwd")),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert_eq!(session.transcript(), transcript);
+        assert_eq!(session.turns_used(), 0);
+
+        let dropped = {
+            let mut session = AgentSession::new(4);
+            session.submit_user("inspect").unwrap();
+            session.model_request_token().unwrap()
+        };
+        assert!(!dropped.is_active());
+    }
+
+    #[test]
+    fn model_request_task_reset_cannot_reuse_a_finished_callback() {
+        let mut session = AgentSession::new(1);
+        session.submit_user("first task").unwrap();
+        let first = session.model_request_token().unwrap();
+        session
+            .accept_model_reply_for(&first, r#"{"action":"done","message":"finished"}"#)
+            .unwrap();
+        session.start_new_task().unwrap();
+        assert!(session.model_request_token().is_none());
+        session.submit_user("second task").unwrap();
+        let second = session.model_request_token().unwrap();
+        assert_eq!(
+            session.accept_model_reply_for(&first, &run_reply("printf old")),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert!(!first.is_active());
+        assert!(second.is_active());
+        assert_eq!(session.turns_used(), 0);
+        session
+            .accept_model_reply_for(&second, &run_reply("pwd"))
+            .unwrap();
+        assert!(!second.is_active());
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn model_request_protocol_error_retires_only_its_attempt() {
+        let mut session = AgentSession::new(3);
+        session.submit_user("inspect").unwrap();
+        let first = session.model_request_token().unwrap();
+        let error = session
+            .accept_model_reply_for(&first, "not json")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ModelRequestError::Session(SessionError::Protocol(_))
+        ));
+        assert!(std::error::Error::source(&error).is_some());
+        assert!(!first.is_active());
+        assert_eq!(session.turns_used(), 1);
+        assert!(session.can_retry_model());
+        session.retry_model().unwrap();
+        let current = session.model_request_token().unwrap();
+        assert_eq!(
+            session.accept_model_reply_for(&first, "not json"),
+            Err(ModelRequestError::StaleRequest)
+        );
+        assert!(current.is_active());
+        assert_eq!(session.turns_used(), 1);
+        session
+            .model_failed_for(&current, "transport failed")
+            .unwrap();
+        assert!(!current.is_active());
+        assert_eq!(session.turns_used(), 1);
+        assert_snapshot_roundtrips(&session);
+    }
+
+    #[test]
+    fn legacy_model_callbacks_retire_request_handles_too() {
+        let mut session = AgentSession::new(4);
+        session.submit_user("inspect").unwrap();
+        let first = session.model_request_token().unwrap();
+        session.model_failed("transport failed").unwrap();
+        assert!(!first.is_active());
+        session.retry_model().unwrap();
+        let second = session.model_request_token().unwrap();
+        let id = accept_run_proposal(&mut session, "pwd");
+        assert!(!second.is_active());
+        let _approved = session.approve(id).unwrap();
+        session
+            .observe_execution_failure(id, CommandExecutionFailure::TimedOut, "")
+            .unwrap();
+        let third = session.model_request_token().unwrap();
+        assert!(third.is_active());
+        session
+            .accept_model_tool_reply(&tool_reply(TOOL_DONE, r#"{"message":"complete"}"#))
+            .unwrap();
+        assert!(!third.is_active());
+        assert!(session.model_request_token().is_none());
         assert_snapshot_roundtrips(&session);
     }
 

@@ -17,7 +17,7 @@ use crate::provider::{
     ChatResponse, Provider, ProviderError, Usage,
 };
 use crate::session::{parse_action, ParseError, ParsedAction};
-use crate::stream::{StreamEvent, StreamParser};
+use crate::stream::{StreamEvent, StreamParser, StreamProgress};
 use crate::tools::{parse_tool_response, AgentProtocol, ToolCall, ToolResponse};
 use serde_json::Value;
 
@@ -168,6 +168,18 @@ impl AgentStream {
     /// [`Self::into_response`] remains the authoritative validation step.
     pub fn is_complete(&self) -> bool {
         self.done
+    }
+
+    /// Content-free progress for a UI or transport diagnostic.
+    ///
+    /// Includes high-level protocol failures, so `is_failed` may be true even
+    /// when the low-level parser completed. As with [`Self::is_complete`], a
+    /// completion marker is not action authorization; use
+    /// [`Self::into_response`] for final response validation.
+    pub fn progress(&self) -> StreamProgress {
+        let mut progress = self.parser.progress();
+        progress.is_failed |= self.failure.is_some();
+        progress
     }
 
     /// Feed the next raw response-body chunk and return the underlying parser
@@ -783,11 +795,41 @@ mod tests {
             .iter()
             .any(|event| matches!(event, StreamEvent::ToolCall(_))));
         assert!(events.contains(&StreamEvent::Done));
+        let progress = stream.progress();
+        assert!(progress.is_complete);
+        assert!(progress.is_failed);
+        assert_eq!(progress.tool_calls, 1);
         assert!(matches!(
             stream.into_response(),
             Err(ProviderError::MalformedResponse(message))
                 if message == TEXT_STREAM_CONTAINED_TOOL_CALL
         ));
+    }
+
+    #[test]
+    fn progress_reports_response_validation_without_exposing_content() {
+        let body = text_stream_body("stop");
+        let mut stream = AgentStream::new(Provider::OpenAiCompatible, AgentProtocol::Text);
+        assert_eq!(stream.progress().raw_response_bytes, 0);
+        stream.push(body.as_bytes());
+        let progress = stream.progress();
+        assert!(progress.is_complete);
+        assert!(!progress.is_failed);
+        assert_eq!(progress.raw_response_bytes, body.len());
+        assert_eq!(progress.decoded_frames, 4);
+        assert_eq!(progress.tool_calls, 0);
+        assert_eq!(progress.tool_argument_bytes, 0);
+        assert!(!format!("{progress:?}").contains("complete\""));
+        let response = stream.into_response().unwrap();
+        assert_eq!(progress.text_bytes, response.text().len());
+
+        let mut missing_reason = AgentStream::new(Provider::OpenAiCompatible, AgentProtocol::Text);
+        missing_reason.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: [DONE]\n\n",
+        );
+        assert!(missing_reason.progress().is_complete);
+        assert!(missing_reason.progress().is_failed);
+        assert!(missing_reason.into_response().is_err());
     }
 
     #[test]

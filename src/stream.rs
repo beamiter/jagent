@@ -52,6 +52,7 @@ use crate::tools::{
     MAX_TOOL_ID_BYTES, MAX_TOOL_NAME_BYTES,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Detail quoted from provider-reported stream errors is elided to this many
@@ -74,6 +75,36 @@ pub const MAX_STREAM_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// ceiling. SSE comments and blank lines consume the raw-byte budget but are
 /// not decoded frames.
 pub const MAX_STREAM_FRAMES: usize = 4096;
+
+/// Content-free counters and completion state for one response stream.
+///
+/// Integrations can display these counters while private tool arguments are
+/// still arriving, without copying or exposing model text. Counters remain
+/// available after completion or failure. This value never authorizes a tool
+/// call or proves that a completed response contains a valid agent action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamProgress {
+    /// Raw body bytes inspected, including framing and keep-alives. Input
+    /// after completion or failure is ignored and is not counted.
+    pub raw_response_bytes: usize,
+    /// Payload frames inspected, including a terminal SSE sentinel and any
+    /// malformed frame that caused failure. Comments are not payload frames.
+    pub decoded_frames: usize,
+    /// UTF-8 bytes emitted as text deltas, including Anthropic block joins.
+    pub text_bytes: usize,
+    /// Tool-argument bytes accepted before completion or failure. Calls remain
+    /// private until completion; this count conveys no execution permission.
+    pub tool_argument_bytes: usize,
+    /// Distinct tool calls opened, including calls later discarded on error.
+    pub tool_calls: usize,
+    /// Whether the low-level parser emitted [`StreamEvent::Done`].
+    pub is_complete: bool,
+    /// Whether parsing failed. [`crate::response::AgentStream::progress`]
+    /// additionally reflects its protocol validation: a mismatched response
+    /// may have both `is_complete` and `is_failed` set.
+    pub is_failed: bool,
+}
 
 /// One parsed increment of a streaming chat response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,11 +253,14 @@ pub struct StreamParser {
     completed_tools: Vec<PendingToolCall>,
     /// Cumulative bytes of tool-call arguments seen, bounded like text.
     delivered_tool_bytes: usize,
+    /// Response-wide count survives publication or discarding of private calls.
+    opened_tool_calls: usize,
 }
 
 #[derive(Debug)]
 struct PendingToolCall {
     index: u64,
+    ordinal: usize,
     id: String,
     name: String,
     arguments: String,
@@ -254,6 +288,20 @@ impl StreamParser {
             pending_tools: Vec::new(),
             completed_tools: Vec::new(),
             delivered_tool_bytes: 0,
+            opened_tool_calls: 0,
+        }
+    }
+
+    /// Snapshot the response's bounded, content-free progress counters.
+    pub fn progress(&self) -> StreamProgress {
+        StreamProgress {
+            raw_response_bytes: self.raw_response_bytes,
+            decoded_frames: self.decoded_frames,
+            text_bytes: self.delivered_text_bytes,
+            tool_argument_bytes: self.delivered_tool_bytes,
+            tool_calls: self.opened_tool_calls,
+            is_complete: self.phase == Phase::Finished,
+            is_failed: self.phase == Phase::Failed,
         }
     }
 
@@ -279,10 +327,15 @@ impl StreamParser {
     /// and always returns no events.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-        for &byte in bytes {
-            if self.phase != Phase::Streaming {
-                break;
-            }
+        // Tiny transport fragments do not amortize delimiter scanning and
+        // slice setup. Retain the inexpensive byte path while sharing the
+        // same bounds and reusable line/event buffers.
+        if bytes.len() <= 64 {
+            self.push_small_chunk(bytes, &mut events);
+            return events;
+        }
+        let mut remaining = bytes;
+        while !remaining.is_empty() && self.phase == Phase::Streaming {
             if self.raw_response_bytes == MAX_STREAM_RESPONSE_BYTES {
                 self.fail(
                     &format!("stream response exceeds the {MAX_STREAM_RESPONSE_BYTES} byte limit"),
@@ -290,38 +343,87 @@ impl StreamParser {
                 );
                 break;
             }
+            if self.pending_cr {
+                self.pending_cr = false;
+                if remaining[0] == b'\n' {
+                    // The preceding CR already flushed this line. This LF is
+                    // the second half of the same CRLF delimiter, including
+                    // when the pair was split across transport chunks.
+                    self.raw_response_bytes += 1;
+                    remaining = &remaining[1..];
+                    continue;
+                }
+            }
+
+            // Inspect at most the remaining response/line budget. Complete
+            // lines borrow the caller's chunk; only fragmented lines require
+            // copying. This also avoids scanning an arbitrarily large tail
+            // after the first byte that would exceed a bound.
+            let line_budget = MAX_MODEL_TEXT_BYTES - self.line.len();
+            let scan_len = remaining
+                .len()
+                .min(MAX_STREAM_RESPONSE_BYTES - self.raw_response_bytes)
+                .min(line_budget + 1);
+            let scan = &remaining[..scan_len];
+            if let Some(end) = scan.iter().position(|byte| matches!(*byte, b'\r' | b'\n')) {
+                self.raw_response_bytes += end + 1;
+                if self.line.is_empty() {
+                    self.handle_line(&scan[..end], &mut events);
+                } else {
+                    self.line.extend_from_slice(&scan[..end]);
+                    self.flush_buffered_line(&mut events);
+                }
+                self.pending_cr = scan[end] == b'\r' && self.phase == Phase::Streaming;
+                remaining = &remaining[end + 1..];
+            } else {
+                self.raw_response_bytes += scan_len;
+                if scan_len > line_budget {
+                    self.fail(
+                        &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
+                        &mut events,
+                    );
+                    break;
+                }
+                self.line.extend_from_slice(scan);
+                remaining = &remaining[scan_len..];
+            }
+        }
+        events
+    }
+
+    fn push_small_chunk(&mut self, bytes: &[u8], events: &mut Vec<StreamEvent>) {
+        for &byte in bytes {
+            if self.phase != Phase::Streaming {
+                break;
+            }
+            if self.raw_response_bytes == MAX_STREAM_RESPONSE_BYTES {
+                self.fail(
+                    &format!("stream response exceeds the {MAX_STREAM_RESPONSE_BYTES} byte limit"),
+                    events,
+                );
+                break;
+            }
             self.raw_response_bytes += 1;
             if self.pending_cr {
                 self.pending_cr = false;
                 if byte == b'\n' {
-                    // The preceding CR already flushed this line. This LF is
-                    // the second half of the same CRLF delimiter, including
-                    // when the pair was split across transport chunks.
                     continue;
                 }
             }
             match byte {
-                b'\r' => {
-                    let line = std::mem::take(&mut self.line);
-                    self.handle_line(&line, &mut events);
-                    self.pending_cr = self.phase == Phase::Streaming;
+                b'\r' | b'\n' => {
+                    self.flush_buffered_line(events);
+                    self.pending_cr = byte == b'\r' && self.phase == Phase::Streaming;
                 }
-                b'\n' => {
-                    let line = std::mem::take(&mut self.line);
-                    self.handle_line(&line, &mut events);
+                _ if self.line.len() == MAX_MODEL_TEXT_BYTES => {
+                    self.fail(
+                        &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
+                        events,
+                    );
                 }
-                _ => {
-                    self.line.push(byte);
-                    if self.line.len() > MAX_MODEL_TEXT_BYTES {
-                        self.fail(
-                            &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
-                            &mut events,
-                        );
-                    }
-                }
+                _ => self.line.push(byte),
             }
         }
-        events
     }
 
     /// Signal EOF. Flushes any buffered final line or SSE event, then emits
@@ -337,14 +439,11 @@ impl StreamParser {
         // A trailing CR already terminated and flushed its line in `push`.
         self.pending_cr = false;
         if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
-            self.handle_line(&line, &mut events);
+            self.flush_buffered_line(&mut events);
         }
         // An SSE stream may end at EOF instead of a final blank line.
         if self.phase == Phase::Streaming && self.event_has_data {
-            let data = std::mem::take(&mut self.event_data);
-            self.event_has_data = false;
-            self.dispatch_sse_frame(&data, &mut events);
+            self.flush_sse_frame(&mut events);
         }
         if self.phase == Phase::Streaming {
             if self.saw_message_end {
@@ -358,6 +457,25 @@ impl StreamParser {
             }
         }
         events
+    }
+
+    fn flush_buffered_line(&mut self, events: &mut Vec<StreamEvent>) {
+        let mut line = std::mem::take(&mut self.line);
+        self.handle_line(&line, events);
+        if self.phase == Phase::Streaming {
+            line.clear();
+            self.line = line;
+        }
+    }
+
+    fn flush_sse_frame(&mut self, events: &mut Vec<StreamEvent>) {
+        let mut data = std::mem::take(&mut self.event_data);
+        self.event_has_data = false;
+        self.dispatch_sse_frame(&data, events);
+        if self.phase == Phase::Streaming {
+            data.clear();
+            self.event_data = data;
+        }
     }
 
     fn handle_line(&mut self, line: &[u8], events: &mut Vec<StreamEvent>) {
@@ -384,9 +502,7 @@ impl StreamParser {
     fn handle_sse_line(&mut self, line: &str, events: &mut Vec<StreamEvent>) {
         if line.is_empty() {
             if self.event_has_data {
-                let data = std::mem::take(&mut self.event_data);
-                self.event_has_data = false;
-                self.dispatch_sse_frame(&data, events);
+                self.flush_sse_frame(events);
             }
             return;
         }
@@ -403,17 +519,19 @@ impl StreamParser {
         if field != "data" {
             return;
         }
+        let additional_bytes = value.len().saturating_add(usize::from(self.event_has_data));
+        if self.event_data.len().saturating_add(additional_bytes) > MAX_MODEL_TEXT_BYTES {
+            self.fail(
+                &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
+                events,
+            );
+            return;
+        }
         if self.event_has_data {
             self.event_data.push('\n');
         }
         self.event_has_data = true;
         self.event_data.push_str(value);
-        if self.event_data.len() > MAX_MODEL_TEXT_BYTES {
-            self.fail(
-                &format!("stream frame exceeds the {MAX_MODEL_TEXT_BYTES} byte limit"),
-                events,
-            );
-        }
     }
 
     fn dispatch_sse_frame(&mut self, data: &str, events: &mut Vec<StreamEvent>) {
@@ -838,10 +956,8 @@ impl StreamParser {
         }
         match frame.pointer("/choices/0/delta/tool_calls") {
             Some(Value::Array(entries)) => {
-                // Cloned so the accumulator can borrow `self` mutably; a delta
-                // frame carries at most a handful of small fragments.
-                for entry in entries.clone() {
-                    self.accumulate_openai_tool_call(&entry, events);
+                for entry in entries {
+                    self.accumulate_openai_tool_call(entry, events);
                     if self.phase != Phase::Streaming {
                         return;
                     }
@@ -1042,10 +1158,10 @@ impl StreamParser {
         }
 
         let arguments = match function.get("arguments") {
-            None | Some(Value::Null) => String::new(),
-            Some(Value::String(arguments)) => arguments.to_string(),
+            None | Some(Value::Null) => Cow::Borrowed(""),
+            Some(Value::String(arguments)) => Cow::Borrowed(arguments.as_str()),
             Some(arguments @ Value::Object(_)) => match serialize_tool_arguments(arguments) {
-                Ok(arguments) => arguments,
+                Ok(arguments) => Cow::Owned(arguments),
                 Err(ProviderError::ResponseTooLarge { .. }) => {
                     self.fail(
                         &format!(
@@ -1114,7 +1230,14 @@ impl StreamParser {
                 return;
             }
         };
-        let function = entry.get("function");
+        let function = match entry.get("function") {
+            None | Some(Value::Null) => None,
+            Some(function @ Value::Object(_)) => Some(function),
+            Some(_) => {
+                self.fail("tool call function is not an object", events);
+                return;
+            }
+        };
         let name = match function.and_then(|function| function.get("name")) {
             Some(Value::String(name)) => name.as_str(),
             Some(Value::Null) | None => "",
@@ -1134,9 +1257,16 @@ impl StreamParser {
         match self.pending_index(index) {
             None => self.open_tool_call(index, id, name, events),
             Some(position) => {
+                let pending = &self.pending_tools[position];
+                if !self.check_tool_identifier_lengths(
+                    pending.id.len().saturating_add(id.len()),
+                    pending.name.len().saturating_add(name.len()),
+                    events,
+                ) {
+                    return;
+                }
                 self.pending_tools[position].id.push_str(id);
                 self.pending_tools[position].name.push_str(name);
-                self.check_tool_identifiers(position, events);
             }
         }
         if self.phase != Phase::Streaming {
@@ -1158,12 +1288,7 @@ impl StreamParser {
         if self.phase != Phase::Streaming {
             return;
         }
-        if self
-            .pending_tools
-            .len()
-            .saturating_add(self.completed_tools.len())
-            >= MAX_STREAM_TOOL_CALLS
-        {
+        if self.opened_tool_calls >= MAX_STREAM_TOOL_CALLS {
             self.fail(
                 &format!("stream contains more than {MAX_STREAM_TOOL_CALLS} tool calls"),
                 events,
@@ -1179,23 +1304,30 @@ impl StreamParser {
             self.fail("stream reused a tool-call index", events);
             return;
         }
+        if !self.check_tool_identifier_lengths(id.len(), name.len(), events) {
+            return;
+        }
         self.pending_tools.push(PendingToolCall {
             index,
+            ordinal: self.opened_tool_calls,
             id: id.to_string(),
             name: name.to_string(),
             arguments: String::new(),
         });
-        let position = self.pending_tools.len() - 1;
-        self.check_tool_identifiers(position, events);
+        self.opened_tool_calls += 1;
     }
 
-    fn check_tool_identifiers(&mut self, position: usize, events: &mut Vec<StreamEvent>) -> bool {
-        let pending = &self.pending_tools[position];
-        if pending.name.len() > MAX_TOOL_NAME_BYTES {
+    fn check_tool_identifier_lengths(
+        &mut self,
+        id_bytes: usize,
+        name_bytes: usize,
+        events: &mut Vec<StreamEvent>,
+    ) -> bool {
+        if name_bytes > MAX_TOOL_NAME_BYTES {
             self.fail("streamed tool name exceeds its byte limit", events);
             return false;
         }
-        if pending.id.len() > MAX_TOOL_ID_BYTES {
+        if id_bytes > MAX_TOOL_ID_BYTES {
             self.fail("streamed tool call id exceeds its byte limit", events);
             return false;
         }
@@ -1223,17 +1355,22 @@ impl StreamParser {
             );
             return;
         }
-        self.delivered_tool_bytes = total;
-        let pending = &mut self.pending_tools[position];
-        pending.arguments.push_str(fragment);
-        if pending.arguments.len() > MAX_TOOL_ARGUMENTS_BYTES {
+        if self.pending_tools[position]
+            .arguments
+            .len()
+            .saturating_add(fragment.len())
+            > MAX_TOOL_ARGUMENTS_BYTES
+        {
             self.fail(
                 &format!(
                     "one tool call's arguments exceed the {MAX_TOOL_ARGUMENTS_BYTES} byte limit"
                 ),
                 events,
             );
+            return;
         }
+        self.delivered_tool_bytes = total;
+        self.pending_tools[position].arguments.push_str(fragment);
     }
 
     /// Finish the tool call accumulating at `index`, if any. Anthropic closes
@@ -1339,6 +1476,11 @@ impl StreamParser {
             self.fail("the model returned an empty response", events);
             return;
         }
+        // Anthropic blocks can close in a different order than they opened.
+        // Publish the documented opening order regardless of close order or
+        // the numeric indexes chosen by a compatible provider.
+        self.completed_tools
+            .sort_unstable_by_key(|call| call.ordinal);
         for pending in std::mem::take(&mut self.completed_tools) {
             events.push(StreamEvent::ToolCall(finished_tool_call(pending)));
         }
@@ -1614,6 +1756,113 @@ mod tests {
             events.extend(parser.finish());
             assert_eq!(events, run(provider, &body), "{provider:?}");
         }
+    }
+
+    #[test]
+    fn every_two_chunk_split_preserves_text_tool_and_error_events() {
+        // Exhaust both direct-line and fragmented-line paths, including UTF-8,
+        // CRLF, BOM, native arguments, EOF, and a malformed trailing frame.
+        let bodies = [
+            (Provider::Anthropic, anthropic_tool_body()),
+            (Provider::OpenAiCompatible, openai_tool_body()),
+            (Provider::Ollama, ollama_tool_body("stop")),
+            (
+                Provider::OpenAiCompatible,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"编译🙂\"}}]}\n\ndata: {broken\n\n"
+                    .to_string(),
+            ),
+        ];
+        for (provider, body) in bodies {
+            let body = if provider == Provider::Ollama {
+                body.replace('\n', "\r\n")
+            } else {
+                format!("\u{feff}{}", body.replace('\n', "\r\n"))
+            };
+            let expected = run(provider, &body);
+            for split in 0..=body.len() {
+                let mut parser = StreamParser::new(provider);
+                let mut events = parser.push(&body.as_bytes()[..split]);
+                events.extend(parser.push(&body.as_bytes()[split..]));
+                events.extend(parser.finish());
+                assert_eq!(events, expected, "{provider:?} split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn progress_tracks_private_calls_and_remains_available_after_completion() {
+        for (provider, body) in [
+            (Provider::Anthropic, anthropic_tool_body()),
+            (Provider::OpenAiCompatible, openai_tool_body()),
+            (Provider::Ollama, ollama_tool_body("stop")),
+        ] {
+            let mut parser = StreamParser::new(provider);
+            let initial = parser.progress();
+            assert_eq!(initial.raw_response_bytes, 0);
+            assert_eq!(initial.decoded_frames, 0);
+            assert_eq!(initial.text_bytes, 0);
+            assert_eq!(initial.tool_argument_bytes, 0);
+            assert_eq!(initial.tool_calls, 0);
+            assert!(!initial.is_complete);
+            assert!(!initial.is_failed);
+
+            let mut events = Vec::new();
+            let mut saw_private_arguments = false;
+            for byte in body.as_bytes() {
+                events.extend(parser.push(std::slice::from_ref(byte)));
+                let progress = parser.progress();
+                if progress.tool_argument_bytes > 0 && !progress.is_complete {
+                    saw_private_arguments = true;
+                    assert_eq!(progress.tool_calls, 1);
+                    assert!(!events
+                        .iter()
+                        .any(|event| matches!(event, StreamEvent::ToolCall(_))));
+                }
+            }
+            assert!(saw_private_arguments, "{provider:?}");
+            let folded = fold(&events);
+            let progress = parser.progress();
+            assert!(progress.is_complete);
+            assert!(!progress.is_failed);
+            assert_eq!(progress.raw_response_bytes, body.len());
+            assert!(progress.decoded_frames > 0);
+            assert_eq!(progress.text_bytes, folded.text.len());
+            assert_eq!(progress.tool_calls, folded.calls.len());
+            assert_eq!(
+                progress.tool_argument_bytes,
+                folded
+                    .calls
+                    .iter()
+                    .map(|call| call.arguments.len())
+                    .sum::<usize>()
+            );
+            assert!(parser.push(b"ignored trailing bytes").is_empty());
+            assert!(parser.finish().is_empty());
+            assert_eq!(parser.progress(), progress);
+        }
+    }
+
+    #[test]
+    fn progress_retains_accepted_counts_when_a_private_call_fails() {
+        let mut parser = StreamParser::new(Provider::OpenAiCompatible);
+        let opening = openai_line(&json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_1", "function": {"name": "run", "arguments": "{\"command\":"}
+        }]}}]}));
+        assert!(parser.push(opening.as_bytes()).is_empty());
+        let before = parser.progress();
+        assert_eq!(before.tool_calls, 1);
+        assert_eq!(before.tool_argument_bytes, "{\"command\":".len());
+        assert!(matches!(
+            parser.finish().as_slice(),
+            [StreamEvent::Protocol(_)]
+        ));
+        let after = parser.progress();
+        assert!(!after.is_complete);
+        assert!(after.is_failed);
+        assert_eq!(after.tool_calls, before.tool_calls);
+        assert_eq!(after.tool_argument_bytes, before.tool_argument_bytes);
+        assert_eq!(after.raw_response_bytes, before.raw_response_bytes);
+        assert_eq!(after.decoded_frames, before.decoded_frames);
     }
 
     #[test]
@@ -2030,6 +2279,57 @@ mod tests {
         );
         assert_eq!(parser.push(b"\n"), vec![]);
         assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn direct_and_fragmented_lines_enforce_the_same_exact_byte_budget() {
+        let prefix = "{\"message\":{\"content\":\"";
+        let suffix = "\"},\"done\":true}";
+        let padding = MAX_MODEL_TEXT_BYTES - prefix.len() - suffix.len();
+        for extra in [0, 1] {
+            let body = format!("{prefix}{}{suffix}\n", "x".repeat(padding + extra));
+            for split in [0, 1, MAX_MODEL_TEXT_BYTES - 1, MAX_MODEL_TEXT_BYTES] {
+                let mut parser = StreamParser::new(Provider::Ollama);
+                let mut events = parser.push(&body.as_bytes()[..split]);
+                events.extend(parser.push(&body.as_bytes()[split..]));
+                if extra == 0 {
+                    assert!(
+                        matches!(events.as_slice(), [StreamEvent::TextDelta(text), StreamEvent::Done] if text.len() == padding)
+                    );
+                    assert_eq!(parser.progress().raw_response_bytes, body.len());
+                } else {
+                    assert!(
+                        matches!(events.as_slice(), [StreamEvent::Protocol(message)] if message.contains("stream frame exceeds"))
+                    );
+                    assert_eq!(
+                        parser.progress().raw_response_bytes,
+                        MAX_MODEL_TEXT_BYTES + 1
+                    );
+                    assert_eq!(parser.progress().text_bytes, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_sse_budget_counts_the_join_before_appending() {
+        let payload =
+            json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}).to_string();
+        for extra in [0, 1] {
+            let padding = " ".repeat(MAX_MODEL_TEXT_BYTES - payload.len() - 1 + extra);
+            let body = format!("data: {padding}\ndata: {payload}\n\ndata: [DONE]\n\n");
+            let events = run(Provider::OpenAiCompatible, &body);
+            if extra == 0 {
+                assert_eq!(
+                    events,
+                    vec![StreamEvent::TextDelta("ok".into()), StreamEvent::Done]
+                );
+            } else {
+                assert!(
+                    matches!(events.as_slice(), [StreamEvent::Protocol(message)] if message.contains("stream frame exceeds"))
+                );
+            }
+        }
     }
 
     #[test]
@@ -3192,6 +3492,19 @@ mod tests {
                 "delta tool_calls is not an array".into()
             )]
         );
+
+        // A scalar function fragment must not be silently ignored and then
+        // rescued by a later valid fragment for the same index.
+        for function in [json!(7), json!([]), json!("run")] {
+            let body = openai_line(&json!({"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "function": function
+            }]}}]}));
+            let mut parser = StreamParser::new(Provider::OpenAiCompatible);
+            assert!(
+                matches!(parser.push(body.as_bytes()).as_slice(), [StreamEvent::Protocol(message)] if message == "tool call function is not an object")
+            );
+            assert!(parser.push(openai_tool_body().as_bytes()).is_empty());
+        }
     }
 
     #[test]
@@ -3437,6 +3750,85 @@ mod tests {
             .iter()
             .any(|event| matches!(event, StreamEvent::ToolCall(_))));
         assert_eq!(parser.finish(), vec![]);
+    }
+
+    #[test]
+    fn tool_fragment_budgets_accept_the_limit_then_reject_the_next_byte() {
+        for (field, limit, diagnostic) in [
+            ("id", MAX_TOOL_ID_BYTES, "call id"),
+            ("name", MAX_TOOL_NAME_BYTES, "name"),
+            ("arguments", MAX_TOOL_ARGUMENTS_BYTES, "arguments exceed"),
+        ] {
+            let fragment = |size| {
+                let mut call = json!({"index": 0, "function": {}});
+                if field == "id" {
+                    call[field] = json!("x".repeat(size));
+                } else {
+                    call["function"][field] = json!("x".repeat(size));
+                }
+                openai_line(&json!({"choices": [{"delta": {"tool_calls": [call]}}]}))
+            };
+            let mut parser = StreamParser::new(Provider::OpenAiCompatible);
+            assert!(parser.push(fragment(limit - 1).as_bytes()).is_empty());
+            assert!(parser.push(fragment(1).as_bytes()).is_empty());
+            let accepted = parser.progress();
+            assert_eq!(accepted.tool_calls, 1);
+            assert_eq!(
+                accepted.tool_argument_bytes,
+                if field == "arguments" { limit } else { 0 }
+            );
+            assert!(
+                matches!(parser.push(fragment(1).as_bytes()).as_slice(), [StreamEvent::Protocol(message)] if message.contains(diagnostic)),
+                "{field}"
+            );
+            let failed = parser.progress();
+            assert!(failed.is_failed);
+            assert_eq!(failed.tool_calls, accepted.tool_calls);
+            assert_eq!(failed.tool_argument_bytes, accepted.tool_argument_bytes);
+            assert!(parser.finish().is_empty());
+        }
+    }
+
+    #[test]
+    fn anthropic_calls_publish_in_opening_order_even_when_closed_in_reverse() {
+        let mut body = String::new();
+        // Deliberately use descending provider indexes: neither numerical
+        // index sorting nor completion order is the opening-order contract.
+        for index in [9, 2] {
+            body.push_str(&sse("content_block_start", &json!({
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "tool_use", "id": format!("call_{index}"), "name": "run", "input": {}}
+            })));
+            body.push_str(&sse(
+                "content_block_delta",
+                &json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"pwd\"}"}
+                }),
+            ));
+        }
+        for index in [2, 9] {
+            body.push_str(&sse(
+                "content_block_stop",
+                &json!({"type": "content_block_stop", "index": index}),
+            ));
+        }
+        body.push_str(&sse(
+            "message_delta",
+            &json!({"type": "message_delta", "delta": {"stop_reason": "tool_use"}}),
+        ));
+        body.push_str(&sse("message_stop", &json!({"type": "message_stop"})));
+        let folded = fold(&run(Provider::Anthropic, &body));
+        assert!(folded.done);
+        assert_eq!(folded.protocol, None);
+        assert_eq!(
+            folded
+                .calls
+                .iter()
+                .map(|call| call.id.as_str())
+                .collect::<Vec<_>>(),
+            ["call_9", "call_2"]
+        );
     }
 
     #[test]

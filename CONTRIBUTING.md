@@ -19,6 +19,7 @@ Run the same gates as CI before opening a pull request:
 cargo fmt --all -- --check
 cargo run --locked --example quickstart
 cargo run --locked --example streaming
+cargo run --locked --example recovery
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo test --locked --all-features --doc

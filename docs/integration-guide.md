@@ -34,7 +34,7 @@ integration-owned HTTP transport
                           push → finish → into_response
     │
     ▼
-AgentSession::accept_agent_response
+AgentSession::accept_agent_response_for
     │
     ├─ Said / Completed ──► render
     │
@@ -89,7 +89,7 @@ remain proposals until the session returns an `ApprovedCommand`.
 
 ## Prepare a turn
 
-1. Call `AgentSession::submit_user`.
+1. Call `AgentSession::submit_user` and capture `model_request_token()`.
 2. Build the session instruction with `build_user_prompt_with(protocol)`.
 3. If terminal or repository context is needed, wrap it with
    `agent_user_prompt`; `EnvironmentMeta` and `BlockContext` are encoded as
@@ -115,10 +115,13 @@ budget after JSON escaping, mark locally shortened block output as truncated,
 and escape any raw closing-tag prefix inside an untrusted value so it cannot
 terminate the surrounding prompt envelope.
 
-Preparation also checks that the provider builder omits no additional turn
-from this already-bounded history. That is a release-mode failure, not a debug
-assertion: a successful `PreparedAgentRequest` therefore has one truthful
-history-loss report even if internal wire budgets change in a later release.
+Preparation passes its retained history to the provider builder by reference.
+The builder independently revalidates the canonical turn count, leading-role,
+per-turn, and encoded-history bounds without cloning or bounding the turns a
+second time. Invalid prepared history fails in release builds, and an
+additional-omission guard remains in place. A successful request therefore
+has one truthful history-loss report; the optimization does not trust a
+caller-supplied report or relax the final request-envelope validation.
 
 ## Perform the HTTP request
 
@@ -148,10 +151,39 @@ and value, and the body. Applications should still treat the value itself as
 sensitive.
 
 If the transport fails before a response can be decoded, record a bounded,
-non-secret diagnostic with `AgentSession::model_failed`. A retry can then use
+non-secret diagnostic with `AgentSession::model_failed_for` and the token
+captured for that attempt. A retry can then use
 `can_retry_model` and `retry_model`; do not feed an HTTP error page to a model
 response parser. `SessionError::Protocol` exposes its `ParseError` through the
 standard `Error::source` chain when an integration needs typed diagnostics.
+
+### Bind asynchronous callbacks to their request
+
+Store the `ModelRequestToken` alongside the prepared request before starting
+transport. After decoding, use `accept_agent_response_for(&attempt, &response)`;
+on transport or decoding failure, use `model_failed_for(&attempt, diagnostic)`.
+Both verify identity before changing the live session. They return
+`ModelRequestError::StaleRequest` for an obsolete or foreign callback; discard
+that result without retrying or failing the current request.
+
+Each retry, next model turn, and restored `AwaitingModel` session creates a
+fresh identity. A callback from a timed-out request therefore cannot consume
+the retry's turn, show an obsolete approval card, or replace its error context.
+Responses and failures retire the token even when accepted through a legacy
+method. Cancellation and dropping the session retire it as well. Transport
+may poll `is_active()` to stop unnecessary work, but the checked callback is
+the authoritative synchronization boundary.
+
+Tokens are process-local and intentionally not serializable. A restored
+instance rejects the original instance's token even while both instances
+remain live; restoration does not cancel the separate original instance.
+The existing unguarded ingestion methods remain suitable for synchronous
+callers that guarantee callback ordering. Mixing guarded and unguarded
+callbacks in an asynchronous integration defeats the identity guarantee.
+
+[`examples/recovery.rs`](../examples/recovery.rs) demonstrates timeout, retry,
+late success/failure rejection, streaming, saved review restoration, simulated
+execution, and completion using only local fixtures.
 
 ## Decode a response
 
@@ -197,9 +229,25 @@ reports the selected wire protocol. A generation-bound event—including an
 Anthropic context-window limit—marks the response incomplete and prevents its
 partial contents from becoming an action.
 
+For UI and telemetry, `StreamParser::progress()` and `AgentStream::progress()`
+return content-free `StreamProgress` counters: inspected body bytes, inspected
+payload frames, emitted UTF-8 text bytes, accepted tool-argument bytes, and
+opened tool calls. Comments/keep-alives count toward raw bytes; payload frame
+counts include the terminal SSE sentinel and an inspected malformed frame.
+Input after termination is ignored. Call and argument counts remain available
+after completion even though the parser has released its private call storage.
+These counters support activity displays without copying response content.
+
+`is_complete` reflects the low-level `Done` marker. `AgentStream` also records
+high-level protocol failure, so `is_complete` and `is_failed` may both be true.
+Neither counters nor a completion flag authorize an action; successful
+`into_response`, request-bound ingestion, and explicit proposal approval are
+still required.
+
 ## Review and execution
 
-Pass the decoded value to `AgentSession::accept_agent_response`. A `run`
+Pass the decoded value and its captured request token to
+`AgentSession::accept_agent_response_for`. A `run`
 action yields `ModelOutcome::Proposal`; show its exact `id`, `command`, and
 optional `danger` warning to the user.
 
@@ -256,6 +304,8 @@ is still the integration's responsibility.
   provider error bodies.
 - Require an explicit review action for every proposal ID.
 - Apply transport and executor timeouts independently of model turn limits.
+- Carry a fresh request token through every asynchronous success/error callback;
+  ignore stale callbacks without modifying or retrying the current request.
 - Test malformed, token-limited, interrupted, oversized, and multi-tool-call
   responses as well as the happy path.
 - Exercise snapshot restore with corrupted and stale data.

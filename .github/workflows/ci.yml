@@ -66,6 +66,8 @@ jobs:
         run: cargo run --locked --example quickstart
       - name: Streaming example
         run: cargo run --locked --example streaming
+      - name: Recovery example
+        run: cargo run --locked --example recovery
       - name: Test
         run: cargo test --locked --all-targets --all-features --no-fail-fast
       - name: Compile-fail API doc tests

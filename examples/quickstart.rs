@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.submit_user(format!(
         "show the current directory; an accidental token was pasted: {SECRET}"
     ))?;
+    let attempt = session.model_request_token().expect("model turn is live");
 
     let environment = EnvironmentMeta {
         cwd: "/workspace/jagent".into(),
@@ -77,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(20)
     );
 
-    let outcome = session.accept_agent_response(&response)?;
+    let outcome = session.accept_agent_response_for(&attempt, &response)?;
     let ModelOutcome::Proposal {
         id,
         command,

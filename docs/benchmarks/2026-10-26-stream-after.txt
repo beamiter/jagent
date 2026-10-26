@@ -1,0 +1,4 @@
+chunk=1 bytes=282081 iterations=50 elapsed_ms=343.293
+chunk=64 bytes=282081 iterations=50 elapsed_ms=203.611
+chunk=4096 bytes=282081 iterations=50 elapsed_ms=187.818
+chunk=282081 bytes=282081 iterations=50 elapsed_ms=187.042

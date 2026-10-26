@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added opaque `ModelRequestToken` identities and checked response/failure
+  ingestion methods to isolate asynchronous attempts across retries,
+  subsequent turns, session restoration, and task resets. Stale callbacks
+  return `ModelRequestError::StaleRequest` before changing the current session.
+  Existing ingestion methods and `SessionError` remain source-compatible.
+- Added content-free `StreamProgress` snapshots on `StreamParser` and
+  `AgentStream` for byte/frame/text/argument/call counters and terminal state.
+- Added an executable recovery lifecycle example and public-API integration
+  coverage across all three providers, both protocols, complete delivery, and
+  multiple UTF-8-splitting streaming chunk sizes.
+
 - Added `validate_command_text`, `CommandTextError`, and the public
   `MAX_COMMAND_BYTES` ceiling so terminals and shells can share the exact
   bounded, nonempty, single-line, control-free, visually unambiguous command
@@ -61,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Request preparation reuses its already-bounded history by reference, with
+  independent canonical-history validation and cached encoded-size accounting.
+  It no longer clones/bounds the same history a second time; provider request
+  bytes and truthful history diagnostics are preserved.
+- Streaming processes complete lines directly from transport chunks, reuses
+  fragmented-line and SSE buffers, and avoids cloning tool-delta JSON arrays
+  or Ollama argument objects. Tool-field limits are checked before copying.
+
 - Provider extension values are measured through the JSON serializer before
   cloning or request assembly, with independent per-value and cumulative
   encoded budgets. Extension failures and duplicate/reserved-name diagnostics
@@ -92,6 +111,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations, and review-smuggling control or invisible characters.
 
 ### Fixed
+
+- Submitting new input at the final turn no longer overwrites a pending
+  approval, in-flight execution, or completed state with `TurnLimitReached`.
+  Rejected transitions leave the session and its snapshot unchanged.
+- Snapshots produced by rejecting the final proposal with feedback now
+  restore correctly; the final user turn must immediately follow the rejected
+  proposal, so unrelated forged final user turns remain invalid.
+- Overlapping Anthropic tool blocks retain their opening order even when
+  blocks close in a different order.
+- OpenAI-compatible scalar or array `function` fragments fail immediately
+  instead of being silently ignored until a later fragment supplies a value.
+- Restored a missing `#[test]` attribute on the container-init regression and
+  resolved strict Clippy/formatting failures present on the upgrade baseline.
 
 - `runc run` and `crun run` now expose explicit command overrides to the same
   classifier as `docker run`, so low-level OCI launches warn on destructive

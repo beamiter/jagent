@@ -808,9 +808,7 @@ fn is_uclamp_value(value: &str) -> bool {
     if value == "-1" {
         return true;
     }
-    value
-        .parse::<u16>()
-        .is_ok_and(|clamp| clamp <= 1024)
+    value.parse::<u16>().is_ok_and(|clamp| clamp <= 1024)
 }
 
 fn is_process_id(value: &str) -> bool {
@@ -2405,10 +2403,7 @@ fn select_execution_wrappers_mode(
                     else {
                         break;
                     };
-                    if !flags
-                        .chars()
-                        .all(|flag| matches!(flag, 'c' | 'v' | 'h'))
-                    {
+                    if !flags.chars().all(|flag| matches!(flag, 'c' | 'v' | 'h')) {
                         valid = false;
                         break;
                     }
@@ -2692,11 +2687,11 @@ fn select_execution_wrappers_mode(
                             .map_or((long, None), |(name, value)| (name, Some(value)));
                         match unique_long_option(
                             spelling,
-                            &["compute", "type", "user", "role", "range", "help", "version"],
+                            &[
+                                "compute", "type", "user", "role", "range", "help", "version",
+                            ],
                         ) {
-                            Some("compute") if attached.is_none() => {
-                                tokens = &tokens[1..]
-                            }
+                            Some("compute") if attached.is_none() => tokens = &tokens[1..],
                             Some("type" | "user" | "role" | "range") => {
                                 tokens = &tokens[1..];
                                 let value = if let Some(value) = attached {
@@ -3147,7 +3142,10 @@ fn select_execution_wrappers_mode(
                     else {
                         break;
                     };
-                    if !short.chars().all(|flag| matches!(flag, 'n' | 'N' | 'x' | 'X')) {
+                    if !short
+                        .chars()
+                        .all(|flag| matches!(flag, 'n' | 'N' | 'x' | 'X'))
+                    {
                         valid = false;
                         break;
                     }
@@ -3202,8 +3200,8 @@ fn select_execution_wrappers_mode(
                                 tokens = &tokens[1..];
                             }
                             Some(
-                                "chdir" | "err" | "stderr" | "out" | "stdout" | "pidfile"
-                                | "user" | "lockfile" | "env",
+                                "chdir" | "err" | "stderr" | "out" | "stdout" | "pidfile" | "user"
+                                | "lockfile" | "env",
                             ) => {
                                 tokens = &tokens[1..];
                                 let value = if let Some(value) = attached {
@@ -3790,13 +3788,7 @@ fn select_execution_wrappers_mode(
                         match unique_long_option(
                             spelling,
                             &[
-                                "rootfs",
-                                "bind",
-                                "pwd",
-                                "cwd",
-                                "qemu",
-                                "root-id",
-                                "help",
+                                "rootfs", "bind", "pwd", "cwd", "qemu", "root-id", "help",
                                 "version",
                             ],
                         ) {
@@ -3936,21 +3928,9 @@ fn select_execution_wrappers_mode(
                             ],
                         ) {
                             Some(
-                                "noprofile"
-                                | "quiet"
-                                | "debug"
-                                | "noroot"
-                                | "nonewprivs"
-                                | "caps"
-                                | "seccomp"
-                                | "private-tmp"
-                                | "private-dev"
-                                | "private-cwd"
-                                | "netfilter"
-                                | "nodbus"
-                                | "nosound"
-                                | "novideo"
-                                | "no3d",
+                                "noprofile" | "quiet" | "debug" | "noroot" | "nonewprivs" | "caps"
+                                | "seccomp" | "private-tmp" | "private-dev" | "private-cwd"
+                                | "netfilter" | "nodbus" | "nosound" | "novideo" | "no3d",
                             ) if attached.is_none() => {
                                 tokens = &tokens[1..];
                             }
@@ -3960,23 +3940,9 @@ fn select_execution_wrappers_mode(
                                 tokens = &tokens[1..];
                             }
                             Some(
-                                "private-home"
-                                | "net"
-                                | "profile"
-                                | "name"
-                                | "hostname"
-                                | "join"
-                                | "whitelist"
-                                | "blacklist"
-                                | "read-only"
-                                | "read-write"
-                                | "tmpfs"
-                                | "bind"
-                                | "shell"
-                                | "dns"
-                                | "chroot"
-                                | "env"
-                                | "rmenv",
+                                "private-home" | "net" | "profile" | "name" | "hostname" | "join"
+                                | "whitelist" | "blacklist" | "read-only" | "read-write" | "tmpfs"
+                                | "bind" | "shell" | "dns" | "chroot" | "env" | "rmenv",
                             ) => {
                                 tokens = &tokens[1..];
                                 let value = if let Some(value) = attached {
@@ -4190,17 +4156,8 @@ fn select_execution_wrappers_mode(
                         match unique_long_option(
                             spelling,
                             &[
-                                "help",
-                                "version",
-                                "shell",
-                                "user",
-                                "pass",
-                                "address",
-                                "port",
-                                "isolate",
-                                "ipv6",
-                                "on",
-                                "off",
+                                "help", "version", "shell", "user", "pass", "address", "port",
+                                "isolate", "ipv6", "on", "off",
                             ],
                         ) {
                             Some("user" | "pass" | "address" | "port") => {
@@ -4600,7 +4557,7 @@ fn select_execution_wrappers_mode(
                             }
                             Some(
                                 "error-file" | "auth-file" | "server-num" | "xauth-protocol"
-                                    | "server-args",
+                                | "server-args",
                             ) => {
                                 tokens = &tokens[1..];
                                 let value = if let Some(value) = attached {
@@ -4781,13 +4738,30 @@ fn select_execution_wrappers_mode(
                                 tokens = &tokens[1..];
                             }
                             Some(
-                                "attach" | "output" | "env" | "user" | "detach-on"
-                                | "interruptible" | "trace" | "signal" | "status"
-                                | "trace-path" | "columns" | "string-limit"
-                                | "syscall-limit" | "summary-syscall-overhead"
-                                | "summary-sort-by" | "summary-columns"
-                                | "const-print-style" | "inject" | "fault"
-                                | "abbrev" | "verbose" | "raw" | "read" | "write"
+                                "attach"
+                                | "output"
+                                | "env"
+                                | "user"
+                                | "detach-on"
+                                | "interruptible"
+                                | "trace"
+                                | "signal"
+                                | "status"
+                                | "trace-path"
+                                | "columns"
+                                | "string-limit"
+                                | "syscall-limit"
+                                | "summary-syscall-overhead"
+                                | "summary-sort-by"
+                                | "summary-columns"
+                                | "const-print-style"
+                                | "inject"
+                                | "fault"
+                                | "abbrev"
+                                | "verbose"
+                                | "raw"
+                                | "read"
+                                | "write"
                                 | "kvm",
                             ) => {
                                 tokens = &tokens[1..];
@@ -4905,7 +4879,10 @@ fn select_execution_wrappers_mode(
                                 "version",
                             ],
                         ) {
-                            Some(flag @ ("timing" | "log-timing" | "log-in" | "log-io" | "divisor" | "maxdelay")) => {
+                            Some(
+                                flag @ ("timing" | "log-timing" | "log-in" | "log-io" | "divisor"
+                                | "maxdelay"),
+                            ) => {
                                 if matches!(flag, "log-in" | "log-io") {
                                     saw_typescript_opt = true;
                                 }
@@ -5084,15 +5061,13 @@ fn select_execution_wrappers_mode(
                     };
                     tokens = &tokens[1..];
                     let mut terminal = false;
-                    for flag in flags.chars() {
+                    if let Some(flag) = flags.chars().next() {
                         match flag {
                             'h' | 'l' => {
                                 terminal = true;
-                                break;
                             }
                             _ => {
                                 valid = false;
-                                break;
                             }
                         }
                     }
@@ -5179,15 +5154,13 @@ fn select_execution_wrappers_mode(
                     };
                     tokens = &tokens[1..];
                     let mut terminal = false;
-                    for flag in flags.chars() {
+                    if let Some(flag) = flags.chars().next() {
                         match flag {
                             'h' => {
                                 terminal = true;
-                                break;
                             }
                             _ => {
                                 valid = false;
-                                break;
                             }
                         }
                     }
@@ -5379,11 +5352,10 @@ fn select_execution_wrappers_mode(
                     };
                     tokens = &tokens[1..];
                     let mut terminal = false;
-                    for (offset, flag) in flags.char_indices() {
+                    if let Some((offset, flag)) = flags.char_indices().next() {
                         match flag {
                             'h' => {
                                 terminal = true;
-                                break;
                             }
                             't' | 'p' => {
                                 let value_start = offset + flag.len_utf8();
@@ -5400,11 +5372,9 @@ fn select_execution_wrappers_mode(
                                 if value.is_empty() {
                                     valid = false;
                                 }
-                                break;
                             }
                             _ => {
                                 valid = false;
-                                break;
                             }
                         }
                     }
@@ -6521,14 +6491,13 @@ fn scriptlive_command_option(tokens: &[String]) -> Option<&str> {
         }
         if let Some(short) = token.strip_prefix('-').filter(|short| !short.is_empty()) {
             index += 1;
-            for (offset, flag) in short.char_indices() {
+            if let Some((offset, flag)) = short.char_indices().next() {
                 match flag {
                     't' | 'T' | 'I' | 'B' | 'd' | 'm' => {
                         let value_start = offset + flag.len_utf8();
                         if value_start >= short.len() {
                             index += 1;
                         }
-                        break;
                     }
                     'c' => {
                         let value_start = offset + flag.len_utf8();
@@ -10939,32 +10908,68 @@ fn container_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
             }
             let consumes = matches!(
                 token,
-                "--name" | "--volume" | "--env" | "--publish" | "--mount"
-                    | "--network" | "--net" | "--user" | "--workdir" | "--hostname"
-                    | "--entrypoint" | "--platform" | "--label" | "--device"
-                    | "--memory" | "--cpus" | "--gpus" | "--env-file" | "--add-host"
-                    | "--annotation" | "--cap-add" | "--cap-drop" | "--cidfile"
-                    | "--dns" | "--expose" | "--group-add" | "--health-cmd"
-                    | "--ipc" | "--link" | "--log-driver" | "--log-opt"
-                    | "--mac-address" | "--memory-swap" | "--pid" | "--pull"
-                    | "--restart" | "--runtime" | "--security-opt" | "--shm-size"
-                    | "--stop-signal" | "--stop-timeout" | "--storage-opt"
-                    | "--sysctl" | "--tmpfs" | "--ulimit" | "--userns" | "--uts"
-                    | "--volume-driver" | "--volumes-from"
+                "--name"
+                    | "--volume"
+                    | "--env"
+                    | "--publish"
+                    | "--mount"
+                    | "--network"
+                    | "--net"
+                    | "--user"
+                    | "--workdir"
+                    | "--hostname"
+                    | "--entrypoint"
+                    | "--platform"
+                    | "--label"
+                    | "--device"
+                    | "--memory"
+                    | "--cpus"
+                    | "--gpus"
+                    | "--env-file"
+                    | "--add-host"
+                    | "--annotation"
+                    | "--cap-add"
+                    | "--cap-drop"
+                    | "--cidfile"
+                    | "--dns"
+                    | "--expose"
+                    | "--group-add"
+                    | "--health-cmd"
+                    | "--ipc"
+                    | "--link"
+                    | "--log-driver"
+                    | "--log-opt"
+                    | "--mac-address"
+                    | "--memory-swap"
+                    | "--pid"
+                    | "--pull"
+                    | "--restart"
+                    | "--runtime"
+                    | "--security-opt"
+                    | "--shm-size"
+                    | "--stop-signal"
+                    | "--stop-timeout"
+                    | "--storage-opt"
+                    | "--sysctl"
+                    | "--tmpfs"
+                    | "--ulimit"
+                    | "--userns"
+                    | "--uts"
+                    | "--volume-driver"
+                    | "--volumes-from"
             );
             index += 1;
-            if consumes
-                && index < tokens.len()
-                && !tokens[index].starts_with('-')
-            {
+            if consumes && index < tokens.len() && !tokens[index].starts_with('-') {
                 index += 1;
             }
         } else {
             let letters: Vec<char> = token.chars().skip(1).collect();
             index += 1;
             if let Some(last) = letters.last() {
-                if matches!(*last, 'v' | 'e' | 'p' | 'u' | 'w' | 'm' | 'h' | 'l' | 'c' | 'a')
-                    && index < tokens.len()
+                if matches!(
+                    *last,
+                    'v' | 'e' | 'p' | 'u' | 'w' | 'm' | 'h' | 'l' | 'c' | 'a'
+                ) && index < tokens.len()
                     && !tokens[index].starts_with('-')
                 {
                     index += 1;
@@ -11011,19 +11016,17 @@ fn kubectl_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
             }
             let consumes = matches!(token, "--container" | "--namespace" | "--context");
             index += 1;
-            if consumes
-                && index < tokens.len()
-                && !tokens[index].starts_with('-')
-            {
+            if consumes && index < tokens.len() && !tokens[index].starts_with('-') {
                 index += 1;
             }
         } else {
             let letters: Vec<char> = token.chars().skip(1).collect();
             index += 1;
-            if letters.iter().any(|flag| matches!(*flag, 'c' | 'n')) {
-                if index < tokens.len() && !tokens[index].starts_with('-') {
-                    index += 1;
-                }
+            if letters.iter().any(|flag| matches!(*flag, 'c' | 'n'))
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
             }
         }
     }
@@ -11069,10 +11072,7 @@ fn lxc_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
             }
             let consumes = matches!(token, "--project" | "--env");
             index += 1;
-            if consumes
-                && index < tokens.len()
-                && !tokens[index].starts_with('-')
-            {
+            if consumes && index < tokens.len() && !tokens[index].starts_with('-') {
                 index += 1;
             }
         } else {
@@ -11124,19 +11124,17 @@ fn container_exec_child_argv(tokens: &[String]) -> Option<Vec<String>> {
                 "--detach-keys" | "--env" | "--user" | "--workdir" | "--privileged"
             );
             index += 1;
-            if consumes
-                && index < tokens.len()
-                && !tokens[index].starts_with('-')
-            {
+            if consumes && index < tokens.len() && !tokens[index].starts_with('-') {
                 index += 1;
             }
         } else {
             let letters: Vec<char> = token.chars().skip(1).collect();
             index += 1;
-            if letters.iter().any(|flag| matches!(*flag, 'e' | 'u' | 'w')) {
-                if index < tokens.len() && !tokens[index].starts_with('-') {
-                    index += 1;
-                }
+            if letters.iter().any(|flag| matches!(*flag, 'e' | 'u' | 'w'))
+                && index < tokens.len()
+                && !tokens[index].starts_with('-')
+            {
+                index += 1;
             }
         }
     }
@@ -11169,22 +11167,30 @@ fn oci_run_child_argv(tokens: &[String]) -> Option<Vec<String>> {
             }
             let consumes = matches!(
                 token,
-                "--bundle" | "--config" | "--console-socket" | "--pid-file"
-                    | "--preserve-fds" | "--rootfs" | "--log" | "--log-format"
-                    | "--process" | "--detach" | "--no-subreaper" | "--systemd-cgroup"
+                "--bundle"
+                    | "--config"
+                    | "--console-socket"
+                    | "--pid-file"
+                    | "--preserve-fds"
+                    | "--rootfs"
+                    | "--log"
+                    | "--log-format"
+                    | "--process"
+                    | "--detach"
+                    | "--no-subreaper"
+                    | "--systemd-cgroup"
             );
             index += 1;
-            if consumes
-                && index < tokens.len()
-                && !tokens[index].starts_with('-')
-            {
+            if consumes && index < tokens.len() && !tokens[index].starts_with('-') {
                 index += 1;
             }
         } else {
             let letters: Vec<char> = token.chars().skip(1).collect();
             index += 1;
             if let Some(last) = letters.last() {
-                if matches!(*last, 'b' | 'p' | 'r') && index < tokens.len() && !tokens[index].starts_with('-')
+                if matches!(*last, 'b' | 'p' | 'r')
+                    && index < tokens.len()
+                    && !tokens[index].starts_with('-')
                 {
                     index += 1;
                 }
@@ -11542,8 +11548,10 @@ fn dangerous_segment(
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
             }
-            let normalized_child: Vec<String> =
-                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            let normalized_child: Vec<String> = child
+                .iter()
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
             if let Some(reason) =
                 dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
             {
@@ -11557,8 +11565,10 @@ fn dangerous_segment(
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
             }
-            let normalized_child: Vec<String> =
-                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            let normalized_child: Vec<String> = child
+                .iter()
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
             if let Some(reason) =
                 dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
             {
@@ -11574,8 +11584,10 @@ fn dangerous_segment(
             if depth >= 4 {
                 return Some("command dispatcher nesting exceeds the review limit");
             }
-            let normalized_child: Vec<String> =
-                child.iter().map(|token| token.to_ascii_lowercase()).collect();
+            let normalized_child: Vec<String> = child
+                .iter()
+                .map(|token| token.to_ascii_lowercase())
+                .collect();
             if let Some(reason) =
                 dangerous_segment_with_dispatch(&child, &normalized_child, depth + 1, true)
             {
@@ -12404,7 +12416,11 @@ mod tests {
             );
         }
 
-        for command in ["kubectl exec mypod", "kubectl exec --help rm -rf /", "kubectl exec"] {
+        for command in [
+            "kubectl exec mypod",
+            "kubectl exec --help rm -rf /",
+            "kubectl exec",
+        ] {
             assert!(
                 is_dangerous(command).is_none(),
                 "kubectl exec metadata was treated as child for {command:?}"
@@ -12448,7 +12464,11 @@ mod tests {
             );
         }
 
-        for command in ["incus exec mybox", "incus exec --help rm -rf /", "incus exec"] {
+        for command in [
+            "incus exec mybox",
+            "incus exec --help rm -rf /",
+            "incus exec",
+        ] {
             assert!(
                 is_dangerous(command).is_none(),
                 "incus exec metadata was treated as child for {command:?}"
@@ -12517,6 +12537,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn container_init_wrappers_expose_their_direct_child() {
         for command in [
             "dumb-init rm -rf /",
@@ -16100,7 +16121,6 @@ mod tests {
         assert!(is_dangerous("timeout 5 ionice -p 99999999 rm -rf /").is_none());
     }
 
-
     #[test]
     fn taskset_pid_mode_does_not_hide_direct_child_dispatch() {
         for command in [
@@ -16523,7 +16543,6 @@ mod tests {
         assert!(is_dangerous("timeout 5 setuidgid --version systemctl reboot").is_none());
         assert!(is_dangerous("timeout 5 setuidgid -u nobody git reset --hard HEAD~1").is_none());
     }
-
 
     #[test]
     fn prlimit_pid_mode_does_not_hide_direct_child_dispatch() {
@@ -17031,7 +17050,6 @@ mod tests {
             );
         }
     }
-
 
     /// Wave-35 PATH leftovers: host/hw inventory managers installed beside
     /// STAGE peelers and wave-30–34 ctl/block leftovers. These list hardware /

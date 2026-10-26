@@ -35,23 +35,29 @@ Documentation:
   turn with a local response fixture.
 - [Streaming example](examples/streaming.rs) — chunked native-tool streaming
   through the same review state machine.
+- [Recovery example](examples/recovery.rs) — retry identity, late callbacks,
+  content-free progress, restored review, and task completion.
 - [Migration notes](docs/jterm4-migration.md) — compatibility guidance for
   `jterm_core` and existing terminal consumers.
 - [Changelog](CHANGELOG.md) — release history and compatibility notes.
+- [Performance measurements](docs/performance.md) — reproducible local
+  request-preparation and streaming benchmarks with their scope and limits.
 
 ## Quick start
 
 The recommended 0.7 path keeps the request protocol, matching system prompt,
 redaction policy, response decoder, and session ingestion together:
 
-1. Submit user input to an `AgentSession`.
+1. Submit user input to an `AgentSession` and capture its
+   `model_request_token()` for this attempt.
 2. Encode terminal/environment context as untrusted user-role data.
 3. Call `prepare_agent_request`; high-confidence secret redaction is on by
    default, with counts for retained-turn redaction, elision, and omission.
 4. Perform the returned HTTP request with your own transport.
 5. Decode bytes with `prepared.parse_response`; the prepared request keeps the
    provider, protocol, and non-streaming delivery mode paired for you.
-6. Display every proposed command. Only `approve` returns an
+6. Ingest with `accept_agent_response_for` and that attempt's token, then
+   display every proposed command. Only `approve` returns an
    `ApprovedCommand`, and the integration must still execute it deliberately.
 
 Run the repository example:
@@ -75,11 +81,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protocol = AgentProtocol::Text;
     let mut session = AgentSession::new(8);
 
-    // Deliberately resembles a leaked token so the secure default is visible.
-    const SECRET: &str = "YOUR_GITHUB_TOKEN";
+    // A labeled synthetic secret makes the default redaction observable.
+    const SECRET: &str = "documentation-only-password";
     session.submit_user(format!(
-        "show the current directory; an accidental token was pasted: {SECRET}"
+        "show the current directory; an accidental setting was pasted: password=\"{SECRET}\""
     ))?;
+    let attempt = session.model_request_token().expect("model turn is live");
 
     let environment = EnvironmentMeta {
         cwd: "/workspace/jagent".into(),
@@ -131,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "usage": {"prompt_tokens": 20, "completion_tokens": 8}
     }"#;
     let response = prepared.parse_response(response_bytes)?;
-    let outcome = session.accept_agent_response(&response)?;
+    let outcome = session.accept_agent_response_for(&attempt, &response)?;
 
     let ModelOutcome::Proposal {
         id,
@@ -171,6 +178,8 @@ provider or protocol:
 # fn example(history: &[Message]) -> Result<(), Box<dyn std::error::Error>> {
 # let config = ChatConfig::new(Provider::OpenAiCompatible);
 let protocol = AgentProtocol::Text;
+// Before starting transport, capture this turn's identity:
+// let attempt = session.model_request_token().expect("model turn is live");
 let prepared = prepare_agent_request(
     &config,
     AgentRequestSpec::new(history, protocol).streaming(true),
@@ -182,7 +191,7 @@ let mut response_stream = prepared.response_stream()?;
 // At transport EOF:
 // for event in response_stream.finish() { render(event); }
 // let response = response_stream.into_response()?;
-// let outcome = session.accept_agent_response(&response)?;
+// let outcome = session.accept_agent_response_for(&attempt, &response)?;
 # let _ = (&prepared.request, &mut response_stream);
 # Ok(())
 # }
@@ -204,6 +213,36 @@ stream completion, response conversion, and proposal approval:
 
 ```text
 cargo run --example streaming
+```
+
+`stream.progress()` returns a `StreamProgress` snapshot with inspected bytes,
+payload frames, emitted text bytes, accepted argument bytes, opened tool calls,
+and completion/failure flags. It contains no model text or credentials. A
+completed transport can still have a protocol mismatch, so `into_response`
+remains the final stream check before session ingestion.
+
+## Retries and restored sessions
+
+Asynchronous integrations should carry a `ModelRequestToken` with every
+request and return it to `accept_agent_response_for` or `model_failed_for`.
+Tokens distinguish attempts even when the session returns to `AwaitingModel`:
+
+- Success, failure, cancellation, and dropping the originating session retire
+  its token. `is_active()` is a cooperative cancellation hint for transport.
+- A retry or subsequent model turn creates a new identity. A late callback
+  returns `ModelRequestError::StaleRequest` without changing the transcript,
+  turn budget, or pending proposal.
+- Restored sessions have independent identities. Persist snapshots, not
+  request tokens; a restored approval card still requires explicit review.
+
+The existing unguarded ingestion methods remain available for synchronous
+integrations that guarantee callback ordering. This upgrade does not change
+the snapshot wire format or add an HTTP/runtime dependency.
+
+Run the complete no-I/O recovery fixture:
+
+```text
+cargo run --example recovery
 ```
 
 ## Native tools
@@ -444,6 +483,7 @@ The full local release gate is:
 cargo fmt --all -- --check
 cargo run --locked --example quickstart
 cargo run --locked --example streaming
+cargo run --locked --example recovery
 cargo check --locked --all-targets --all-features
 cargo test --locked --all-targets --all-features --no-fail-fast
 cargo test --locked --all-features --doc

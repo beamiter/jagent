@@ -7,6 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protocol = AgentProtocol::NativeTools;
     let mut session = AgentSession::new(4);
     session.submit_user("show the current directory")?;
+    let attempt = session.model_request_token().expect("model turn is live");
 
     let history = [Message {
         role: Role::User,
@@ -54,11 +55,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|event| matches!(event, StreamEvent::ToolCall(_))));
     assert!(events.contains(&StreamEvent::Done));
+    assert!(stream.progress().is_complete);
+    assert!(!stream.progress().is_failed);
 
     // A low-level ToolCall event is display data, not authorization. Only the
     // completed response enters the session and becomes a reviewable proposal.
     let response = stream.into_response()?;
-    let ModelOutcome::Proposal { id, command, .. } = session.accept_agent_response(&response)?
+    let ModelOutcome::Proposal { id, command, .. } =
+        session.accept_agent_response_for(&attempt, &response)?
     else {
         panic!("the local stream fixture must produce a command proposal");
     };

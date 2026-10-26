@@ -771,11 +771,13 @@ pub fn bound_history_cow_with_report<'a>(
 ) -> PreparedHistory {
     struct PreparedTurn {
         message: Message,
+        json_bytes: usize,
         changed: bool,
         elided: bool,
     }
 
-    let mut retained_reversed: Vec<PreparedTurn> = Vec::new();
+    let mut retained_reversed: Vec<PreparedTurn> =
+        Vec::with_capacity(history.len().min(MAX_REQUEST_HISTORY_TURNS));
     let mut retained_bytes = 0_usize;
     for turn in history.iter().rev() {
         if retained_reversed.len() >= MAX_REQUEST_HISTORY_TURNS {
@@ -796,6 +798,7 @@ pub fn bound_history_cow_with_report<'a>(
                 role: turn.role,
                 text,
             },
+            json_bytes: message_bytes,
             changed,
             elided,
         });
@@ -823,10 +826,7 @@ pub fn bound_history_cow_with_report<'a>(
         sent_history_json_bytes: retained_reversed
             .iter()
             .enumerate()
-            .map(|(index, turn)| {
-                history_turn_wire_bytes(turn.message.role, &turn.message.text)
-                    .saturating_add(usize::from(index > 0))
-            })
+            .map(|(index, turn)| turn.json_bytes.saturating_add(usize::from(index > 0)))
             .fold(0_usize, usize::saturating_add),
     };
     PreparedHistory {
@@ -840,10 +840,10 @@ pub fn bound_history_cow_with_report<'a>(
 
 fn bound_history_turn(role: Role, text: &str) -> (String, bool, usize) {
     let initial_limit = text.len().min(MAX_REQUEST_TURN_BYTES);
-    if elided_history_turn_wire_bytes(role, text, initial_limit) <= MAX_REQUEST_HISTORY_BYTES {
+    let initial_bytes = elided_history_turn_wire_bytes(role, text, initial_limit);
+    if initial_bytes <= MAX_REQUEST_HISTORY_BYTES {
         let bounded = elide_middle(text, initial_limit);
-        let bytes = history_turn_wire_bytes(role, &bounded);
-        return (bounded, initial_limit < text.len(), bytes);
+        return (bounded, initial_limit < text.len(), initial_bytes);
     }
 
     // Find the largest raw-text budget whose JSON representation still fits.
@@ -1047,6 +1047,81 @@ fn build_request_with(
     stream: bool,
     extra_body_fields: &[(&'static str, Value)],
 ) -> Result<BuiltRequest, ProviderError> {
+    build_request_with_history(
+        config,
+        system,
+        RequestHistory::Unprepared(history),
+        stream,
+        extra_body_fields,
+    )
+}
+
+enum RequestHistory<'a> {
+    Unprepared(&'a [Message]),
+    Prepared(&'a [Message]),
+}
+
+/// Internal path for the high-level request preparer. It borrows the already
+/// redacted/bounded history instead of bounding and copying every turn a
+/// second time. The runtime validation below is intentional: report
+/// correctness must not rely on a debug assertion or trust in the caller.
+pub(crate) fn build_prepared_agent_request(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: &[Message],
+    protocol: AgentProtocol,
+    stream: bool,
+) -> Result<BuiltRequest, ProviderError> {
+    config.validate()?;
+    let extra = match protocol {
+        AgentProtocol::Text => Vec::new(),
+        AgentProtocol::NativeTools => agent_body_fields(config.provider)?,
+    };
+    build_request_with_history(
+        config,
+        system,
+        RequestHistory::Prepared(history),
+        stream,
+        &extra,
+    )
+}
+
+/// Check that another bounding pass would preserve the complete history.
+/// Do not trust a cached report here: this independent check also catches
+/// drift between the history preparer and the provider's hard wire budgets.
+fn validate_prepared_history(history: &[Message]) -> Result<(), ProviderError> {
+    let invalid = || {
+        ProviderError::InvalidConfiguration(
+            "agent request builder received non-canonical prepared history".into(),
+        )
+    };
+    if history.len() > MAX_REQUEST_HISTORY_TURNS
+        || (history.len() > 1 && history[0].role == Role::Assistant)
+    {
+        return Err(invalid());
+    }
+    let mut encoded_bytes = 0_usize;
+    for (index, turn) in history.iter().enumerate() {
+        if turn.text.len() > MAX_REQUEST_TURN_BYTES {
+            return Err(invalid());
+        }
+        encoded_bytes = encoded_bytes
+            .saturating_add(history_turn_wire_bytes(turn.role, &turn.text))
+            .saturating_add(usize::from(index > 0));
+        if encoded_bytes > MAX_REQUEST_HISTORY_BYTES {
+            return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+fn build_request_with_history(
+    config: &ChatConfig,
+    system: Option<&str>,
+    history: RequestHistory<'_>,
+    stream: bool,
+    extra_body_fields: &[(&'static str, Value)],
+) -> Result<BuiltRequest, ProviderError> {
     let url = config.endpoint()?;
     let _extension_json_bytes = validate_extra_body_fields(extra_body_fields)?;
     if let Some(system) = system {
@@ -1056,11 +1131,20 @@ fn build_request_with(
             )));
         }
     }
-    // `bound_history` is idempotent, so a caller that already bounded (or
-    // redacted and bounded) its history sends exactly what it prepared, while
-    // a caller that forgot cannot make this crate emit an unbounded body.
-    let (history, omitted_history_turns) = bound_history(history);
-    let history = &history[..];
+    // Public compatibility builders always bound their input. The high-level
+    // preparer can borrow its canonical window after independently validating
+    // it, without allocating a duplicate Vec<String> merely to prove that
+    // nothing would change.
+    let (history, omitted_history_turns) = match history {
+        RequestHistory::Unprepared(history) => {
+            let (bounded, omitted) = bound_history(history);
+            (Cow::Owned(bounded), omitted)
+        }
+        RequestHistory::Prepared(history) => {
+            validate_prepared_history(history)?;
+            (Cow::Borrowed(history), 0)
+        }
+    };
     let api_key = config.api_key.as_deref();
     let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
     match config.provider {
@@ -1078,7 +1162,7 @@ fn build_request_with(
             }
         }
     }
-    let mut body = request_body(config, system, history, stream);
+    let mut body = request_body(config, system, &history, stream);
     if !body.is_object() {
         return Err(ProviderError::InvalidConfiguration(
             "provider request body is not a JSON object".into(),
@@ -2558,6 +2642,117 @@ mod tests {
             .join(",")
             .len();
         assert_eq!(prepared.report.sent_history_json_bytes, actual);
+    }
+
+    #[test]
+    fn prepared_history_builder_matches_compatibility_builders_for_every_mode() {
+        let histories = [
+            Vec::new(),
+            vec![assistant("singleton compatibility")],
+            vec![assistant("drop orphan"), user("hello"), assistant("你好🙂")],
+            (0..MAX_REQUEST_HISTORY_TURNS + 3)
+                .map(|index| user(&format!("turn {index}: quote \" and slash \\")))
+                .collect(),
+            vec![user(&"\0\"\\\n界🙂".repeat(MAX_REQUEST_TURN_BYTES / 8))],
+        ];
+        for history in histories {
+            let prepared = bound_history_with_report(&history);
+            for provider in [
+                Provider::Anthropic,
+                Provider::OpenAiCompatible,
+                Provider::Ollama,
+            ] {
+                for protocol in [AgentProtocol::Text, AgentProtocol::NativeTools] {
+                    for streaming in [false, true] {
+                        for system in [None, Some("policy \" and newline\n")] {
+                            let expected = build_agent_request(
+                                &config(provider),
+                                system,
+                                &prepared.messages,
+                                protocol,
+                                streaming,
+                            )
+                            .unwrap();
+                            let actual = build_prepared_agent_request(
+                                &config(provider),
+                                system,
+                                &prepared.messages,
+                                protocol,
+                                streaming,
+                            )
+                            .unwrap();
+                            assert_eq!(actual, expected, "{provider:?}/{protocol:?}/{streaming}");
+                            assert_eq!(actual.omitted_history_turns, 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_history_is_revalidated_instead_of_trusting_a_report() {
+        let invalid_histories = [
+            vec![user("turn"); MAX_REQUEST_HISTORY_TURNS + 1],
+            vec![assistant("orphan"), user("current")],
+            vec![user(&"x".repeat(MAX_REQUEST_TURN_BYTES + 1))],
+            vec![user(&"\0".repeat(MAX_REQUEST_TURN_BYTES))],
+            vec![user(&"x".repeat(MAX_REQUEST_TURN_BYTES)); 2],
+        ];
+        for history in invalid_histories {
+            let error = build_prepared_agent_request(
+                &config(Provider::OpenAiCompatible),
+                None,
+                &history,
+                AgentProtocol::Text,
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "invalid configuration: agent request builder received non-canonical prepared history"
+            );
+        }
+
+        // Check the encoded budget at its exact boundary independently of
+        // the preparer's own oracle, including the separator between turns.
+        let fixed = serde_json::to_string(&json!({"role": "user", "content": ""}))
+            .unwrap()
+            .len();
+        let budget = MAX_REQUEST_HISTORY_BYTES - fixed * 2 - 1;
+        let escaped_len = budget / 6;
+        let mut history = vec![
+            user(&"\0".repeat(escaped_len)),
+            user(&"x".repeat(budget % 6)),
+        ];
+        assert!(validate_prepared_history(&history).is_ok());
+        history[1].text.push('x');
+        assert!(validate_prepared_history(&history).is_err());
+    }
+
+    #[test]
+    fn cached_history_accounting_matches_serialized_elision_and_role_pruning() {
+        for text in [
+            "plain".repeat(MAX_REQUEST_TURN_BYTES / 5 + 10),
+            "界🙂\n\\\0".repeat(MAX_REQUEST_TURN_BYTES / 10 + 10),
+            (0_u8..32).map(char::from).collect::<String>().repeat(6145),
+        ] {
+            let history = [assistant("orphan"), user(&text), assistant("latest")];
+            let prepared = bound_history_with_report(&history);
+            let encoded: Vec<_> = prepared
+                .messages
+                .iter()
+                .map(|message| json!({"role": message.role.as_str(), "content": message.text}))
+                .collect();
+            let bytes = serde_json::to_vec(&encoded).unwrap().len() - 2;
+            assert_eq!(prepared.report.sent_history_json_bytes, bytes);
+            assert!(validate_prepared_history(&prepared.messages).is_ok());
+            assert_eq!(prepared.report.changed_history_turns, 0);
+            assert_eq!(
+                prepared.report.sent_history_turns + prepared.report.omitted_history_turns,
+                history.len()
+            );
+        }
     }
 
     #[test]

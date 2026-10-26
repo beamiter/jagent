@@ -19,8 +19,10 @@ prompt tags or extraction state.
 | Protocol/delivery capability discovery | `jagent::capabilities` | Exchange the bounded versioned token across a terminal/shell boundary, negotiate exact v2 mode pairs (with strict v1 compatibility), and let request preparation re-check provider support. |
 | Protocol-matched request preparation and response decoding | `jagent::agent`, `jagent::response` | `prepare_agent_request` binds prompt, schema, history policy, delivery mode, and decoder to one `AgentProtocol`. This is the recommended 0.7 path. |
 | Agent state, proposal review, snapshots, and text-protocol parsing | `jagent::session` | Approval produces an `ApprovedCommand`; execution remains a caller action and returns a typed `CommandExecutionOutcome`. |
+| Async request identity and stale callbacks | `jagent::session` | Capture `model_request_token()` before transport; return it through checked success/failure methods. Retry and restore create new identities. |
 | Native tool schemas and response parsing | `jagent::tools` | Text and native-tool protocols converge on the same `ParsedAction` values. |
 | Low-level provider encoding and stream events | `jagent::provider`, `jagent::stream` | Compatibility surface for integrations that deliberately coordinate prompt, protocol, delivery, and parsing themselves. |
+| Content-free streaming diagnostics | `StreamParser::progress`, `AgentStream::progress` | Display bounded byte/frame/call counters; `into_response` remains authoritative for successful completion. |
 | System prompts and untrusted user-role context | `jagent::prompt` | `BlockContext` and `EnvironmentMeta` are shared wire-facing shapes. |
 | History bounding and secret preparation | `jagent::agent`, or `jagent::provider` plus `jagent::redact` | The high-level path redacts high-confidence secrets by default and reports changes, elision, and omission. Low-level builders bound history but do not implicitly redact it. |
 | Dangerous-command warnings | `jagent::safety` | `is_auto_approvable` is retained for compatibility but always returns `false`. |
@@ -42,12 +44,16 @@ drift between layers:
 4. Surface the returned history report. Redaction is enabled by default;
    disabling it with `AgentRequestSpec::redact_secrets(false)` is an explicit
    integration policy decision.
-5. Perform the returned request with the consumer's bounded HTTP transport.
+5. Capture the session's `model_request_token()` and perform the returned
+   request with the consumer's bounded HTTP transport. Keep the token with
+   this attempt, including any error callback.
 6. Decode a complete response with `prepared.parse_response`, or create the
    streaming accumulator with `prepared.response_stream`, feed every chunk,
    call `finish` at EOF, and then call `into_response`.
-7. Pass the completed `AgentResponse` to
-   `AgentSession::accept_agent_response`. Never interpret a raw streamed
+7. Pass the completed `AgentResponse` and captured token to
+   `AgentSession::accept_agent_response_for`. Discard
+   `ModelRequestError::StaleRequest`; do not let an old callback fail or retry
+   the current attempt. Never interpret a raw streamed
    `ToolCall` as an approval or execution token.
 8. Preserve the existing review UI boundary: display the exact proposal and
    execute only the `ApprovedCommand` returned for its ID.
@@ -57,6 +63,12 @@ stream APIs where they need byte-stable compatibility, but they then own the
 prompt/protocol/delivery pairing and secret-preparation policy explicitly.
 See the generic [integration guide](integration-guide.md) for transport,
 failure, persistence, and production guidance.
+
+The request-token and stream-progress APIs are additive. Existing
+`SessionError` variants, snapshot encoding, request bytes, and unguarded
+ingestion methods remain available. Async consumers must migrate both success
+and failure callbacks to enforce request identity; upgrading the dependency
+alone does not fix a consumer that continues to use unguarded callbacks.
 
 ## Low-level compatibility and 0.6 wire decoding
 
@@ -105,7 +117,7 @@ entry points.
 
 ## Integration checklist
 
-1. Prefer `prepare_agent_request` and `accept_agent_response` for new or
+1. Prefer `prepare_agent_request` and `accept_agent_response_for` for new or
    migrated agent loops; import low-level modules only where the consumer needs
    their additional control.
 2. Treat the high-level preparation report as part of the UI contract and

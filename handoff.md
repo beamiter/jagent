@@ -1,5 +1,76 @@
 # Engineering handoff
 
+Updated: 2026-10-26
+
+## Current verified upgrade
+
+Baseline: `d5492320686879c8b92106d2e31e4293ff125a5a` (master at the start of
+this work). Package version stays 0.7.0; changes are recorded as Unreleased.
+
+### Request lifecycle and restoration
+
+- Added opaque, process-local `ModelRequestToken` and a separate
+  `ModelRequestError` so existing `SessionError` matches remain compatible.
+  Capture `model_request_token()` before transport and return it through
+  `accept_agent_response_for`, `accept_model_reply_for`,
+  `accept_model_tool_reply_for`, or `model_failed_for`.
+- Each retry/subsequent turn/restored instance has a distinct identity.
+  Responses, failures, cancellation, and session drop retire the originating
+  token. Stale/foreign/duplicate callbacks leave the current session untouched.
+- Fixed an exhausted-budget submission overwriting pending approval,
+  observation, or completion state.
+- Fixed restoration after rejecting the final proposal with feedback; strict
+  adjacency to that rejected proposal is required for the final user turn.
+- Snapshot wire format is unchanged. The legacy ingestion methods remain
+  unguarded for synchronous consumers. Restoring a separate live instance does
+  not cancel the original instance.
+
+### Request preparation and streaming
+
+- Prepared history is borrowed by provider construction instead of being
+  cloned/bounded twice. Independent canonical-window and final request
+  validation remain; cached encoded sizes preserve the history-loss report.
+- Added content-free `StreamProgress` on low/high-level stream APIs.
+- Streaming borrows complete lines, reuses fragmented buffers, keeps a fast
+  small-chunk path, and checks field limits before copying.
+- Anthropic tools publish in opening order even when blocks close in reverse.
+  Malformed OpenAI function fragment shapes fail immediately.
+- Benchmarks, raw samples, dependency provenance, and limitations are in
+  [docs/performance.md](docs/performance.md). Local preparation improved by
+  23.5–64.5% in measured workloads (44.2% with default redaction); measured
+  stream parsing improved by 13.6–23.1%. These are not model/network timings.
+
+### Validation completed
+
+- Rust 1.99.1: 400 unit tests and one public-API integration test passed.
+  The integration test exercises 24 full provider/protocol/delivery/chunk
+  workflows through request identity, review, restore, and completion.
+- Rust 1.86: the same 400 + 1 tests passed with all targets/features.
+- Six rustdoc tests passed; docs build with warnings denied passed.
+- Strict Clippy, formatting, and `git diff --check` passed. Fixed seven
+  baseline strict-lint blockers, including a missing container-init `#[test]`.
+- quickstart, streaming, and recovery examples executed successfully with
+  local fixtures. CI now executes the recovery example too.
+- `cargo package --offline --locked --allow-dirty` verified the packaged
+  crate. Offline mode was used because the sandbox proxy could not access
+  the registry; all locked dependencies were already cached.
+- 120 exact-request-byte parity combinations cover provider/protocol/delivery,
+  system-prompt, and history variants. No dependency or MSRV increase.
+
+### Consumer adoption still required
+
+This change updates jagent only. jsh/jterm_core/terminal integrations must
+update their dependency and move both async success and failure callbacks to
+the request-bound APIs. They may expose `progress()` in activity UI. Updating
+only the dependency does not add provenance checks to legacy callbacks.
+Networking, cancellation of sockets/processes, execution, durable snapshot
+storage, and command-review UI remain consumer responsibilities.
+
+Use `cargo run --locked --example recovery` for the local recovery lifecycle.
+It sends no network traffic and executes no commands.
+
+## Historical handoff (before this upgrade)
+
 Updated: 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)
 
 ## 2026-09-30 (pending tip cohort — wave-38 leftovers and deepen)

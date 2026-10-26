@@ -14,8 +14,7 @@ use crate::capabilities::{
 };
 use crate::prompt::{build_agent_system_prompt, build_agent_tool_system_prompt};
 use crate::provider::{
-    bound_history_cow_with_report, bound_history_with_report,
-    build_agent_chat_request_streaming_with_report, build_agent_chat_request_with_report,
+    bound_history_cow_with_report, bound_history_with_report, build_prepared_agent_request,
     BuiltRequest, ChatConfig, HistoryReport, HttpRequest, Message, Provider, ProviderError,
 };
 use crate::redact::redact_secrets_cow;
@@ -198,6 +197,9 @@ pub fn prepare_agent_request(
     config: &ChatConfig,
     spec: AgentRequestSpec<'_>,
 ) -> Result<PreparedAgentRequest, ProviderError> {
+    // Reject bad settings before scanning potentially large context for
+    // secrets. The provider builder repeats validation at its own boundary.
+    config.validate()?;
     let delivery = if spec.streaming {
         AgentDelivery::Streaming
     } else {
@@ -231,21 +233,13 @@ pub fn prepare_agent_request(
         SystemPrompt::Custom(system) => system,
     };
 
-    let built = if spec.streaming {
-        build_agent_chat_request_streaming_with_report(
-            config,
-            system,
-            &prepared_history.messages,
-            spec.protocol,
-        )?
-    } else {
-        build_agent_chat_request_with_report(
-            config,
-            system,
-            &prepared_history.messages,
-            spec.protocol,
-        )?
-    };
+    let built = build_prepared_agent_request(
+        config,
+        system,
+        &prepared_history.messages,
+        spec.protocol,
+        spec.streaming,
+    )?;
     let built = require_idempotent_history(built)?;
 
     let request_body_bytes = built.request.body.len();
