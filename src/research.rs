@@ -260,6 +260,10 @@ impl ResearchContext {
                 completed(status) || matches!(status, "queued" | "running"),
                 "unknown trial status",
             )?;
+            require(
+                action != "needs_proposal" || !matches!(status, "queued" | "running"),
+                "proposal requested while visible work is pending",
+            )?;
             let parents = trial["parents"]
                 .as_array()
                 .ok_or(ResearchError("expected parents"))?;

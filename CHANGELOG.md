@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Research contexts reject `needs_proposal` when a visible trial is queued or
+  running, without requiring pending work to appear in a bounded nonready window.
 - Research validation now requires stage-specific failure categories, distinct
   feedback trial identities, admission before bound feedback and screening before
   confirmation. Context scores must agree with trial status. Existing valid V1/V2

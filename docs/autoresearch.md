@@ -16,6 +16,9 @@ The jsh host retains an older incumbent's scored record alongside the latest 15
 trials when needed. Scores must match the recorded outcome: kept/baseline/archived
 trials have both stages, screened-out trials have only screening, and queued
 trials have no scores. Confirmation always requires screening evidence.
+`needs_proposal` is rejected when any visible trial is queued or running. A
+nonready context need not include the pending trial within its bounded window;
+absence from that window does not prove that the campaign has no pending work.
 
 `prepare_request` returns provider-neutral messages and a JSON response schema.
 The system instructions are constant. All observations and hypotheses remain
