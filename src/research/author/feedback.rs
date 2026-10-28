@@ -7,7 +7,13 @@ fn status(value: &Value) -> Result<&str> {
     require(
         matches!(
             value,
-            "kept" | "archived" | "screened_out" | "invalid" | "failed" | "interrupted" | "author_failed"
+            "kept"
+                | "archived"
+                | "screened_out"
+                | "invalid"
+                | "failed"
+                | "interrupted"
+                | "author_failed"
         ),
         "invalid feedback category",
     )?;
@@ -27,7 +33,14 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
         }
         object(
             record,
-            &["attempt", "status", "stage", "failure_code", "trial_id", "scores"],
+            &[
+                "attempt",
+                "status",
+                "stage",
+                "failure_code",
+                "trial_id",
+                "scores",
+            ],
         )?;
         let attempt = integer(&record["attempt"], 1, 1000)?;
         require(attempt > previous, "feedback is not in attempt order")?;

@@ -147,7 +147,11 @@ fn provider_error_wins_over_apparently_valid_edits_without_echoing_it() {
     assert!(request
         .parse_response(&serde_json::to_vec(&response).unwrap())
         .is_ok());
-    for error in [json!({"message": "private-secret"}), json!(false), json!([])] {
+    for error in [
+        json!({"message": "private-secret"}),
+        json!(false),
+        json!([]),
+    ] {
         response["error"] = error;
         let rejected = request
             .parse_response(&serde_json::to_vec(&response).unwrap())
