@@ -29,6 +29,8 @@
 //! - [`prompt`] — the agent system prompt and user-role context encoding.
 //!   Terminal bytes and environment metadata are always carried as explicitly
 //!   untrusted user-role data, never interpolated into system instructions.
+//! - [`research`] — bounded research snapshots, provider-neutral proposal
+//!   messages and campaign/revision/incumbent-bound candidate validation.
 //! - [`stream`] — sans-IO incremental parsing of streaming chat response
 //!   bodies (Anthropic SSE, OpenAI-compatible SSE, Ollama NDJSON) into
 //!   byte-bounded [`stream::StreamEvent`]s.
@@ -65,6 +67,7 @@ mod json;
 pub mod prompt;
 pub mod provider;
 pub mod redact;
+pub mod research;
 pub mod response;
 pub mod safety;
 pub mod session;
