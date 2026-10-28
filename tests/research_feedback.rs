@@ -19,6 +19,22 @@ fn accepts(value: &Value) -> bool {
     EditRequest::from_json(&serde_json::to_vec(value).unwrap()).is_ok()
 }
 
+fn visible_trial_input(status: &str, scores: Value) -> Value {
+    let mut value = input();
+    value["context"]["budget"]["trials_used"] = json!(2);
+    value["context"]["omitted_trials"] = json!(0);
+    value["context"]["recent_trials"] = json!([
+        {"id": "baseline", "commit": "c".repeat(40), "hypothesis": "Frozen baseline",
+         "status": "baseline", "parents": [], "scores": {"screen": 10, "confirm": 10}},
+        {"id": "e000001", "commit": "e".repeat(40), "hypothesis": "Candidate",
+         "status": status, "parents": ["baseline"], "scores": scores}
+    ]);
+    if status == "kept" {
+        value["context"]["best"] = json!({"id": "e000001", "commit": "e".repeat(40)});
+    }
+    value
+}
+
 #[test]
 fn structured_observations_stay_in_user_data_and_plan_schema_stays_v1() {
     let mut value = input();
@@ -207,6 +223,87 @@ fn legacy_unknown_stage_placeholder_remains_unbound_and_scoreless() {
     value["feedback"][0]["trial_id"] = Value::Null;
     value["feedback"][0]["scores"]["screen"] = json!(1);
     assert!(!accepts(&value));
+}
+
+#[test]
+fn feedback_status_must_match_its_visible_trial() {
+    let mut value = visible_trial_input("archived", json!({"screen": -2, "confirm": -1}));
+    value["feedback"] = json!([record()]);
+    assert!(!accepts(&value));
+    value["feedback"][0]["status"] = json!("archived");
+    assert!(accepts(&value));
+
+    value = visible_trial_input("kept", json!({"screen": -2, "confirm": -1}));
+    value["feedback"] = json!([record()]);
+    value["feedback"][0]["status"] = json!("interrupted");
+    value["feedback"][0]["stage"] = json!("evaluate");
+    value["feedback"][0]["failure_code"] = json!("interrupted");
+    assert!(!accepts(&value));
+}
+
+#[test]
+fn feedback_scores_must_match_its_visible_trial() {
+    let mut value = visible_trial_input("kept", json!({"screen": -2, "confirm": -1}));
+    value["feedback"] = json!([record()]);
+    assert!(accepts(&value));
+    for stage in ["screen", "confirm"] {
+        let mut changed = value.clone();
+        changed["feedback"][0]["scores"][stage] = json!(123);
+        assert!(!accepts(&changed), "{stage}");
+    }
+}
+
+#[test]
+fn visible_failure_scores_preserve_missing_stage_semantics() {
+    let mut value = visible_trial_input("failed", json!({"screen": -2}));
+    let mut item = record();
+    item["status"] = json!("failed");
+    item["failure_code"] = json!("evaluation_failed");
+    item["scores"]["confirm"] = Value::Null;
+    value["feedback"] = json!([item]);
+    assert!(accepts(&value));
+    value["feedback"][0]["scores"]["confirm"] = json!(0);
+    assert!(!accepts(&value));
+    value["feedback"][0]["scores"]["confirm"] = Value::Null;
+    value["feedback"][0]["scores"]["screen"] = Value::Null;
+    assert!(!accepts(&value));
+}
+
+#[test]
+fn equivalent_integer_float_and_signed_zero_scores_are_accepted() {
+    let mut value = visible_trial_input("kept", json!({"screen": 8.0, "confirm": 0}));
+    let mut item = record();
+    item["scores"] = json!({"screen": 8, "confirm": -0.0});
+    value["feedback"] = json!([item]);
+    assert!(accepts(&value));
+}
+
+#[test]
+fn unseen_feedback_requires_omitted_history_but_unbound_observations_do_not() {
+    let mut value = visible_trial_input("archived", json!({"screen": -2, "confirm": -1}));
+    value["feedback"] = json!([record()]);
+    value["feedback"][0]["status"] = json!("archived");
+    value["context"]["recent_trials"]
+        .as_array_mut()
+        .unwrap()
+        .pop();
+    value["context"]["omitted_trials"] = json!(1);
+    assert!(accepts(&value));
+    value["context"]["budget"]["trials_used"] = json!(1);
+    value["context"]["omitted_trials"] = json!(0);
+    assert!(!accepts(&value));
+    value["feedback"] = json!([{"attempt": 1, "status": "author_failed", "stage": "prepare",
+        "failure_code": "preparation_failed", "trial_id": null,
+        "scores": {"screen": null, "confirm": null}}]);
+    assert!(accepts(&value));
+}
+
+#[test]
+fn legacy_categories_do_not_claim_visible_trial_identity() {
+    let mut value = visible_trial_input("archived", json!({"screen": -2, "confirm": -1}));
+    value["schema_version"] = json!(1);
+    value["feedback"] = json!(["kept", "interrupted"]);
+    assert!(accepts(&value));
 }
 
 #[test]

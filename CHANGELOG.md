@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed research feedback is checked against visible context trial statuses and
+  scores, with numeric equivalence and omitted-history compatibility. Complete
+  histories reject unknown feedback trial identities; V1 categories are unchanged.
+
 - Research contexts cross-check the declared best against complete histories and
   the visible baseline against its frozen commit, while allowing omitted history.
 - Research contexts reject `needs_proposal` when a visible trial is queued or

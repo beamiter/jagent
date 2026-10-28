@@ -112,7 +112,7 @@ impl EditRequest {
             total <= MAX_SOURCE_BYTES,
             "total source byte limit exceeded",
         )?;
-        feedback::validate(&value["feedback"], version)?;
+        feedback::validate(&value["feedback"], version, &context)?;
         Ok(Self { value, context })
     }
 

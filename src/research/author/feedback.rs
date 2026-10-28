@@ -1,5 +1,7 @@
 //! Typed host observations, never model-supplied measurements or instructions.
-use crate::research::{finite, integer, object, require, trial_id, ResearchError, Result};
+use crate::research::{
+    finite, integer, object, require, trial_id, ResearchContext, ResearchError, Result,
+};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -21,7 +23,42 @@ fn status(value: &Value) -> Result<&str> {
     Ok(value)
 }
 
-pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
+fn validate_binding(record: &Value, context: &ResearchContext) -> Result<()> {
+    let Some(id) = record["trial_id"].as_str() else {
+        return Ok(());
+    };
+    let snapshot = context.as_json();
+    let visible = snapshot["recent_trials"]
+        .as_array()
+        .expect("validated context trials")
+        .iter()
+        .find(|trial| trial["id"] == id);
+    if let Some(trial) = visible {
+        require(
+            record["status"] == trial["status"],
+            "feedback status contradicts visible trial",
+        )?;
+        for stage in ["screen", "confirm"] {
+            // Both sides have already been validated as finite numbers or
+            // absent evidence. Compare numeric meaning, not JSON spelling.
+            require(
+                record["scores"][stage].as_f64() == trial["scores"][stage].as_f64(),
+                "feedback scores contradict visible trial",
+            )?;
+        }
+    } else {
+        require(
+            snapshot["omitted_trials"]
+                .as_u64()
+                .expect("validated omitted count")
+                > 0,
+            "feedback trial is absent from complete history",
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate(value: &Value, version: u64, context: &ResearchContext) -> Result<()> {
     let records = value
         .as_array()
         .ok_or(ResearchError("expected feedback array"))?;
@@ -134,6 +171,7 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
                 "evaluation failure lacks a completed stage",
             )?;
         }
+        validate_binding(record, context)?;
     }
     Ok(())
 }
