@@ -4,6 +4,8 @@
 //! and runs the frozen evaluator. Model responses can only replace supplied
 //! UTF-8 files. No command, fabricated commit, metric or authorization is accepted.
 
+mod feedback;
+
 use super::{decode, hex, integer, object, require, text, ResearchContext, ResearchError, Result};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -62,11 +64,12 @@ pub struct EditRequest {
 }
 
 impl EditRequest {
-    /// Parse the host-selected source files and the exact research context.
+    /// Parse host-selected files and context. V1 has category-only feedback;
+    /// v2 has bounded, typed host observations. Edit-plan schema stays at v1.
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
         let value = decode(bytes, MAX_EDIT_REQUEST_BYTES)?;
         object(&value, &["schema_version", "context", "files", "feedback"])?;
-        integer(&value["schema_version"], 1, 1)?;
+        let version = integer(&value["schema_version"], 1, 2)?;
         let encoded = serde_json::to_vec(&value["context"])
             .map_err(|_| ResearchError("cannot encode context"))?;
         let context = ResearchContext::from_json(&encoded)?;
@@ -109,27 +112,7 @@ impl EditRequest {
             total <= MAX_SOURCE_BYTES,
             "total source byte limit exceeded",
         )?;
-        let feedback = value["feedback"]
-            .as_array()
-            .ok_or(ResearchError("expected feedback array"))?;
-        require(feedback.len() <= 4, "too many feedback records")?;
-        for item in feedback {
-            require(
-                matches!(
-                    item.as_str(),
-                    Some(
-                        "kept"
-                            | "archived"
-                            | "screened_out"
-                            | "invalid"
-                            | "failed"
-                            | "interrupted"
-                            | "author_failed"
-                    )
-                ),
-                "invalid feedback category",
-            )?;
-        }
+        feedback::validate(&value["feedback"], version)?;
         Ok(Self { value, context })
     }
 
@@ -174,10 +157,11 @@ impl EditRequest {
     }
 
     /// Validate a complete non-streaming chat-completion envelope and its plan.
+    /// Provider errors take precedence even if choices also contain valid edits.
     /// Truncated completions, tool calls and refusals are never repaired into edits.
-    /// Reasoning metadata is ignored; every authoring round is a fresh request.
     pub fn parse_response(&self, bytes: &[u8]) -> Result<EditPlan> {
         let value = decode(bytes, MAX_EDIT_RESPONSE_BYTES)?;
+        require(value["error"].is_null(), "model returned a provider error")?;
         let choices = value["choices"]
             .as_array()
             .ok_or(ResearchError("missing model choices"))?;
