@@ -12,6 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
+      fail-fast: false
       matrix:
         toolchain: ['stable', '1.86.0']
     steps:
@@ -22,10 +23,12 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: rustfmt, clippy
-      - run: cargo test --locked --all-targets --all-features --no-fail-fast
-      - run: cargo test --locked --all-features --doc
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - run: cargo doc --locked --no-deps
+      # Explicit +toolchain is required: rust-toolchain.toml otherwise selects stable.
+      - run: cargo +${{ matrix.toolchain }} test --locked --all-targets --all-features --no-fail-fast
+      - run: cargo +${{ matrix.toolchain }} test --locked --all-features --doc
+      - run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo +${{ matrix.toolchain }} doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - run: cargo fmt --all -- --check
+      - if: matrix.toolchain == 'stable'
+        run: cargo +stable fmt --all -- --check
