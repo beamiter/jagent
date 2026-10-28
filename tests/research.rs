@@ -197,6 +197,32 @@ fn snapshot_budget_and_trial_accounting_are_validated() {
 }
 
 #[test]
+fn stage_scores_must_describe_a_possible_trial_outcome() {
+    for (status, scores, valid) in [
+        ("baseline", json!({"screen": 1, "confirm": 2}), true),
+        ("kept", json!({"screen": 1}), false),
+        ("archived", json!({"screen": 1}), false),
+        ("screened_out", json!({"screen": 1}), true),
+        ("screened_out", json!({"screen": 1, "confirm": 2}), false),
+        ("failed", json!({"confirm": 2}), false),
+        ("failed", json!({"screen": 1}), true),
+        ("queued", json!({"screen": 1}), false),
+        ("queued", json!({}), true),
+    ] {
+        let mut value = snapshot();
+        value["next_action"] = json!("stopped");
+        value["best"] = Value::Null;
+        value["recent_trials"][0]["status"] = json!(status);
+        value["recent_trials"][0]["scores"] = scores;
+        assert_eq!(
+            ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_ok(),
+            valid,
+            "{status}"
+        );
+    }
+}
+
+#[test]
 fn protected_paths_cannot_overlap_or_traverse() {
     for paths in [
         json!(["evaluate.py"]),

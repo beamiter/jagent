@@ -10,8 +10,12 @@ review-first command semantics are unchanged.
 `ResearchContext::from_json` accepts at most 256 KiB of encoded JSON using
 `jsh.research.bridge/v1`. It rejects duplicate members, unknown fields, malformed
 identities, inconsistent trial accounting and an impossible ready/budget state.
-The memory window contains at most 16 recent trials, with 2048-byte hypotheses,
+The memory window contains at most 16 trials, with 2048-byte hypotheses,
 plus a separate best-candidate identity and an explicit omitted-trial count.
+The jsh host retains an older incumbent's scored record alongside the latest 15
+trials when needed. Scores must match the recorded outcome: kept/baseline/archived
+trials have both stages, screened-out trials have only screening, and queued
+trials have no scores. Confirmation always requires screening evidence.
 
 `prepare_request` returns provider-neutral messages and a JSON response schema.
 The system instructions are constant. All observations and hypotheses remain

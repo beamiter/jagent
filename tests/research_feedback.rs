@@ -105,6 +105,7 @@ fn feedback_count_and_chronology_are_bounded() {
     for index in 1..=5 {
         let mut item = record();
         item["attempt"] = json!(index);
+        item["trial_id"] = json!(format!("e{index:06}"));
         records.push(item);
     }
     value["feedback"] = json!(records);
@@ -135,6 +136,77 @@ fn screened_out_feedback_does_not_claim_confirmation() {
     item["scores"]["confirm"] = Value::Null;
     value["feedback"] = json!([item]);
     assert!(accepts(&value));
+}
+
+#[test]
+fn failure_categories_must_match_the_actual_authoring_stage() {
+    let mut value = input();
+    for (stage, code) in [
+        ("prepare", "preparation_failed"),
+        ("model_request", "transport_failed"),
+        ("validate_plan", "plan_rejected"),
+        ("commit_candidate", "candidate_rejected"),
+        ("submit", "admission_rejected"),
+        ("evaluate", "evaluation_unresolved"),
+        ("recovered_without_replay", "legacy_unknown"),
+    ] {
+        let mut item = json!({"attempt": 1, "status": "author_failed", "stage": stage,
+            "failure_code": code, "trial_id": null, "scores": {"screen": null, "confirm": null}});
+        value["feedback"] = json!([item.clone()]);
+        assert!(accepts(&value), "{stage}");
+        item["failure_code"] = json!(if code == "transport_failed" {
+            "plan_rejected"
+        } else {
+            "transport_failed"
+        });
+        value["feedback"] = json!([item]);
+        assert!(!accepts(&value), "{stage}");
+    }
+    value["feedback"][0]["stage"] = json!("finished");
+    value["feedback"][0]["failure_code"] = Value::Null;
+    assert!(!accepts(&value));
+}
+
+#[test]
+fn trial_id_cannot_exist_before_admission_or_repeat_across_attempts() {
+    let mut value = input();
+    value["feedback"] = json!([{"attempt": 1, "status": "interrupted", "stage": "model_request",
+        "failure_code": "interrupted", "trial_id": "e000001", "scores": {"screen": null, "confirm": null}}]);
+    assert!(!accepts(&value));
+    let mut second = record();
+    second["attempt"] = json!(2);
+    value["feedback"] = json!([record(), second]);
+    assert!(!accepts(&value));
+}
+
+#[test]
+fn failed_evaluation_requires_finished_stage_and_screen_before_confirmation() {
+    let mut value = input();
+    let mut item = record();
+    item["status"] = json!("failed");
+    item["failure_code"] = json!("evaluation_failed");
+    value["feedback"] = json!([item.clone()]);
+    assert!(accepts(&value));
+    item["scores"]["screen"] = Value::Null;
+    value["feedback"] = json!([item.clone()]);
+    assert!(!accepts(&value));
+    item["scores"] = json!({"screen": null, "confirm": null});
+    item["stage"] = json!("evaluate");
+    value["feedback"] = json!([item]);
+    assert!(!accepts(&value));
+}
+
+#[test]
+fn legacy_unknown_stage_placeholder_remains_unbound_and_scoreless() {
+    let mut value = input();
+    value["feedback"] = json!([{"attempt": 1, "status": "author_failed", "stage": "prepare",
+        "failure_code": "legacy_unknown", "trial_id": null, "scores": {"screen": null, "confirm": null}}]);
+    assert!(accepts(&value));
+    value["feedback"][0]["trial_id"] = json!("e000001");
+    assert!(!accepts(&value));
+    value["feedback"][0]["trial_id"] = Value::Null;
+    value["feedback"][0]["scores"]["screen"] = json!(1);
+    assert!(!accepts(&value));
 }
 
 #[test]

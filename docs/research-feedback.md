@@ -10,6 +10,14 @@ Unbound observations cannot contain measurements. Successful outcomes require
 completed screen evidence; kept/archived require confirmation, screened_out must
 not claim confirmation. The host supplies only complete-stage measurements.
 
+V2 also requires failure codes to match the authoring stage, and a trial ID
+cannot appear before submission or repeat within the four-record window.
+Evaluation failures require a finished/recovered stage; confirmation measurements
+require screening measurements. These checks reject inconsistent host evidence
+without adding fields or changing V1 category-only inputs.
+Older ledgers without stage metadata can still use `legacy_unknown` with the
+host's `prepare` placeholder; this observation must remain unbound and scoreless.
+
 This is input validation, not remote attestation or scientific proof. All feedback
 remains untrusted user-role data. A host must associate observations with its own
 campaign records; the model may not supply results for promotion. The protocol

@@ -1,6 +1,7 @@
 //! Typed host observations, never model-supplied measurements or instructions.
 use crate::research::{finite, integer, object, require, trial_id, ResearchError, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 
 fn status(value: &Value) -> Result<&str> {
     let value = value.as_str().ok_or(ResearchError("expected status"))?;
@@ -26,6 +27,7 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
         .ok_or(ResearchError("expected feedback array"))?;
     require(records.len() <= 4, "too many feedback records")?;
     let mut previous = 0;
+    let mut trials = HashSet::new();
     for record in records {
         if version == 1 {
             status(record)?;
@@ -63,28 +65,36 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
             "invalid feedback stage",
         )?;
         let code = &record["failure_code"];
+        let stage = record["stage"].as_str().expect("validated stage");
         let valid_code = match outcome {
             "kept" | "archived" | "screened_out" => code.is_null(),
             "failed" => code == "evaluation_failed",
             "invalid" => code == "evaluation_invalid",
             "interrupted" => code == "interrupted",
             _ => matches!(
-                code.as_str(),
-                Some(
-                    "preparation_failed"
-                        | "transport_failed"
-                        | "plan_rejected"
-                        | "candidate_rejected"
-                        | "admission_rejected"
-                        | "evaluation_unresolved"
-                        | "legacy_unknown"
-                )
+                (stage, code.as_str()),
+                // Older ledgers without a stage use the host's prepare placeholder.
+                ("prepare", Some("preparation_failed" | "legacy_unknown"))
+                    | ("model_request", Some("transport_failed"))
+                    | ("validate_plan", Some("plan_rejected"))
+                    | ("commit_candidate", Some("candidate_rejected"))
+                    | ("submit", Some("admission_rejected"))
+                    | ("evaluate", Some("evaluation_unresolved"))
+                    | ("recovered_without_replay", Some("legacy_unknown"))
             ),
         };
         require(valid_code, "feedback failure code contradicts status")?;
         let bound = !record["trial_id"].is_null();
         if bound {
-            trial_id(&record["trial_id"])?;
+            let id = trial_id(&record["trial_id"])?;
+            require(trials.insert(id), "duplicate feedback trial")?;
+            require(
+                matches!(
+                    stage,
+                    "submit" | "evaluate" | "finished" | "recovered_without_replay"
+                ),
+                "feedback trial precedes admission",
+            )?;
         }
         object(&record["scores"], &["screen", "confirm"])?;
         for stage in ["screen", "confirm"] {
@@ -94,6 +104,10 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
                 finite(score, -1e100)?;
             }
         }
+        require(
+            record["scores"]["confirm"].is_null() || !record["scores"]["screen"].is_null(),
+            "confirmation feedback lacks screen evidence",
+        )?;
         if matches!(outcome, "kept" | "archived" | "screened_out") {
             require(
                 bound
@@ -115,6 +129,10 @@ pub(super) fn validate(value: &Value, version: u64) -> Result<()> {
         }
         if matches!(outcome, "failed" | "invalid") {
             require(bound, "evaluation failure lacks a trial identity")?;
+            require(
+                matches!(stage, "finished" | "recovered_without_replay"),
+                "evaluation failure lacks a completed stage",
+            )?;
         }
     }
     Ok(())

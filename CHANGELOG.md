@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Research validation now requires stage-specific failure categories, distinct
+  feedback trial identities, admission before bound feedback and screening before
+  confirmation. Context scores must agree with trial status. Existing valid V1/V2
+  inputs and model edit-plan schemas remain unchanged.
+
 - Added opaque `ModelRequestToken` identities and checked response/failure
   ingestion methods to isolate asynchronous attempts across retries,
   subsequent turns, session restoration, and task resets. Stale callbacks

@@ -282,6 +282,19 @@ impl ResearchContext {
                 )?;
                 finite(score, -1e100)?;
             }
+            require(
+                !scores.contains_key("confirm") || scores.contains_key("screen"),
+                "confirmation score lacks screen evidence",
+            )?;
+            require(
+                match status {
+                    "baseline" | "kept" | "archived" => scores.len() == 2,
+                    "screened_out" => scores.len() == 1 && scores.contains_key("screen"),
+                    "queued" => scores.is_empty(),
+                    _ => true,
+                },
+                "trial scores contradict status",
+            )?;
             if trial["id"] == value["best"]["id"] {
                 require(
                     trial["commit"] == value["best"]["commit"]
