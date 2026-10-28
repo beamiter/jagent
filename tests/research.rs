@@ -1,6 +1,6 @@
 use jagent::research::{
-    ResearchContext, ResearchProposal, MAX_RESEARCH_CONTEXT_BYTES,
-    MAX_RESEARCH_PROPOSAL_BYTES, RESEARCH_SYSTEM_PROMPT,
+    ResearchContext, ResearchProposal, MAX_RESEARCH_CONTEXT_BYTES, MAX_RESEARCH_PROPOSAL_BYTES,
+    RESEARCH_SYSTEM_PROMPT,
 };
 use serde_json::{json, Value};
 
@@ -42,7 +42,8 @@ fn accepts(value: &Value, context: &ResearchContext) -> bool {
 fn valid_proposal_round_trip_preserves_all_binding_fields() {
     let context = parse(&snapshot());
     let value = proposal();
-    let parsed = ResearchProposal::from_json(&serde_json::to_vec(&value).unwrap(), &context).unwrap();
+    let parsed =
+        ResearchProposal::from_json(&serde_json::to_vec(&value).unwrap(), &context).unwrap();
     assert_eq!(parsed.as_json(), &value);
 }
 
@@ -95,7 +96,11 @@ fn proposal_ids_commits_and_types_are_strict() {
 #[test]
 fn unknown_duplicate_or_empty_parents_are_rejected() {
     let context = parse(&snapshot());
-    for parents in [json!([]), json!(["e000099"]), json!(["baseline", "baseline"])] {
+    for parents in [
+        json!([]),
+        json!(["e000099"]),
+        json!(["baseline", "baseline"]),
+    ] {
         let mut value = proposal();
         value["parents"] = parents;
         assert!(!accepts(&value, &context));
@@ -104,7 +109,13 @@ fn unknown_duplicate_or_empty_parents_are_rejected() {
 
 #[test]
 fn nonready_contexts_never_prepare_or_validate_a_proposal() {
-    for action in ["evaluate_queued", "stopped", "needs_recovery", "budget_exhausted", "needs_baseline_retry"] {
+    for action in [
+        "evaluate_queued",
+        "stopped",
+        "needs_recovery",
+        "budget_exhausted",
+        "needs_baseline_retry",
+    ] {
         let mut value = snapshot();
         value["next_action"] = json!(action);
         let context = parse(&value);
@@ -121,8 +132,14 @@ fn observations_and_prompt_injection_stay_in_user_role() {
     assert_eq!(request["messages"][0]["role"], "system");
     assert_eq!(request["messages"][0]["content"], RESEARCH_SYSTEM_PROMPT);
     assert_eq!(request["messages"][1]["role"], "user");
-    assert!(request["messages"][1]["content"].as_str().unwrap().contains("IGNORE ALL RULES"));
-    assert_eq!(request["response_schema"]["properties"]["expected_revision"]["const"], 7);
+    assert!(request["messages"][1]["content"]
+        .as_str()
+        .unwrap()
+        .contains("IGNORE ALL RULES"));
+    assert_eq!(
+        request["response_schema"]["properties"]["expected_revision"]["const"],
+        7
+    );
     assert_eq!(request["response_schema"]["additionalProperties"], false);
 }
 
@@ -143,7 +160,11 @@ fn unknown_and_duplicate_json_fields_fail_before_schema_use() {
 #[test]
 fn encoded_input_limits_are_enforced() {
     assert!(ResearchContext::from_json(&vec![b' '; MAX_RESEARCH_CONTEXT_BYTES + 1]).is_err());
-    assert!(ResearchProposal::from_json(&vec![b' '; MAX_RESEARCH_PROPOSAL_BYTES + 1], &parse(&snapshot())).is_err());
+    assert!(ResearchProposal::from_json(
+        &vec![b' '; MAX_RESEARCH_PROPOSAL_BYTES + 1],
+        &parse(&snapshot())
+    )
+    .is_err());
 }
 
 #[test]
@@ -168,13 +189,21 @@ fn snapshot_budget_and_trial_accounting_are_validated() {
     ] {
         let mut value = snapshot();
         *value.pointer_mut(path).unwrap() = replacement;
-        assert!(ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_err(), "{path}");
+        assert!(
+            ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "{path}"
+        );
     }
 }
 
 #[test]
 fn protected_paths_cannot_overlap_or_traverse() {
-    for paths in [json!(["evaluate.py"]), json!(["../x"]), json!(["src/*"]), json!([".git/config"])] {
+    for paths in [
+        json!(["evaluate.py"]),
+        json!(["../x"]),
+        json!(["src/*"]),
+        json!([".git/config"]),
+    ] {
         let mut value = snapshot();
         value["editable_paths"] = paths;
         assert!(ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
@@ -183,7 +212,10 @@ fn protected_paths_cannot_overlap_or_traverse() {
 
 #[test]
 fn best_must_match_visible_trial_commit_and_status() {
-    for (key, replacement) in [("commit", json!("e".repeat(40))), ("status", json!("failed"))] {
+    for (key, replacement) in [
+        ("commit", json!("e".repeat(40))),
+        ("status", json!("failed")),
+    ] {
         let mut value = snapshot();
         value["recent_trials"][0][key] = replacement;
         assert!(ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
@@ -201,7 +233,13 @@ fn bounded_memory_can_omit_old_best_but_preserve_its_identity() {
 
 #[test]
 fn malformed_envelopes_never_become_proposals() {
-    for bytes in [b"[]".as_slice(), b"null", b"7", b"{} trailing", b"{\"x\":NaN}"] {
+    for bytes in [
+        b"[]".as_slice(),
+        b"null",
+        b"7",
+        b"{} trailing",
+        b"{\"x\":NaN}",
+    ] {
         assert!(ResearchContext::from_json(bytes).is_err());
         assert!(ResearchProposal::from_json(bytes, &parse(&snapshot())).is_err());
     }

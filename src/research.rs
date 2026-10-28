@@ -42,7 +42,8 @@ fn require(condition: bool, message: &'static str) -> Result<()> {
 
 fn decode(bytes: &[u8], maximum: usize) -> Result<Value> {
     require(bytes.len() <= maximum, "research JSON byte limit exceeded")?;
-    crate::json::validate_object(bytes).map_err(|_| ResearchError("invalid research JSON object"))?;
+    crate::json::validate_object(bytes)
+        .map_err(|_| ResearchError("invalid research JSON object"))?;
     serde_json::from_slice(bytes).map_err(|_| ResearchError("invalid research JSON"))
 }
 
@@ -65,13 +66,17 @@ fn text(value: &Value, maximum: usize) -> Result<&str> {
 }
 
 fn integer(value: &Value, minimum: u64, maximum: u64) -> Result<u64> {
-    let value = value.as_u64().ok_or(ResearchError("expected unsigned integer"))?;
+    let value = value
+        .as_u64()
+        .ok_or(ResearchError("expected unsigned integer"))?;
     require(value >= minimum && value <= maximum, "integer out of range")?;
     Ok(value)
 }
 
 fn finite(value: &Value, minimum: f64) -> Result<f64> {
-    let value = value.as_f64().ok_or(ResearchError("expected finite number"))?;
+    let value = value
+        .as_f64()
+        .ok_or(ResearchError("expected finite number"))?;
     require(
         value.is_finite() && value >= minimum && value.abs() <= 1e100,
         "number out of range",
@@ -83,7 +88,9 @@ fn hex(value: &Value, lengths: &[usize]) -> Result<()> {
     let value = text(value, 64)?;
     require(
         lengths.contains(&value.len())
-            && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "invalid research identity or commit",
     )
 }
@@ -101,11 +108,16 @@ fn trial_id(value: &Value) -> Result<&str> {
 }
 
 fn completed(status: &str) -> bool {
-    matches!(status, "baseline" | "kept" | "archived" | "screened_out" | "invalid" | "failed" | "interrupted")
+    matches!(
+        status,
+        "baseline" | "kept" | "archived" | "screened_out" | "invalid" | "failed" | "interrupted"
+    )
 }
 
 fn path_list(value: &Value) -> Result<Vec<&str>> {
-    let list = value.as_array().ok_or(ResearchError("expected path array"))?;
+    let list = value
+        .as_array()
+        .ok_or(ResearchError("expected path array"))?;
     require(!list.is_empty() && list.len() <= 128, "invalid path count")?;
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -113,8 +125,12 @@ fn path_list(value: &Value) -> Result<Vec<&str>> {
         let path = text(item, 1024)?;
         require(
             !path.starts_with('/')
-                && !path.chars().any(|c| matches!(c, '\\' | '\n' | '\r' | '\t' | ':' | '*' | '?' | '['))
-                && path.split('/').all(|p| !matches!(p, "" | "." | ".." | ".git"))
+                && !path
+                    .chars()
+                    .any(|c| matches!(c, '\\' | '\n' | '\r' | '\t' | ':' | '*' | '?' | '['))
+                && path
+                    .split('/')
+                    .all(|p| !matches!(p, "" | "." | ".." | ".git"))
                 && seen.insert(path),
             "invalid or duplicate repository path",
         )?;
@@ -136,19 +152,40 @@ impl ResearchContext {
         object(
             &value,
             &[
-                "protocol", "campaign_id", "manifest_digest", "revision", "next_action",
-                "baseline_commit", "best", "objective", "editable_paths", "protected_paths",
-                "budget", "recent_trials", "omitted_trials",
+                "protocol",
+                "campaign_id",
+                "manifest_digest",
+                "revision",
+                "next_action",
+                "baseline_commit",
+                "best",
+                "objective",
+                "editable_paths",
+                "protected_paths",
+                "budget",
+                "recent_trials",
+                "omitted_trials",
             ],
         )?;
-        require(value["protocol"] == RESEARCH_CONTEXT_PROTOCOL, "unsupported research protocol")?;
+        require(
+            value["protocol"] == RESEARCH_CONTEXT_PROTOCOL,
+            "unsupported research protocol",
+        )?;
         hex(&value["campaign_id"], &[32])?;
         hex(&value["manifest_digest"], &[64])?;
         hex(&value["baseline_commit"], &[40, 64])?;
         integer(&value["revision"], 1, u64::MAX)?;
         let action = text(&value["next_action"], 32)?;
         require(
-            matches!(action, "needs_proposal" | "evaluate_queued" | "stopped" | "needs_recovery" | "budget_exhausted" | "needs_baseline_retry"),
+            matches!(
+                action,
+                "needs_proposal"
+                    | "evaluate_queued"
+                    | "stopped"
+                    | "needs_recovery"
+                    | "budget_exhausted"
+                    | "needs_baseline_retry"
+            ),
             "unknown research action",
         )?;
         if !value["best"].is_null() {
@@ -159,7 +196,10 @@ impl ResearchContext {
         object(&value["objective"], &["metric", "direction", "min_delta"])?;
         text(&value["objective"]["metric"], 128)?;
         require(
-            matches!(value["objective"]["direction"].as_str(), Some("min" | "max")),
+            matches!(
+                value["objective"]["direction"].as_str(),
+                Some("min" | "max")
+            ),
             "invalid objective direction",
         )?;
         finite(&value["objective"]["min_delta"], 0.0)?;
@@ -174,7 +214,16 @@ impl ResearchContext {
             }
         }
         let budget = &value["budget"];
-        object(budget, &["max_trials", "trials_used", "max_seconds", "charged_seconds", "trial_reservation_seconds"])?;
+        object(
+            budget,
+            &[
+                "max_trials",
+                "trials_used",
+                "max_seconds",
+                "charged_seconds",
+                "trial_reservation_seconds",
+            ],
+        )?;
         let maximum = integer(&budget["max_trials"], 1, 10000)?;
         let used = integer(&budget["trials_used"], 1, maximum)?;
         let seconds = finite(&budget["max_seconds"], 0.1)?;
@@ -187,34 +236,56 @@ impl ResearchContext {
                 "proposal requested without baseline or budget",
             )?;
         }
-        let trials = value["recent_trials"].as_array().ok_or(ResearchError("expected recent trials"))?;
+        let trials = value["recent_trials"]
+            .as_array()
+            .ok_or(ResearchError("expected recent trials"))?;
         require(trials.len() <= 16, "too many recent trials")?;
         let omitted = integer(&value["omitted_trials"], 0, 10000)?;
-        require(trials.len() as u64 + omitted == used, "inconsistent trial accounting")?;
+        require(
+            trials.len() as u64 + omitted == used,
+            "inconsistent trial accounting",
+        )?;
         let mut ids = HashSet::new();
         for trial in trials {
-            object(trial, &["id", "commit", "hypothesis", "status", "parents", "scores"])?;
+            object(
+                trial,
+                &["id", "commit", "hypothesis", "status", "parents", "scores"],
+            )?;
             let id = trial_id(&trial["id"])?;
             require(ids.insert(id), "duplicate trial ID")?;
             hex(&trial["commit"], &[40, 64])?;
             text(&trial["hypothesis"], 2048)?;
             let status = text(&trial["status"], 32)?;
-            require(completed(status) || matches!(status, "queued" | "running"), "unknown trial status")?;
-            let parents = trial["parents"].as_array().ok_or(ResearchError("expected parents"))?;
+            require(
+                completed(status) || matches!(status, "queued" | "running"),
+                "unknown trial status",
+            )?;
+            let parents = trial["parents"]
+                .as_array()
+                .ok_or(ResearchError("expected parents"))?;
             require(parents.len() <= 8, "too many parents")?;
             let mut parent_ids = HashSet::new();
             for parent in parents {
                 let parent = trial_id(parent)?;
-                require(parent != id && parent_ids.insert(parent), "invalid parent lineage")?;
+                require(
+                    parent != id && parent_ids.insert(parent),
+                    "invalid parent lineage",
+                )?;
             }
-            let scores = trial["scores"].as_object().ok_or(ResearchError("expected scores"))?;
+            let scores = trial["scores"]
+                .as_object()
+                .ok_or(ResearchError("expected scores"))?;
             for (key, score) in scores {
-                require(matches!(key.as_str(), "screen" | "confirm"), "unknown score stage")?;
+                require(
+                    matches!(key.as_str(), "screen" | "confirm"),
+                    "unknown score stage",
+                )?;
                 finite(score, -1e100)?;
             }
             if trial["id"] == value["best"]["id"] {
                 require(
-                    trial["commit"] == value["best"]["commit"] && matches!(status, "baseline" | "kept"),
+                    trial["commit"] == value["best"]["commit"]
+                        && matches!(status, "baseline" | "kept"),
                     "inconsistent best candidate",
                 )?;
             }
@@ -229,7 +300,9 @@ impl ResearchContext {
 
     /// Controller's next action; no action is executed by this crate.
     pub fn next_action(&self) -> &str {
-        self.value["next_action"].as_str().expect("validated action")
+        self.value["next_action"]
+            .as_str()
+            .expect("validated action")
     }
 
     fn parent_ids(&self) -> Vec<String> {
@@ -237,7 +310,10 @@ impl ResearchContext {
         if let Some(id) = self.value["best"]["id"].as_str() {
             ids.push(id.to_owned());
         }
-        for trial in self.value["recent_trials"].as_array().expect("validated trials") {
+        for trial in self.value["recent_trials"]
+            .as_array()
+            .expect("validated trials")
+        {
             if completed(trial["status"].as_str().expect("validated status")) {
                 let id = trial["id"].as_str().expect("validated id").to_owned();
                 if !ids.contains(&id) {
@@ -251,7 +327,10 @@ impl ResearchContext {
     /// Build messages and a strict JSON schema. The host supplies transport and
     /// a code-authoring agent; this is not an HTTP request or execution permit.
     pub fn prepare_request(&self) -> Result<Value> {
-        require(self.next_action() == "needs_proposal", "controller is not requesting a proposal")?;
+        require(
+            self.next_action() == "needs_proposal",
+            "controller is not requesting a proposal",
+        )?;
         let schema = json!({
             "type": "object", "additionalProperties": false,
             "required": ["schema_version", "campaign_id", "manifest_digest", "expected_revision",
@@ -293,16 +372,29 @@ impl ResearchProposal {
     /// Parse and bind a proposal to one exact context. Duplicate keys, unknown
     /// fields, stale bindings and fabricated result fields all fail closed.
     pub fn from_json(bytes: &[u8], context: &ResearchContext) -> Result<Self> {
-        require(context.next_action() == "needs_proposal", "controller is not requesting a proposal")?;
+        require(
+            context.next_action() == "needs_proposal",
+            "controller is not requesting a proposal",
+        )?;
         let value = decode(bytes, MAX_RESEARCH_PROPOSAL_BYTES)?;
         object(
             &value,
             &[
-                "schema_version", "campaign_id", "manifest_digest", "expected_revision",
-                "expected_best_commit", "request_id", "commit", "hypothesis", "parents",
+                "schema_version",
+                "campaign_id",
+                "manifest_digest",
+                "expected_revision",
+                "expected_best_commit",
+                "request_id",
+                "commit",
+                "hypothesis",
+                "parents",
             ],
         )?;
-        require(integer(&value["schema_version"], 2, 2)? == 2, "unsupported proposal version")?;
+        require(
+            integer(&value["schema_version"], 2, 2)? == 2,
+            "unsupported proposal version",
+        )?;
         hex(&value["campaign_id"], &[32])?;
         hex(&value["manifest_digest"], &[64])?;
         hex(&value["expected_best_commit"], &[40, 64])?;
@@ -319,17 +411,27 @@ impl ResearchProposal {
         require(
             id != "baseline"
                 && id.as_bytes()[0].is_ascii_alphanumeric()
-                && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
             "invalid request ID",
         )?;
         text(&value["hypothesis"], 8192)?;
-        let parents = value["parents"].as_array().ok_or(ResearchError("expected parents"))?;
-        require(!parents.is_empty() && parents.len() <= 8, "invalid parent count")?;
+        let parents = value["parents"]
+            .as_array()
+            .ok_or(ResearchError("expected parents"))?;
+        require(
+            !parents.is_empty() && parents.len() <= 8,
+            "invalid parent count",
+        )?;
         let known = context.parent_ids();
         let mut seen = HashSet::new();
         for parent in parents {
             let id = trial_id(parent)?;
-            require(known.iter().any(|known| known == id) && seen.insert(id), "unknown or duplicate parent")?;
+            require(
+                known.iter().any(|known| known == id) && seen.insert(id),
+                "unknown or duplicate parent",
+            )?;
         }
         Ok(Self { value })
     }
