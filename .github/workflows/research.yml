@@ -26,7 +26,10 @@ jobs:
       # Explicit +toolchain is required: rust-toolchain.toml otherwise selects stable.
       - run: cargo +${{ matrix.toolchain }} test --locked --all-targets --all-features --no-fail-fast
       - run: cargo +${{ matrix.toolchain }} test --locked --all-features --doc
-      - run: cargo +${{ matrix.toolchain }} clippy --locked --all-targets --all-features -- -D warnings
+      # Lint/style policy follows stable. MSRV still compiles and runs every test.
+      # Old Clippy reports needless_lifetimes in the existing session.rs visitor.
+      - if: matrix.toolchain == 'stable'
+        run: cargo +stable clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo +${{ matrix.toolchain }} doc --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
