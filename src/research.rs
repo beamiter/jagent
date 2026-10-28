@@ -442,3 +442,6 @@ impl ResearchProposal {
         &self.value
     }
 }
+
+/// Bounded source editing for model-driven research.
+pub mod author;
