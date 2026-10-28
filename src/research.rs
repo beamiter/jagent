@@ -254,6 +254,12 @@ impl ResearchContext {
             let id = trial_id(&trial["id"])?;
             require(ids.insert(id), "duplicate trial ID")?;
             hex(&trial["commit"], &[40, 64])?;
+            if id == "baseline" {
+                require(
+                    trial["commit"] == value["baseline_commit"],
+                    "visible baseline differs from frozen baseline commit",
+                )?;
+            }
             text(&trial["hypothesis"], 2048)?;
             let status = text(&trial["status"], 32)?;
             require(
@@ -304,6 +310,14 @@ impl ResearchContext {
                     trial["commit"] == value["best"]["commit"]
                         && matches!(status, "baseline" | "kept"),
                     "inconsistent best candidate",
+                )?;
+            }
+        }
+        if omitted == 0 {
+            if let Some(best_id) = value["best"]["id"].as_str() {
+                require(
+                    ids.contains(best_id),
+                    "complete trial history is missing the best candidate",
                 )?;
             }
         }

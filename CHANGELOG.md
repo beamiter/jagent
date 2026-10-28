@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Research contexts cross-check the declared best against complete histories and
+  the visible baseline against its frozen commit, while allowing omitted history.
 - Research contexts reject `needs_proposal` when a visible trial is queued or
   running, without requiring pending work to appear in a bounded nonready window.
 - Research validation now requires stage-specific failure categories, distinct

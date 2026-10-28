@@ -284,6 +284,40 @@ fn best_must_match_visible_trial_commit_and_status() {
 }
 
 #[test]
+fn complete_history_must_contain_the_declared_best() {
+    for action in ["needs_proposal", "stopped"] {
+        let mut value = snapshot();
+        value["next_action"] = json!(action);
+        value["best"] = json!({"id": "e999999", "commit": "f".repeat(40)});
+        let error = ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "complete trial history is missing the best candidate"
+        );
+
+        value["budget"]["trials_used"] = json!(2);
+        value["omitted_trials"] = json!(1);
+        assert!(ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_ok());
+    }
+}
+
+#[test]
+fn visible_baseline_commit_must_match_the_frozen_identity() {
+    let mut value = snapshot();
+    value["baseline_commit"] = json!("e".repeat(40));
+    let error = ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "visible baseline differs from frozen baseline commit"
+    );
+
+    // A baseline absent from the bounded window cannot be cross-checked here.
+    value["recent_trials"] = json!([]);
+    value["omitted_trials"] = json!(1);
+    assert!(ResearchContext::from_json(&serde_json::to_vec(&value).unwrap()).is_ok());
+}
+
+#[test]
 fn bounded_memory_can_omit_old_best_but_preserve_its_identity() {
     let mut value = snapshot();
     value["recent_trials"] = json!([]);

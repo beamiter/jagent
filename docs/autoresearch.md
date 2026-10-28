@@ -19,6 +19,9 @@ trials have no scores. Confirmation always requires screening evidence.
 `needs_proposal` is rejected when any visible trial is queued or running. A
 nonready context need not include the pending trial within its bounded window;
 absence from that window does not prove that the campaign has no pending work.
+When no trials are omitted, a declared best candidate must occur in the complete
+history. A visible `baseline` trial must match the frozen `baseline_commit`.
+Omitted trials remain opaque; their identities are not fabricated or inferred.
 
 `prepare_request` returns provider-neutral messages and a JSON response schema.
 The system instructions are constant. All observations and hypotheses remain
