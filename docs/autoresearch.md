@@ -61,3 +61,20 @@ rebound to new state. Preserve its candidate and ask the host to reassess it.
 This phase establishes the model/control-plane boundary, not a functioning
 Flint/DLC service. Remote job leases, authenticated callbacks, GPU-hour budgets,
 container isolation and independent result validation remain executor work.
+
+## Remote execution boundary (2026-10-30)
+
+`research::remote::{RemoteBinding, RemoteObservation}` validates the shared
+`jsh.research.remote/v1` response shape, fresh exchange nonce, request digest,
+provider job identity, status, lease and result binding. Expectations must come
+from the host's durable ledger, never from model output. Parse with
+`from_authenticated_json` only after the host verifies gateway authentication.
+The validator cannot verify HMAC, compare metrics_sha256 to payload bytes, apply
+campaign guardrails, reserve GPUs, issue requests or authorize execution.
+
+The matching jsh remote staging client persists submit/cancel intent and full
+GPU-time reservations before IO, recovers by lookup rather than blind resubmission,
+and archives authenticated results without promoting the local incumbent.
+See [jsh remote contract](https://github.com/beamiter/jsh/blob/master/docs/autoresearch-remote.md).
+Actual Alibaba DLC SDK/gateway deployment and GPU integration remain separate;
+mock tests must never be described as a completed cluster run.

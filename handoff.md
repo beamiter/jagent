@@ -2322,3 +2322,11 @@ cargo package --locked --allow-dirty
 The examples intentionally send and execute nothing. Successful runs prove
 request construction, secure-default reporting, bounded local response
 parsing, and explicit review transitions only.
+
+## 2026-10-30: remote executor response boundary
+
+Added `research::remote` and adversarial binding tests. This remains sans-IO:
+TLS/HMAC verification, canonical metrics hash verification, reservations,
+transitions and manifest guardrails belong to jsh/the trusted gateway.
+Verified: 451 tests across all targets/features; strict Clippy and formatting.
+No model request or DLC GPU job was executed. See docs/autoresearch.md.

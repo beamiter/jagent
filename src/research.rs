@@ -476,3 +476,6 @@ impl ResearchProposal {
 
 /// Bounded source editing for model-driven research.
 pub mod author;
+
+/// Remote executor wire validation, without network access or authorization.
+pub mod remote;
